@@ -2,12 +2,7 @@
 
 A [pi](https://pi.dev) extension that brings **Claude Code-style autonomous sub-agents** to pi. Spawn specialized agents that run in isolated sessions — each with its own tools, system prompt, model, and thinking level. Run them in foreground or background, steer them mid-run, resume completed sessions, and define your own custom agent types.
 
-> **Fork of [`@tintinweb/pi-subagents`](https://github.com/tintinweb/pi-subagents) with `npm:pi-subagents`-style JSON agent overrides integration.**
->
-> You can configure agent `model`, `thinking`, `systemPrompt`, `tools`, and more via `settings.json`
-> (`~/.pi/agent/settings.json` or `.pi/settings.json`) under `subagents.agentOverrides.<agentName>`,
-> just like in [`npm:pi-subagents`](https://github.com/nicobailon/pi-subagents). JSON overrides take
-> the highest priority — above both built-in agents and `.pi/agents/*.md` definitions.
+> **Fork of [`@tintinweb/pi-subagents`](https://github.com/tintinweb/pi-subagents) integrating `npm:pi-subagents`-style JSON agent overrides — configure agents via `settings.json` without writing `.md` files.**
 
 <img width="600" alt="pi-subagents screenshot" src="https://github.com/tintinweb/pi-subagents/raw/master/media/screenshot.png" />
 
@@ -276,9 +271,112 @@ A few rules the examples don't make obvious:
 - `exclude_extensions:` is **not a sandbox**: excluded extensions' factory code still executes once during loading. Exclusion suppresses their tools and their bound lifecycle hooks (`pi.on` handlers like `session_start` only fire for extensions bound to the session), but not other load-time side effects — a factory that subscribes directly to the shared `pi.events` bus stays live. Don't rely on it to contain an untrusted extension.
 - Array and string forms are equivalent: `[a, b]` == `"a, b"`.
 
+## `npm:pi-subagents`-Style JSON Agent Overrides
+
+This fork adds the ability to configure — and even create — agents entirely through JSON,
+no `.md` files required. The syntax matches [`npm:pi-subagents`](https://github.com/nicobailon/pi-subagents)
+(also known as oh-my-opencode-agent / OMO style): put a `subagents.agentOverrides` block in
+`settings.json` and it takes the highest priority.
+
+### Priority Chain
+
+```
+Local  JSON  (.pi/settings.json → subagents.agentOverrides)   ← highest
+Global JSON  (~/.pi/agent/settings.json → subagents.agentOverrides)
+───── ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─
+Local  .md   (.pi/agents/*.md)
+Global .md   (~/.pi/agent/agents/*.md)
+Built-in      (general-purpose, Explore, Plan)               ← lowest
+```
+
+JSON overrides win over everything below the line. If an agent name in the JSON doesn't
+match any existing `.md` or built-in agent, **it is auto-registered** with the fields you
+provide.
+
+### Global Override Example
+
+Put this in `~/.pi/agent/settings.json` to set project-wide defaults for all your agents:
+
+```json
+{
+  "subagents": {
+    "defaultModel": "opencode/deepseek-v4-flash-free",
+    "agentOverrides": {
+      "Explore": {
+        "model": "github-copilot/gpt-5-mini",
+        "thinking": "off"
+      },
+      "researcher": {
+        "model": "opencode/deepseek-v4-flash-free",
+        "thinking": "max",
+        "systemPrompt": "You are an autonomous web researcher. Search for external evidence, official docs, ecosystem behavior, recent changes, benchmarks, and primary sources. Return a focused research brief with source links, confidence level, gaps, and decision implications. Do not edit project files."
+      },
+      "reviewer": {
+        "model": "opencode/deepseek-v4-flash-free",
+        "thinking": "max",
+        "tools": ["read", "grep", "find", "ls", "bash"]
+      }
+    }
+  }
+}
+```
+
+### Local Project Override Example
+
+Put this in `.pi/settings.json` within a specific project. These values **merge over** the
+global ones, so you can override only the fields you need to change for this project:
+
+```json
+{
+  "subagents": {
+    "agentOverrides": {
+      "researcher": {
+        "model": "openai-codex/gpt-5.4",
+        "thinking": "high"
+      },
+      "fixer": {
+        "model": "openai-codex/gpt-5.4",
+        "thinking": "high",
+        "tools": ["read", "grep", "find", "ls", "bash", "edit", "write"],
+        "systemPrompt": "You are Fixer — a fast, focused implementation specialist. Execute code changes efficiently with complete context. NO external research, NO delegation, NO planning. Implement and report."
+      },
+      "explorer": {
+        "model": "openai-codex/gpt-5.4",
+        "thinking": "high",
+        "tools": ["read", "grep", "find", "ls", "bash"]
+      }
+    }
+  }
+}
+```
+
+In this example, `researcher` gets `openai-codex/gpt-5.4` from the local override (instead of
+the global `opencode/deepseek-v4-flash-free`). `fixer` and `explorer` don't exist in global
+overrides and have no `.md` files — they are **auto-registered** from this JSON alone.
+
+### Supported Override Fields
+
+| Field | Type | Description |
+|---|---|---|
+| `model` | `string \| false` | Model to use; `false` clears override and inherits parent |
+| `thinking` | `string \| false` | Thinking level: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` |
+| `systemPrompt` | `string` | Full system prompt (replaces agent's default) |
+| `tools` | `string[]` | Tool allowlist — agent gets exactly these tools and no others |
+| `disabled` | `boolean` | `true` hides the agent from the type list |
+| `skills` | `string[]` | Skill list. `["*"]` = all skills, `[]` = none, `["simplify"]` = only named |
+
+### How Skills Are Mapped
+
+| Nico JSON (`string[]`) | Resulting tintinweb value |
+|---|---|
+| `["*"]` | `true` — all skills inherited |
+| `["simplify", "librarian"]` | `["simplify", "librarian"]` — only listed |
+| `[]` or `false` | `false` — no skills |
+| omitted | `true` — all skills (default) |
+
 ## Tools
 
-### `Agent`
+### `Agent
 
 Launch a sub-agent.
 
