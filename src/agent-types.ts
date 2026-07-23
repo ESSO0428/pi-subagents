@@ -8,6 +8,7 @@
 import { createCodingTools, createReadOnlyTools } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_AGENTS } from "./default-agents.js";
 import type { AgentConfig } from "./types.js";
+import { readNicoAgentOverrides, applyNicoOverridesToMap } from "./nico-overrides.js";
 
 /**
  * All known built-in tool names, derived from pi's own tool factories rather
@@ -78,6 +79,10 @@ export function registerAgents(userAgents: Map<string, AgentConfig>): void {
   for (const [name, config] of buildAgentRegistry(userAgents)) {
     agents.set(name, config);
   }
+
+  // Apply npm:pi-subagents-style JSON overrides (highest priority)
+  const { overrides, defaultModel } = readNicoAgentOverrides(process.cwd());
+  applyNicoOverridesToMap(agents, overrides, defaultModel);
 }
 
 /** Case-insensitive key resolution within a registry. */
