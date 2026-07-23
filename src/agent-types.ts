@@ -7,8 +7,8 @@
 
 import { createCodingTools, createReadOnlyTools } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_AGENTS } from "./default-agents.js";
+import { applyNicoOverridesToMap, readNicoAgentOverrides } from "./nico-overrides.js";
 import type { AgentConfig } from "./types.js";
-import { readNicoAgentOverrides, applyNicoOverridesToMap } from "./nico-overrides.js";
 
 
 /**
