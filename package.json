@@ -1,17 +1,17 @@
 {
-  "name": "@tintinweb/pi-subagents",
-  "version": "0.14.3",
-  "description": "A pi extension extension that brings smart Claude Code-style autonomous sub-agents to pi.",
-  "author": "tintinweb",
-  "license": "MIT",
+  "name": "@esso0428/pi-subagents",
+  "version": "0.15.0",
+  "description": "A pi extension that brings smart Claude Code-style autonomous sub-agents to pi, with npm:pi-subagents-style JSON agent overrides.",
+  "author": "ESSO0428",
   "repository": {
     "type": "git",
-    "url": "https://github.com/tintinweb/pi-subagents.git"
+    "url": "https://github.com/ESSO0428/pi-subagents.git"
   },
-  "homepage": "https://github.com/tintinweb/pi-subagents#readme",
+  "homepage": "https://github.com/ESSO0428/pi-subagents#readme",
   "bugs": {
-    "url": "https://github.com/tintinweb/pi-subagents/issues"
+    "url": "https://github.com/ESSO0428/pi-subagents/issues"
   },
+  "license": "MIT",
   "keywords": [
     "pi-package",
     "pi",

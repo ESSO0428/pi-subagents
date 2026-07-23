@@ -1,6 +1,13 @@
-# @tintinweb/pi-subagents
+# @esso0428/pi-subagents
 
 A [pi](https://pi.dev) extension that brings **Claude Code-style autonomous sub-agents** to pi. Spawn specialized agents that run in isolated sessions — each with its own tools, system prompt, model, and thinking level. Run them in foreground or background, steer them mid-run, resume completed sessions, and define your own custom agent types.
+
+> **Fork of [`@tintinweb/pi-subagents`](https://github.com/tintinweb/pi-subagents) with `npm:pi-subagents`-style JSON agent overrides integration.**
+>
+> You can configure agent `model`, `thinking`, `systemPrompt`, `tools`, and more via `settings.json`
+> (`~/.pi/agent/settings.json` or `.pi/settings.json`) under `subagents.agentOverrides.<agentName>`,
+> just like in [`npm:pi-subagents`](https://github.com/nicobailon/pi-subagents). JSON overrides take
+> the highest priority — above both built-in agents and `.pi/agents/*.md` definitions.
 
 <img width="600" alt="pi-subagents screenshot" src="https://github.com/tintinweb/pi-subagents/raw/master/media/screenshot.png" />
 
@@ -35,7 +42,7 @@ https://github.com/user-attachments/assets/8685261b-9338-4fea-8dfe-1c590d5df543
 ## Install
 
 ```bash
-pi install npm:@tintinweb/pi-subagents
+pi install npm:@esso0428/pi-subagents
 ```
 
 Or load directly for development:
