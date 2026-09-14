@@ -105,6 +105,10 @@ export interface AgentRecord {
   toolCallId?: string;
   /** Path to the streaming output transcript file. */
   outputFile?: string;
+  /** Absolute path to the durable project-local transcript while live. */
+  historyFile?: string;
+  /** Project-relative durable transcript path persisted in the parent session. */
+  transcriptPath?: string;
   /** Cleanup function for the output file stream subscription. */
   outputCleanup?: () => void;
   /**
@@ -133,6 +137,10 @@ export interface AgentRecord {
 export interface AgentInvocation {
   /** Short display name, e.g. "haiku" — only set when different from parent. */
   modelName?: string;
+  /** Effective model captured from the child session, including inherited models. */
+  effectiveModelName?: string;
+  /** Requested/ effective thinking level. */
+  effectiveThinking?: AgentSession["thinkingLevel"];
   thinking?: ThinkingLevel;
   maxTurns?: number;
   isolated?: boolean;

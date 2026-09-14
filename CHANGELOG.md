@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.17] - 2026-09-14
+
+### Fixed
+- **FleetView preserves the selected row while navigating** by maintaining a bounded viewport over the full roster; `j`/`k`, arrow keys, and normalized wheel input share one directional transition and consume handled wheel events without stealing input from other focused components.
+- **Structural Fleet/widget changes refresh the text-input viewport after a short defer** instead of requiring a manual redraw; refreshes coalesce, respect a maximum wait, cancel on session switch, and dispose before shutdown cleanup.
+
+## [0.15.16] - 2026-09-13
+
+### Added
+- **Live panel rendering now coalesces refreshes and avoids rebuilding unchanged rows**, keeping FleetView, the conversation timeline, and tool hover interactions responsive during frequent agent updates.
+
+### Fixed
+- Same-name tool results remain paired with their originating tool calls when a conversation is refreshed.
+
+## [0.15.15] - 2026-09-13
+
+### Added
+- **Full tool previews support modal-local scrolling shortcuts**: `j`/`k` scroll one line, `gg` jumps to the top, `G` jumps to the bottom, and `q`/`Esc` closes the read-only preview.
+
+### Fixed
+- `w` resolves the currently focused tool before opening its preview, preserves durable write/edit rendering, and forwards the full preview character budget to Input/Output rendering.
+- Tool double-click handling no longer reuses a stale span from a different click location.
+- Mouse clicks now use one synchronized focus target across USER, ASSISTANT, and Tool blocks; main-panel scrolling and `J/K` update the same target used by `[/]`, `Enter`, and `w`.
+- The live completed-agent widget remains available without letting multiline rows or a short terminal consume the text-input area; reload-restored records remain visible in that list.
+
+## [0.15.8] - 2026-09-12
+
+### Fixed
+- **Tool `click to show more` expansion now toggles only on the normalized left-click event**, preventing press/click double-dispatch from immediately collapsing the card again.
+
+## [0.15.7] - 2026-09-12
+
+### Added
+- **Conversation history now uses a viewer-local component timeline** with semantic USER/ASSISTANT/tool headers, visible search input, model/thinking metadata, keyboard and normalized mouse tool expansion, and ccstyle-compatible bounded tool/diff cards.
+- **Durable edit/write result metadata is rendered after history reload** without rereading the current file; older Pi hosts use a safe local fallback.
+
+### Fixed
+- **Terminal agent records retain durable history stubs after TTL cleanup**, while live session handles are released; duplicate history/menu labels now resolve to the exact selected record.
+
+## [0.15.6] - 2026-09-11
+
+### Fixed
+- **FleetView stays within a six-row budget** while preserving full-roster keyboard navigation, selected-row visibility, overflow indicators, and prompt-area separation.
+- **Agent history and live FleetView are routed separately**, keeping terminal records in the read-only history viewer instead of treating them as active sessions.
+- **Pi 0.85.1 model-runtime type compatibility** is restored without changing the legacy fallback path.
+
 ## [0.14.3] - 2026-07-23
 
 ### Fixed

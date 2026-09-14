@@ -23,6 +23,101 @@ export type CompactionInfo = { reason: "manual" | "threshold" | "overflow"; toke
 
 /** Default max concurrent background agents. */
 const DEFAULT_MAX_CONCURRENT = 4;
+const RESTORABLE_STATUSES = new Set(["completed", "steered", "stopped", "aborted", "error"] as const);
+const THINKING_LEVELS = new Set(["minimal", "low", "medium", "high", "xhigh", "max", "off"]);
+
+type RestorableAgentStatus = "completed" | "steered" | "stopped" | "aborted" | "error";
+
+/** Narrow persisted strings before putting them into runtime/UI state. */
+function isSafePersistedString(value: unknown, maxLength: number): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= maxLength && !/[\0\r\n]/.test(value);
+}
+
+function isFiniteTimestamp(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && Number.isInteger(value) && value >= 0;
+}
+
+function isValidUsage(value: unknown): value is { input: number; output: number; cacheWrite: number } {
+  if (!value || typeof value !== "object") return false;
+  const usage = value as Record<string, unknown>;
+  return ["input", "output", "cacheWrite"].every((key) => {
+    const n = usage[key];
+    return typeof n === "number" && Number.isFinite(n) && n >= 0;
+  });
+}
+
+function isSafeTranscriptLocator(value: unknown): value is string {
+  return typeof value === "string"
+    && /^\.pi-subagents\/agent-transcripts\/[^/]+\.jsonl$/.test(value)
+    && !value.includes("..")
+    && !value.includes("\\")
+    && !value.includes("\0");
+}
+
+function isSafeInvocation(value: unknown): value is AgentInvocation {
+  if (!value || typeof value !== "object") return false;
+  const invocation = value as Record<string, unknown>;
+  for (const key of ["modelName", "effectiveModelName"]) {
+    if (invocation[key] !== undefined && !isSafePersistedString(invocation[key], 512)) return false;
+  }
+  for (const key of ["thinking", "effectiveThinking"]) {
+    if (invocation[key] !== undefined && (typeof invocation[key] !== "string" || !THINKING_LEVELS.has(invocation[key]))) return false;
+  }
+  if (invocation.maxTurns !== undefined && (!Number.isInteger(invocation.maxTurns) || (invocation.maxTurns as number) < 0)) return false;
+  for (const key of ["isolated", "inheritContext", "runInBackground"]) {
+    if (invocation[key] !== undefined && typeof invocation[key] !== "boolean") return false;
+  }
+  if (invocation.isolation !== undefined && invocation.isolation !== "worktree") return false;
+  return true;
+}
+
+function cloneInvocation(value: AgentInvocation | undefined): AgentInvocation | undefined {
+  return value ? {
+    modelName: value.modelName,
+    effectiveModelName: value.effectiveModelName,
+    thinking: value.thinking,
+    effectiveThinking: value.effectiveThinking,
+    maxTurns: value.maxTurns,
+    isolated: value.isolated,
+    inheritContext: value.inheritContext,
+    runInBackground: value.runInBackground,
+    isolation: value.isolation,
+  } : undefined;
+}
+
+/** Validate one persisted terminal record without constructing runtime handles. */
+export function isRestorableAgentRecord(value: unknown): value is {
+  id: string;
+  type: string;
+  description: string;
+  status: RestorableAgentStatus;
+  startedAt: number;
+  completedAt: number;
+  result?: string;
+  error?: string;
+  toolUses?: number;
+  lifetimeUsage?: { input: number; output: number; cacheWrite: number };
+  transcriptPath?: string;
+  invocation?: AgentInvocation;
+} {
+  if (!value || typeof value !== "object") return false;
+  const record = value as Record<string, unknown>;
+  if (!isSafePersistedString(record.id, 256)
+    || !isSafePersistedString(record.type, 256)
+    || !isSafePersistedString(record.description, 4096)
+    || typeof record.status !== "string"
+    || !RESTORABLE_STATUSES.has(record.status as RestorableAgentStatus)
+    || !isFiniteTimestamp(record.startedAt)
+    || !isFiniteTimestamp(record.completedAt)
+    || record.completedAt < record.startedAt) return false;
+  if (record.result !== undefined && !isSafePersistedString(record.result, 2_000_000)) return false;
+  if (record.error !== undefined && !isSafePersistedString(record.error, 64_000)) return false;
+  if (record.toolUses !== undefined && (!Number.isInteger(record.toolUses) || (record.toolUses as number) < 0)) return false;
+  if (record.lifetimeUsage !== undefined && !isValidUsage(record.lifetimeUsage)) return false;
+  if (record.transcriptPath !== undefined && !isSafeTranscriptLocator(record.transcriptPath)) return false;
+  if (record.invocation !== undefined && !isSafeInvocation(record.invocation)) return false;
+  return true;
+}
 
 /**
  * Validate a caller-supplied SpawnOptions.cwd. `undefined`/`null` mean "unset"
@@ -277,6 +372,12 @@ export class AgentManager {
       },
       onSessionCreated: (session) => {
         record.session = session;
+        const model = session.model;
+        record.invocation = {
+          ...(record.invocation ?? {}),
+          ...(model && { effectiveModelName: model.name ?? model.id }),
+          effectiveThinking: session.thinkingLevel,
+        };
         // Flush any steers that arrived before the session was ready
         if (record.pendingSteers?.length) {
           for (const msg of record.pendingSteers) {
@@ -455,6 +556,12 @@ export class AgentManager {
     record.completedAt = undefined;
     record.result = undefined;
     record.error = undefined;
+    const resumedModel = record.session.model;
+    record.invocation = {
+      ...(record.invocation ?? {}),
+      ...(resumedModel && { effectiveModelName: resumedModel.name ?? resumedModel.id }),
+      effectiveThinking: record.session.thinkingLevel,
+    };
 
     try {
       const { text, failure } = await resumeAgent(record.session, prompt, {
@@ -516,6 +623,55 @@ export class AgentManager {
     );
   }
 
+  /** Restore terminal records persisted by a parent branch without runtime handles. */
+  restoreCompleted(records: readonly unknown[]): void {
+    const latest = new Map<string, ReturnType<typeof this.createRestoredRecord>>();
+    for (const value of records) {
+      if (isRestorableAgentRecord(value)) {
+        latest.set(value.id, this.createRestoredRecord(value));
+      }
+    }
+
+    for (const [id, restored] of latest) {
+      const existing = this.agents.get(id);
+      if (existing?.status === "running" || existing?.status === "queued") continue;
+      this.agents.set(id, restored);
+    }
+  }
+
+  private createRestoredRecord(record: {
+    id: string;
+    type: string;
+    description: string;
+    status: RestorableAgentStatus;
+    startedAt: number;
+    completedAt: number;
+    result?: string;
+    error?: string;
+    toolUses?: number;
+    lifetimeUsage?: { input: number; output: number; cacheWrite: number };
+    transcriptPath?: string;
+    invocation?: AgentInvocation;
+  }): AgentRecord {
+    return {
+      id: record.id,
+      type: record.type,
+      description: record.description,
+      status: record.status,
+      result: record.result,
+      error: record.error,
+      toolUses: record.toolUses ?? 0,
+      startedAt: record.startedAt,
+      completedAt: record.completedAt,
+      transcriptPath: record.transcriptPath,
+      invocation: cloneInvocation(record.invocation),
+      lifetimeUsage: record.lifetimeUsage
+        ? { ...record.lifetimeUsage }
+        : { input: 0, output: 0, cacheWrite: 0 },
+      compactionCount: 0,
+    };
+  }
+
   abort(id: string): boolean {
     const record = this.agents.get(id);
     if (!record) return false;
@@ -547,6 +703,19 @@ export class AgentManager {
     for (const [id, record] of this.agents) {
       if (record.status === "running" || record.status === "queued") continue;
       if ((record.completedAt ?? 0) >= cutoff) continue;
+      // A durable transcript is the source of truth for history. Release the
+      // live session after the TTL, but retain a lightweight record so opening
+      // history again in this session does not silently lose its identity or
+      // locator. Records without durable storage remain eligible for eviction.
+      if (record.transcriptPath) {
+        try { record.session?.dispose?.(); } catch { /* ignore cleanup failures */ }
+        record.session = undefined;
+        try { record.outputCleanup?.(); } catch { /* ignore cleanup failures */ }
+        record.outputCleanup = undefined;
+        record.outputFile = undefined;
+        record.historyFile = undefined;
+        continue;
+      }
       this.removeRecord(id, record);
     }
   }

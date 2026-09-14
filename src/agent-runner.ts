@@ -6,7 +6,7 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
-import type { ExtensionContext, LoadExtensionsResult } from "@earendil-works/pi-coding-agent";
+import type { ExtensionContext, LoadExtensionsResult, ModelRuntime } from "@earendil-works/pi-coding-agent";
 import {
   type AgentSession,
   type AgentSessionEvent,
@@ -25,6 +25,7 @@ import { buildMemoryBlock, buildReadOnlyMemoryBlock } from "./memory.js";
 import { buildAgentPrompt, type PromptExtras } from "./prompts.js";
 import { preloadSkills } from "./skill-loader.js";
 import type { SubagentType, ThinkingLevel } from "./types.js";
+import { createTrackedWriteTool } from "./write-execution.js";
 
 /**
  * Tool names registered by THIS extension. Single source of truth so the
@@ -781,14 +782,19 @@ export async function runAgent(
   const sessionManager = agentConfig?.persistSession
     ? SessionManager.create(effectiveCwd, configuredSessionDir ?? defaultSessionDir)
     : SessionManager.inMemory(effectiveCwd);
+  // Keep write tracking session-local. The custom definition shadows only this
+  // child session's built-in write entry; the parent registry is untouched.
+  const trackedWriteTool = toolNames.includes("write")
+    ? createTrackedWriteTool(effectiveCwd)
+    : undefined;
 
   // Pi 0.80.8 replaced createAgentSession's modelRegistry option with
   // modelRuntime, but ExtensionContext still exposes only the registry facade.
   // Pass both so the full supported Pi range retains the parent's providers.
-  const parentModelRuntime = (ctx.modelRegistry as unknown as { runtime?: unknown }).runtime;
+  const parentModelRuntime = (ctx.modelRegistry as unknown as { runtime?: ModelRuntime | null }).runtime ?? undefined;
   const sessionOpts: Parameters<typeof createAgentSession>[0] & {
     modelRegistry: ExtensionContext["modelRegistry"];
-    modelRuntime?: unknown;
+    modelRuntime?: ModelRuntime;
   } = {
     cwd: effectiveCwd,
     agentDir,
@@ -799,6 +805,7 @@ export async function runAgent(
     model,
     tools: sessionTools,
     resourceLoader: loader,
+    ...(trackedWriteTool && { customTools: [trackedWriteTool as any] }),
   };
   if (sessionExcludeTools) {
     sessionOpts.excludeTools = sessionExcludeTools;

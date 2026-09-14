@@ -24,6 +24,8 @@ import { isModelInScope, readEnabledModels, resolveEnabledModels } from "./enabl
 import { GroupJoinManager } from "./group-join.js";
 import { resolveAgentInvocationConfig, resolveJoinMode } from "./invocation-config.js";
 import { type ModelRegistry, resolveModel } from "./model-resolver.js";
+import { agentHistoryLocator, createAgentHistoryPath, readAgentHistory } from "./agent-history.js";
+import { buildAgentStatusMenuEntries, canOpenActiveAgent, canOpenAgentHistory, formatAgentHistoryOption, splitAgentRecords } from "./agent-history-list.js";
 import { createOutputFilePath, streamToOutputFile, writeInitialEntry } from "./output-file.js";
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
@@ -48,6 +50,7 @@ import {
   type UICtx,
 } from "./ui/agent-widget.js";
 import { FleetList, type FleetUICtx } from "./ui/fleet-list.js";
+import { createDeferredUiRefresh } from "./ui/deferred-ui-refresh.js";
 import { showSchedulesMenu } from "./ui/schedule-menu.js";
 import { addUsage, getLifetimeTotal, getSessionContextPercent, type LifetimeUsage } from "./usage.js";
 
@@ -372,6 +375,7 @@ export default function (pi: ExtensionAPI) {
     fleet.onAgentFinished(record.id);
     scheduleNudge(record.id, () => emitIndividualNudge(record));
     widget.update();
+    scheduleUiRefresh();
   }
 
   // ---- Group join manager ----
@@ -383,7 +387,11 @@ export default function (pi: ExtensionAPI) {
       scheduleNudge(groupKey, () => {
         // Re-check at send time
         const unconsumed = records.filter(r => !r.resultConsumed);
-        if (unconsumed.length === 0) { widget.update(); return; }
+        if (unconsumed.length === 0) {
+          widget.update();
+          scheduleUiRefresh();
+          return;
+        }
 
         const notifications = unconsumed.map(r => formatTaskNotification(r, 300)).join('\n\n');
         const label = partial
@@ -404,6 +412,7 @@ export default function (pi: ExtensionAPI) {
         }, { deliverAs: "followUp", triggerTurn: true });
       });
       widget.update();
+      scheduleUiRefresh();
     },
     30_000,
   );
@@ -449,6 +458,10 @@ export default function (pi: ExtensionAPI) {
       id: record.id, type: record.type, description: record.description,
       status: record.status, result: record.result, error: record.error,
       startedAt: record.startedAt, completedAt: record.completedAt,
+      toolUses: record.toolUses,
+      lifetimeUsage: record.lifetimeUsage,
+      invocation: record.invocation,
+      transcriptPath: record.transcriptPath,
     });
 
     // Skip notification if result was already consumed via get_subagent_result
@@ -457,6 +470,7 @@ export default function (pi: ExtensionAPI) {
       widget.markFinished(record.id);
       fleet.onAgentFinished(record.id);
       widget.update();
+      scheduleUiRefresh();
       return;
     }
 
@@ -464,6 +478,7 @@ export default function (pi: ExtensionAPI) {
     // don't send an individual nudge — finalizeBatch will pick it up retroactively.
     if (currentBatchAgents.some(a => a.id === record.id)) {
       widget.update();
+      scheduleUiRefresh();
       return;
     }
 
@@ -474,6 +489,7 @@ export default function (pi: ExtensionAPI) {
     // 'held' → do nothing, group will fire later
     // 'delivered' → group callback already fired
     widget.update();
+    scheduleUiRefresh();
   }, undefined, (record) => {
     // Emit started event when agent transitions to running (including from queue)
     pi.events.emit("subagents:started", {
@@ -481,6 +497,11 @@ export default function (pi: ExtensionAPI) {
       type: record.type,
       description: record.description,
     });
+    widget.ensureTimer();
+    widget.update();
+    fleet.ensureTimer();
+    fleet.update();
+    scheduleUiRefresh();
   }, (record, info) => {
     // Emit compacted event when agent's session compacts (preserves count on record).
     pi.events.emit("subagents:compacted", {
@@ -553,6 +574,10 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     currentCtx = ctx;
     manager.clearCompleted(true);
+    const branch = ctx.sessionManager?.getBranch?.() ?? [];
+    manager.restoreCompleted(branch
+      .filter((entry: any) => entry?.type === "custom" && entry?.customType === "subagents:record")
+      .map((entry: any) => entry.data));
     // Guard mirrors the `!scheduler.isActive()` pattern below: session_start
     // fires once per activation, but a double-bind must not leak listeners.
     if (!rpcHandle) {
@@ -571,6 +596,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_before_switch", () => {
+    deferredUiRefresh.cancel();
     manager.clearCompleted(true);
     scheduler.stop();
   });
@@ -592,6 +618,7 @@ export default function (pi: ExtensionAPI) {
     manager.abortAll();
     for (const timer of pendingNudges.values()) clearTimeout(timer);
     pendingNudges.clear();
+    deferredUiRefresh.dispose();
     fleet.dispose();
     manager.dispose();
   });
@@ -604,13 +631,34 @@ export default function (pi: ExtensionAPI) {
   let widgetMode: WidgetMode = "background";
   function getWidgetMode(): WidgetMode { return widgetMode; }
   const widget = new AgentWidget(manager, agentActivity, getWidgetMode);
-  function setWidgetMode(m: WidgetMode): void { widgetMode = m; widget.update(); }
+  function setWidgetMode(m: WidgetMode): void {
+    const changed = widgetMode !== m;
+    widgetMode = m;
+    widget.update();
+    if (changed) scheduleUiRefresh();
+  }
 
   // Claude Code-style FleetView: navigable list of main + subagents below the editor.
-  const fleet = new FleetList(manager, agentActivity);
+  const fleet = new FleetList(manager, agentActivity, () => currentCtx?.cwd, pi, () => currentCtx);
+
+  // One render-only scheduler is shared by both widgets. The callback resolves
+  // the live TUI target at fire time because session switches invalidate the
+  // previous widget context; both widgets use the same TUI, so one successful
+  // request is sufficient.
+  const deferredUiRefresh = createDeferredUiRefresh(() => {
+    if (widget.requestUiRefresh(true)) return;
+    fleet.requestUiRefresh(true);
+  });
+  const scheduleUiRefresh = (): void => deferredUiRefresh.schedule();
+
   let fleetViewEnabled = true;
   function isFleetViewEnabled(): boolean { return fleetViewEnabled; }
-  function setFleetViewEnabled(b: boolean): void { fleetViewEnabled = b; fleet.setEnabled(b); }
+  function setFleetViewEnabled(b: boolean): void {
+    const changed = fleetViewEnabled !== b;
+    fleetViewEnabled = b;
+    fleet.setEnabled(b);
+    if (changed) scheduleUiRefresh();
+  }
 
   // Project/global default for writing the subagent .output transcript. A custom
   // agent's `output_transcript` frontmatter overrides this per spawn; when the
@@ -710,8 +758,9 @@ export default function (pi: ExtensionAPI) {
 
   // Grab UI context from first tool execution + clear lingering widget on new turn
   pi.on("tool_execution_start", async (_event, ctx) => {
-    widget.setUICtx(ctx.ui as UICtx);
-    fleet.setUICtx(ctx.ui as unknown as FleetUICtx);
+    const widgetContextChanged = widget.setUICtx(ctx.ui as UICtx);
+    const fleetContextChanged = fleet.setUICtx(ctx.ui as unknown as FleetUICtx);
+    if (widgetContextChanged || fleetContextChanged) scheduleUiRefresh();
     widget.onTurnStart();
   });
 
@@ -1138,6 +1187,19 @@ Terse command-style prompts produce shallow, generic work.
         if (!rec || !outputTranscript) return;
         rec.outputFile = createOutputFilePath(ctx.cwd, agentId, ctx.sessionManager.getSessionId());
         writeInitialEntry(rec.outputFile, agentId, params.prompt, ctx.cwd);
+
+        try {
+          rec.historyFile = createAgentHistoryPath(ctx.cwd, agentId);
+          rec.transcriptPath = agentHistoryLocator(ctx.cwd, rec.historyFile);
+          writeInitialEntry(rec.historyFile, agentId, params.prompt, ctx.cwd);
+        } catch (err) {
+          rec.historyFile = undefined;
+          rec.transcriptPath = undefined;
+          ctx.ui.notify(
+            `Could not create durable transcript for agent ${agentId}: ${err instanceof Error ? err.message : String(err)}`,
+            "warning",
+          );
+        }
       };
 
       const parentModelId = ctx.model?.id;
@@ -1148,7 +1210,9 @@ Terse command-style prompts produce shallow, generic work.
       const effectiveMaxTurns = normalizeMaxTurns(resolvedConfig.maxTurns ?? getDefaultMaxTurns());
       const agentInvocation: AgentInvocation = {
         modelName,
+        effectiveModelName: model?.name ?? model?.id ?? ctx.model?.name ?? ctx.model?.id,
         thinking,
+        effectiveThinking: thinking,
         // Explicit value only — the default fallback would just add noise.
         // Normalize so `0` (unlimited) doesn't surface as a misleading "max turns: 0".
         maxTurns: normalizeMaxTurns(resolvedConfig.maxTurns),
@@ -1247,7 +1311,7 @@ Terse command-style prompts produce shallow, generic work.
           origBgOnSession(session);
           const rec = manager.getRecord(id);
           if (rec?.outputFile) {
-            rec.outputCleanup = streamToOutputFile(session, rec.outputFile, id, ctx.cwd);
+            rec.outputCleanup = streamToOutputFile(session, rec.outputFile, id, ctx.cwd, rec.historyFile);
           }
         };
 
@@ -1294,6 +1358,7 @@ Terse command-style prompts produce shallow, generic work.
         widget.update();
         fleet.ensureTimer();
         fleet.update();
+        scheduleUiRefresh();
 
         // Emit created event
         pi.events.emit("subagents:created", {
@@ -1354,8 +1419,10 @@ Terse command-style prompts produce shallow, generic work.
             fgId = a.id;
             agentActivity.set(a.id, fgState);
             widget.ensureTimer();
+            widget.update();
             fleet.ensureTimer();
             fleet.update();
+            scheduleUiRefresh();
             break;
           }
         }
@@ -1363,7 +1430,7 @@ Terse command-style prompts produce shallow, generic work.
         if (fgId) {
           const rec = manager.getRecord(fgId);
           if (rec?.outputFile) {
-            rec.outputCleanup = streamToOutputFile(session, rec.outputFile, fgId, ctx.cwd);
+            rec.outputCleanup = streamToOutputFile(session, rec.outputFile, fgId, ctx.cwd, rec.historyFile);
           }
         }
       };
@@ -1617,13 +1684,10 @@ Terse command-style prompts produce shallow, generic work.
     // Build select options
     const options: string[] = [];
 
-    // Running agents entry (only if there are active agents)
-    const agents = manager.listAgents();
-    if (agents.length > 0) {
-      const running = agents.filter(a => a.status === "running" || a.status === "queued").length;
-      const done = agents.filter(a => a.status === "completed" || a.status === "steered").length;
-      options.push(`Running agents (${agents.length}) — ${running} running, ${done} done`);
-    }
+    // Keep active agents and terminal history in separate menu entries.
+    const records = manager.listAgents();
+    const { active, history } = splitAgentRecords(records, ctx.cwd);
+    options.push(...buildAgentStatusMenuEntries(records, ctx.cwd));
 
     // Agent types list
     if (allNames.length > 0) {
@@ -1640,7 +1704,7 @@ Terse command-style prompts produce shallow, generic work.
     options.push("Create new agent");
     options.push("Settings");
 
-    const noAgentsMsg = allNames.length === 0 && agents.length === 0
+    const noAgentsMsg = allNames.length === 0 && active.length === 0 && history.length === 0
       ? "No agents found. Create specialized subagents that can be delegated to.\n\n" +
         "Each subagent has its own context window, custom system prompt, and specific tools.\n\n" +
         "Try creating: Code Reviewer, Security Auditor, Test Writer, or Documentation Writer.\n\n"
@@ -1655,6 +1719,9 @@ Terse command-style prompts produce shallow, generic work.
 
     if (choice.startsWith("Running agents (")) {
       await showRunningAgents(ctx);
+      await showAgentsMenu(ctx);
+    } else if (choice.startsWith("Agent history (")) {
+      await showAgentHistory(ctx);
       await showAgentsMenu(ctx);
     } else if (choice.startsWith("Agent types (")) {
       await showAllAgentsList(ctx);
@@ -1738,49 +1805,112 @@ Terse command-style prompts produce shallow, generic work.
     }
   }
 
+  function makeUniqueAgentOptionLabels(pairs: Array<{ record: AgentRecord; label: string }>): string[] {
+    const counts = new Map<string, number>();
+    for (const pair of pairs) counts.set(pair.label, (counts.get(pair.label) ?? 0) + 1);
+    const used = new Set<string>();
+    return pairs.map((pair) => {
+      const { record, label } = pair;
+      if ((counts.get(label) ?? 0) === 1) {
+        used.add(label);
+        return label;
+      }
+      const suffix = ` · #${record.id.slice(-8)}`;
+      let candidate = `${label}${suffix}`;
+      let n = 2;
+      while (used.has(candidate)) candidate = `${label}${suffix}-${n++}`;
+      used.add(candidate);
+      pair.label = candidate;
+      return candidate;
+    });
+  }
+
   async function showRunningAgents(ctx: ExtensionCommandContext) {
-    const agents = manager.listAgents();
+    const { active: agents } = splitAgentRecords(manager.listAgents(), ctx.cwd);
     if (agents.length === 0) {
       ctx.ui.notify("No agents.", "info");
       return;
     }
 
-    const options = agents.map(a => {
-      const dn = getDisplayName(a.type);
-      const dur = formatDuration(a.startedAt, a.completedAt);
-      return `${dn} (${a.description}) · ${a.toolUses} tools · ${a.status} · ${dur}`;
+    const pairs = agents.map((record) => {
+      const dn = getDisplayName(record.type);
+      const dur = formatDuration(record.startedAt, record.completedAt);
+      return { record, label: `${dn} (${record.description}) · ${record.toolUses} tools · ${record.status} · ${dur}` };
     });
+    const options = makeUniqueAgentOptionLabels(pairs);
 
     const choice = await ctx.ui.select("Running agents", options);
     if (!choice) return;
+    const record = pairs.find((pair) => pair.label === choice)?.record;
+    if (!record) return;
 
-    // Find the selected agent by matching the option index
-    const idx = options.indexOf(choice);
-    if (idx < 0) return;
-    const record = agents[idx];
-
-    await viewAgentConversation(ctx, record);
+    await viewAgentConversation(ctx, record, "live");
     // Back-navigation: re-show the list
     await showRunningAgents(ctx);
   }
 
-  async function viewAgentConversation(ctx: ExtensionCommandContext, record: AgentRecord) {
-    if (!record.session) {
-      ctx.ui.notify(`Agent is ${record.status === "queued" ? "queued" : "expired"} — no session available.`, "info");
+  async function showAgentHistory(ctx: ExtensionCommandContext) {
+    const { history } = splitAgentRecords(manager.listAgents(), ctx.cwd);
+    if (history.length === 0) {
+      ctx.ui.notify("No agent history.", "info");
       return;
     }
 
-    const { ConversationViewer, VIEWPORT_HEIGHT_PCT } = await import("./ui/conversation-viewer.js");
-    const session = record.session;
-    const activity = agentActivity.get(record.id);
+    const pairs = history.map((record) => ({ record, label: formatAgentHistoryOption(record, Date.now()) }));
+    const options = makeUniqueAgentOptionLabels(pairs);
+    const choice = await ctx.ui.select("Agent history", options);
+    if (!choice) return;
+    const record = pairs.find((pair) => pair.label === choice)?.record;
+    if (!record) return;
 
+    await viewAgentConversation(ctx, record, "history");
+  }
+
+  async function viewAgentConversation(
+    ctx: ExtensionCommandContext,
+    record: AgentRecord,
+    mode: "live" | "history",
+  ) {
+    if (mode === "live" && !canOpenActiveAgent(record)) {
+      ctx.ui.notify(`Agent is ${record.status === "queued" ? "queued" : "expired"} — no history available.`, "info");
+      return;
+    }
+    if (mode === "history" && !canOpenAgentHistory(record, ctx.cwd)) {
+      ctx.ui.notify("No agent history.", "info");
+      return;
+    }
+
+    const { ConversationViewer, VIEWPORT_HEIGHT_PCT, createStaticConversationSource } = await import("./ui/conversation-viewer.js");
+    const session = mode === "live"
+      ? record.session
+      : (() => {
+          const messages = record.transcriptPath
+            ? readAgentHistory(ctx.cwd, record.transcriptPath)
+            : undefined;
+          return messages
+            ? createStaticConversationSource(messages)
+            : record.session
+              ? createStaticConversationSource(record.session.messages)
+              : undefined;
+        })();
+    if (!session) {
+      ctx.ui.notify("No agent history.", "info");
+      return;
+    }
+
+    const activity = agentActivity.get(record.id);
+    const isLive = mode === "live";
     await ctx.ui.custom<undefined>(
       (tui, theme, keybindings, done) => {
-        return new ConversationViewer(tui, session, record, activity, theme, done, () => {
-          if (manager.abort(record.id)) {
-            ctx.ui.notify(`Stopped "${record.description}".`, "info");
-          }
-        }, keybindings, (message: string) => manager.steer(record.id, message));
+        return new ConversationViewer(tui, session, record, activity, theme, done,
+          isLive ? () => {
+            if (manager.abort(record.id)) {
+              ctx.ui.notify(`Stopped "${record.description}".`, "info");
+            }
+          } : undefined,
+          keybindings,
+          isLive ? (message: string) => manager.steer(record.id, message) : undefined,
+          mode === "history" ? { pi, ctx, readOnly: true } : { pi, ctx });
       },
       {
         overlay: true,

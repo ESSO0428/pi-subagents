@@ -14,7 +14,19 @@ import { getLifetimeTotal, getSessionContextPercent, type LifetimeUsage, type Se
 // ---- Constants ----
 
 /** Maximum number of rendered lines before overflow collapse kicks in. */
-const MAX_WIDGET_LINES = 12;
+export const MAX_WIDGET_LINES = 12;
+/** Keep a small editor/input area visible below the above-editor widget. */
+const MIN_EDITOR_LINES = 4;
+
+/**
+ * Derive the widget ceiling from the terminal height while retaining the
+ * historical MAX_WIDGET_LINES ceiling. Very short terminals may have no room
+ * for the widget; that is preferable to consuming the editor/input area.
+ */
+export function getWidgetLineBudget(rows: number): number {
+  if (!Number.isFinite(rows)) return MAX_WIDGET_LINES;
+  return Math.min(MAX_WIDGET_LINES, Math.max(0, Math.floor(rows) - MIN_EDITOR_LINES));
+}
 
 /** Braille spinner frames for animated running indicator. */
 export const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -166,7 +178,8 @@ export function buildInvocationTags(
 ): { modelName?: string; tags: string[] } {
   const tags: string[] = [];
   if (!invocation) return { tags };
-  if (invocation.thinking) tags.push(`thinking: ${invocation.thinking}`);
+  const thinking = invocation.effectiveThinking ?? invocation.thinking;
+  if (thinking) tags.push(`thinking: ${thinking}`);
   if (invocation.isolated) tags.push("isolated");
   if (invocation.isolation === "worktree") tags.push("worktree");
   if (invocation.inheritContext) tags.push("inherit context");
@@ -175,9 +188,9 @@ export function buildInvocationTags(
   return { modelName: invocation.modelName, tags };
 }
 
-/** Truncate text to a single line, max `len` chars. */
+/** Normalize and truncate text so it can never add physical widget rows. */
 function truncateLine(text: string, len = 60): string {
-  const line = text.split("\n").find(l => l.trim())?.trim() ?? "";
+  const line = text.replace(/[\r\n]+/g, " ").replace(/\s+/g, " ").trim();
   if (line.length <= len) return line;
   return line.slice(0, len) + "…";
 }
@@ -227,6 +240,8 @@ export class AgentWidget {
   private tui: any | undefined;
   /** Last status bar text, used to avoid redundant setStatus calls. */
   private lastStatusText: string | undefined;
+  /** Snapshot of the state used for the last widget registration/render request. */
+  private lastRenderKey: string | undefined;
 
   constructor(
     private manager: AgentManager,
@@ -260,15 +275,24 @@ export class AgentWidget {
   }
 
   /** Set the UI context (grabbed from first tool execution). */
-  setUICtx(ctx: UICtx) {
-    if (ctx !== this.uiCtx) {
-      // UICtx changed — the widget registered on the old context is gone.
-      // Force re-registration on next update().
-      this.uiCtx = ctx;
-      this.widgetRegistered = false;
-      this.tui = undefined;
-      this.lastStatusText = undefined;
-    }
+  setUICtx(ctx: UICtx): boolean {
+    if (ctx === this.uiCtx) return false;
+
+    // UICtx changed — the widget registered on the old context is gone.
+    // Force re-registration on next update().
+    this.uiCtx = ctx;
+    this.widgetRegistered = false;
+    this.tui = undefined;
+    this.lastStatusText = undefined;
+    this.lastRenderKey = undefined;
+    return true;
+  }
+
+  /** Request a render on the currently registered TUI without touching input. */
+  requestUiRefresh(force = true): boolean {
+    if (!this.tui) return false;
+    this.tui.requestRender(force);
+    return true;
   }
 
   /**
@@ -284,10 +308,20 @@ export class AgentWidget {
     this.update();
   }
 
-  /** Ensure the widget update timer is running. */
+  /** Keep the spinner/elapsed-time timer alive only while a visible agent runs. */
   ensureTimer() {
+    if (!this.uiCtx || !this.widgetAgents().some(a => a.status === "running")) return;
     if (!this.widgetInterval) {
-      this.widgetInterval = setInterval(() => this.update(), 80);
+      this.widgetInterval = setInterval(() => this.update(true), 80);
+    }
+  }
+
+  private syncTimer(shouldRun: boolean): void {
+    if (shouldRun) {
+      this.ensureTimer();
+    } else if (this.widgetInterval) {
+      clearInterval(this.widgetInterval);
+      this.widgetInterval = undefined;
     }
   }
 
@@ -324,7 +358,7 @@ export class AgentWidget {
       statusText = theme.fg("dim", " stopped");
     } else if (a.status === "error") {
       icon = theme.fg("error", "✗");
-      const errMsg = a.error ? `: ${a.error.slice(0, 60)}` : "";
+      const errMsg = a.error ? `: ${truncateLine(a.error)}` : "";
       statusText = theme.fg("error", ` error${errMsg}`);
     } else {
       // aborted
@@ -339,7 +373,7 @@ export class AgentWidget {
     parts.push(duration);
 
     const modeTag = modeLabel ? ` ${theme.fg("dim", `(${modeLabel})`)}` : "";
-    return `${icon} ${theme.fg("dim", name)}${modeTag}  ${theme.fg("dim", a.description)} ${theme.fg("dim", "·")} ${theme.fg("dim", parts.join(" · "))}${statusText}`;
+    return `${icon} ${theme.fg("dim", name)}${modeTag}  ${theme.fg("dim", truncateLine(a.description))} ${theme.fg("dim", "·")} ${theme.fg("dim", parts.join(" · "))}${statusText}`;
   }
 
   /**
@@ -362,6 +396,8 @@ export class AgentWidget {
     if (!hasActive && !hasFinished) return [];
 
     const w = tui.terminal.columns;
+    const maxLines = getWidgetLineBudget(tui.terminal.rows);
+    if (maxLines === 0) return [];
     const truncate = (line: string) => truncateToWidth(line, w);
     const headingColor = hasActive ? "accent" : "dim";
     const headingIcon = hasActive ? "●" : "○";
@@ -398,7 +434,7 @@ export class AgentWidget {
       const activity = bg ? describeActivity(bg.activeTools, bg.responseText) : "thinking…";
 
       runningLines.push([
-        truncate(theme.fg("dim", "├─") + ` ${theme.fg("accent", frame)} ${theme.bold(name)}${modeTag}  ${theme.fg("muted", a.description)} ${theme.fg("dim", "·")} ${fgPreservingNestedStyles(theme, "dim", statsText)}`),
+        truncate(theme.fg("dim", "├─") + ` ${theme.fg("accent", frame)} ${theme.bold(name)}${modeTag}  ${theme.fg("muted", truncateLine(a.description))} ${theme.fg("dim", "·")} ${fgPreservingNestedStyles(theme, "dim", statsText)}`),
         truncate(theme.fg("dim", "│  ") + theme.fg("dim", `  ⎿  ${activity}`)),
       ]);
     }
@@ -407,11 +443,17 @@ export class AgentWidget {
       ? truncate(theme.fg("dim", "├─") + ` ${theme.fg("muted", "◦")} ${theme.fg("dim", `${queued.length} queued`)}`)
       : undefined;
 
-    // Assemble with overflow cap (heading + overflow indicator = 2 reserved lines).
-    const maxBody = MAX_WIDGET_LINES - 1; // heading takes 1 line
+    // Assemble with a responsive cap (heading + overflow indicator = 2
+    // reserved lines when content exceeds the available body budget).
+    const maxBody = maxLines - 1; // heading takes 1 line
     const totalBody = finishedLines.length + runningLines.length * 2 + (queuedLine ? 1 : 0);
 
     const lines: string[] = [truncate(theme.fg(headingColor, headingIcon) + " " + theme.fg(headingColor, "Agents"))];
+
+    if (maxLines === 1) {
+      // There is room only for the heading; do not consume the editor/input row.
+      return lines;
+    }
 
     if (totalBody <= maxBody) {
       // Everything fits — add all lines and fix up connectors for the last item.
@@ -438,6 +480,7 @@ export class AgentWidget {
       // Reserve 1 line for overflow indicator.
       let budget = maxBody - 1;
       let hiddenRunning = 0;
+      let hiddenQueued = 0;
       let hiddenFinished = 0;
 
       // 1. Running agents (2 lines each)
@@ -451,9 +494,13 @@ export class AgentWidget {
       }
 
       // 2. Queued line
-      if (queuedLine && budget >= 1) {
-        lines.push(queuedLine);
-        budget--;
+      if (queuedLine) {
+        if (budget >= 1) {
+          lines.push(queuedLine);
+          budget--;
+        } else {
+          hiddenQueued = 1;
+        }
       }
 
       // 3. Finished agents
@@ -469,17 +516,53 @@ export class AgentWidget {
       // Overflow summary
       const overflowParts: string[] = [];
       if (hiddenRunning > 0) overflowParts.push(`${hiddenRunning} running`);
+      if (hiddenQueued > 0) overflowParts.push(`${hiddenQueued} queued`);
       if (hiddenFinished > 0) overflowParts.push(`${hiddenFinished} finished`);
       const overflowText = overflowParts.join(", ");
-      lines.push(truncate(theme.fg("dim", "└─") + ` ${theme.fg("dim", `+${hiddenRunning + hiddenFinished} more (${overflowText})`)}`)
+      lines.push(truncate(theme.fg("dim", "└─") + ` ${theme.fg("dim", `+${hiddenRunning + hiddenQueued + hiddenFinished} more (${overflowText})`)}`)
       );
     }
 
     return lines;
   }
 
-  /** Force an immediate widget update. */
-  update() {
+  /** Build a render-relevant snapshot without capturing mutable records. */
+  private renderKey(allAgents: ReturnType<AgentManager["listAgents"]>): string {
+    const activities = allAgents.map(a => {
+      const activity = this.agentActivity.get(a.id);
+      return activity ? {
+        id: a.id,
+        activeTools: [...activity.activeTools.entries()],
+        toolUses: activity.toolUses,
+        responseText: activity.responseText,
+        turnCount: activity.turnCount,
+        maxTurns: activity.maxTurns,
+        lifetimeUsage: activity.lifetimeUsage,
+        contextPercent: getSessionContextPercent(activity.session),
+      } : undefined;
+    });
+    return JSON.stringify({
+      frame: this.widgetFrame,
+      agents: allAgents.map(a => ({
+        id: a.id,
+        type: a.type,
+        description: a.description,
+        status: a.status,
+        toolUses: a.toolUses,
+        startedAt: a.startedAt,
+        completedAt: a.completedAt,
+        error: a.error,
+        lifetimeUsage: a.lifetimeUsage,
+        compactionCount: a.compactionCount,
+        isBackground: a.isBackground,
+      })),
+      activities,
+      finishedTurnAge: [...this.finishedTurnAge.entries()],
+    });
+  }
+
+  /** Force an immediate widget update. `advanceSpinner` is reserved for the timer. */
+  update(advanceSpinner = false) {
     if (!this.uiCtx) return;
     const allAgents = this.widgetAgents();
 
@@ -505,7 +588,8 @@ export class AgentWidget {
         this.uiCtx.setStatus("subagents", undefined);
         this.lastStatusText = undefined;
       }
-      if (this.widgetInterval) { clearInterval(this.widgetInterval); this.widgetInterval = undefined; }
+      this.lastRenderKey = undefined;
+      this.syncTimer(false);
       // Clean up stale entries
       for (const [id] of this.finishedTurnAge) {
         if (!allAgents.some(a => a.id === id)) this.finishedTurnAge.delete(id);
@@ -527,7 +611,12 @@ export class AgentWidget {
       this.lastStatusText = newStatusText;
     }
 
-    this.widgetFrame++;
+    // Spinner animation is driven only by the timer while a visible running
+    // agent exists. Event-driven updates refresh changed stats without making
+    // an otherwise idle widget advance.
+    if (advanceSpinner && runningCount > 0) this.widgetFrame++;
+    this.syncTimer(runningCount > 0);
+    const renderKey = this.renderKey(allAgents);
 
     // Register widget callback once; subsequent updates use requestRender()
     // which re-invokes render() without replacing the component (avoids layout thrashing).
@@ -540,14 +629,17 @@ export class AgentWidget {
             // Theme changed — force re-registration so factory captures fresh theme.
             this.widgetRegistered = false;
             this.tui = undefined;
+            this.lastRenderKey = undefined;
           },
         };
       }, { placement: "aboveEditor" });
       this.widgetRegistered = true;
-    } else {
-      // Widget already registered — just request a re-render of existing components.
+    } else if (renderKey !== this.lastRenderKey) {
+      // Widget already registered — request a re-render only when visible state
+      // changed (or the spinner timer advanced).
       this.tui?.requestRender();
     }
+    this.lastRenderKey = renderKey;
   }
 
   dispose() {
@@ -562,5 +654,8 @@ export class AgentWidget {
     this.widgetRegistered = false;
     this.tui = undefined;
     this.lastStatusText = undefined;
+    this.lastRenderKey = undefined;
+    this.uiCtx = undefined;
+    this.finishedTurnAge.clear();
   }
 }
