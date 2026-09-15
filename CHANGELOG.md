@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-09-15
+
+> **⚠️ Breaking: pi 0.80.8 is now the minimum supported host version.** The package peer dependencies require `@earendil-works/pi-ai`, `@earendil-works/pi-coding-agent`, and `@earendil-works/pi-tui` `>=0.80.8`; upgrade pi before installing this release. This floor matches the `ModelRuntime` API used by the runner and avoids installing a release against the pre-0.80.8 session-creation contract.
+
+### Added
+- **Conversation tool output now receives bounded syntax highlighting.** Expanded tool cards infer a language only from an explicit file path or fenced-code language, render with pi's synchronous highlighter on the first paint, and enhance eligible output asynchronously with Shiki. The viewer keeps a local cache and falls back safely when Shiki is unavailable or the output is too large.
+- **Project-local durable history mirrors subagent transcripts.** When output transcripts are enabled, each agent's JSONL stream is also written under `.pi-subagents/agent-transcripts/` (with the directory ignored by Git), and the parent session stores a project-relative locator. Terminal agent records can therefore be reopened in the read-only history viewer after their temporary live handles and output files have been cleaned up or after the session is reloaded.
+
+### Changed
+- **Pi compatibility now starts at `>=0.80.8`.** The runner forwards the parent `ModelRuntime` to child sessions on hosts exposing the new API, preserving extension-registered providers and authentication for isolated agents; the legacy session option remains as a compatibility fallback in the implementation, but older pi versions are outside this release's supported peer range.
+- **Shiki is a runtime dependency.** `@shikijs/cli` is now shipped in `dependencies` because the conversation viewer loads it lazily at runtime for asynchronous tool-output highlighting; pi's highlighter remains the synchronous fallback.
+
 ## [0.15.17] - 2026-09-14
 
 ### Fixed
