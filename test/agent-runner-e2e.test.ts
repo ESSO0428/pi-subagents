@@ -27,11 +27,12 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { extensionCanonicalName, runAgent } from "../src/agent-runner.js";
 import { registerAgents } from "../src/agent-types.js";
 import type { AgentConfig } from "../src/types.js";
-import { registerFauxProvider } from "./helpers/pi-ai.js";
+import { fauxProvider } from "./helpers/pi-ai.js";
 
 // These tests spin up the REAL pi-mono runtime (loader + dynamic extension
 // import + session construction), so a cold first run under full-suite CPU
@@ -51,16 +52,19 @@ function makePi() {
 
 describe("agent-runner end-to-end (real pi-mono session + real extension)", () => {
   let cwd: string;
-  let faux: ReturnType<typeof registerFauxProvider>;
+  let faux: ReturnType<typeof fauxProvider>;
+  let modelRuntime: ModelRuntime;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     cwd = mkdtempSync(join(tmpdir(), "subagents-e2e-"));
     // Only used as a valid Model object for createAgentSession; we never rely
     // on it actually streaming (we assert on the pre-prompt gated tool set).
-    faux = registerFauxProvider({ provider: "faux", models: [{ id: "faux-1", contextWindow: 200_000 }] });
+    faux = fauxProvider({ provider: "faux", models: [{ id: "faux-1", contextWindow: 200_000 }] });
+    modelRuntime = await ModelRuntime.create({ refreshOnCreate: false });
+    modelRuntime.registerNativeProvider(faux.provider);
   });
   afterEach(() => {
-    faux.unregister();
+    modelRuntime.unregisterProvider("faux");
     rmSync(cwd, { recursive: true, force: true });
   });
 
@@ -90,6 +94,7 @@ describe("agent-runner end-to-end (real pi-mono session + real extension)", () =
     );
     const model = faux.getModel();
     const modelRegistry: any = {
+      runtime: modelRuntime,
       find: () => model,
       getAll: () => [model],
       getAvailable: () => [model],

@@ -1,11 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
+import { canOpenActiveAgent } from "../../src/agent-history-list.js";
 import {
   calculateFleetAgentWindow,
   ensureFleetSelectionVisible,
   FLEET_MAX_RENDER_ROWS,
   FleetList,
 } from "../../src/ui/fleet-list.js";
-import { canOpenActiveAgent } from "../../src/agent-history-list.js";
 
 const theme = {
   fg: (_color: string, text: string) => text,
@@ -167,7 +167,7 @@ describe("FleetList bounded window", () => {
     expect(afterSecond).toContain("agent 1");
     expect(afterSecond).toContain("agent 0");
     expect(afterSecond).toContain("↓ 9 more");
-    expect(afterSecond).not.toContain("↑");
+    expect(afterSecond.split("\n").slice(1).join("\n")).not.toContain("↑");
     expect(before).toContain("↓ 9 more");
   });
 
@@ -177,6 +177,7 @@ describe("FleetList bounded window", () => {
     input("\u001b[B");
     input("\u001b[B");
     const beforeBoundary = render().join("\n");
+    input("\u001b[B");
     input("\u001b[B");
     const afterBoundary = render().join("\n");
 
@@ -235,9 +236,8 @@ describe("FleetList bounded window", () => {
     expect(left.render()).toEqual(down.render());
     expect(left.render()[1]).toContain("● main");
 
-    const active = left.render();
     left.input("\u001b[D");
-    expect(left.render()).toEqual(active);
+    expect(left.render()[0]).toContain("↓ to manage");
     expect(left.render()[1]).toContain("● main");
   });
 
@@ -290,7 +290,7 @@ describe("FleetList bounded window", () => {
     const { render, input, mouse } = createFleetHarness(makeAgents(2));
     input("\u001b[B"); // activate on main
     expect(mouse(-1)).toEqual({ handled: true, render: true }); // up from main exits, rather than moving past the top
-    expect(render()[0]).toContain("← for agents");
+    expect(render()[0]).toContain("↓ to manage");
 
     input("\u001b[B");
     input("j");

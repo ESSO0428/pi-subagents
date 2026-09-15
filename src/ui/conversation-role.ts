@@ -1,6 +1,6 @@
 import type { Component } from "@earendil-works/pi-tui";
-import type { ConversationBlock } from "./conversation-blocks.js";
 import type { Theme } from "./agent-widget.js";
+import type { ConversationBlock } from "./conversation-blocks.js";
 
 export type ConversationRoleTheme = Pick<Theme, "fg">;
 

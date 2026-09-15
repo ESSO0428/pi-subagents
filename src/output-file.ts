@@ -63,6 +63,7 @@ export function streamToOutputFile(
   path: string,
   agentId: string,
   cwd: string,
+  historyPath?: string,
 ): () => void {
   let writtenCount = 1; // initial user prompt already written
 
@@ -78,9 +79,12 @@ export function streamToOutputFile(
         timestamp: new Date().toISOString(),
         cwd,
       };
-      try {
-        appendFileSync(path, JSON.stringify(entry) + "\n", "utf-8");
-      } catch { /* ignore write errors */ }
+      const entryJson = JSON.stringify(entry) + "\n";
+      for (const target of historyPath && historyPath !== path ? [path, historyPath] : [path]) {
+        try {
+          appendFileSync(target, entryJson, "utf-8");
+        } catch { /* ignore write errors */ }
+      }
       writtenCount++;
     }
   };

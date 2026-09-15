@@ -5,20 +5,20 @@
  * blocks are formatted data, while Markdown/ANSI lines are a bounded cache.
  */
 
-import type { ExtensionAPI, ExtensionContext, AgentSession } from "@earendil-works/pi-coding-agent";
+import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { copyToClipboard } from "@earendil-works/pi-coding-agent";
 import { type Component, Input, Key, matchesKey, type TUI, type TuiMouseEvent, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { AgentRecord } from "../types.js";
 import { getLifetimeTotal, getSessionContextPercent } from "../usage.js";
 import type { Theme } from "./agent-widget.js";
 import { type AgentActivity, buildInvocationTags, describeActivity, fgPreservingNestedStyles, formatDuration, formatSessionTokens, getDisplayName, getPromptModeLabel } from "./agent-widget.js";
-import { formatConversationMessages, type ConversationBlock } from "./conversation-blocks.js";
-import { ConversationTimeline, type ConversationTimelineChange, type TimelineRenderLine } from "./conversation-timeline.js";
-import { renderConversationRoleHeader } from "./conversation-role.js";
-import { editLiveAssistantBlockInNvim, viewConversationBlockInNvim } from "./conversation-nvim.js";
-import { findConversationMatches, highlightConversationLine, nearestConversationMatchAfter, nearestConversationMatchBefore, stripAnsi, type ConversationMatch } from "./conversation-search.js";
-import { createViewerKeys, type ViewerKeybindings, type ViewerKeys } from "./viewer-keys.js";
 import { createViewerCcstyleResult } from "./ccstyle/tool-result.js";
+import { type ConversationBlock, formatConversationMessages } from "./conversation-blocks.js";
+import { editLiveAssistantBlockInNvim, viewConversationBlockInNvim } from "./conversation-nvim.js";
+import { renderConversationRoleHeader } from "./conversation-role.js";
+import { type ConversationMatch, findConversationMatches, highlightConversationLine, nearestConversationMatchAfter, nearestConversationMatchBefore, stripAnsi } from "./conversation-search.js";
+import { ConversationTimeline, type ConversationTimelineChange, type TimelineRenderLine } from "./conversation-timeline.js";
+import { createViewerKeys, type ViewerKeybindings, type ViewerKeys } from "./viewer-keys.js";
 
 /** Base lines consumed by the overlay: borders, header, separator and footer. */
 const CHROME_LINES_BASE = 6;
@@ -569,7 +569,16 @@ export class ConversationViewer implements Component {
     this.timeline.setShowTools(this.showTools);
     this.timeline.render(width);
     const timelineSnapshot = this.timeline.getSnapshot();
-    const lines: RenderLine[] = timelineSnapshot.lines.map((line) => ({ ...line }));
+    const lines: RenderLine[] = timelineSnapshot.lines.map((line) => {
+      const rawText = typeof line?.text === "string" ? line.text : "";
+      const text = truncateToWidth(rawText, width, "", true);
+      return {
+        text,
+        plain: stripAnsi(text),
+        blockIndex: typeof line?.blockIndex === "number" ? line.blockIndex : -1,
+        ...(line?.railable ? { railable: true } : {}),
+      };
+    });
     this.cachedMessageStarts = [...timelineSnapshot.messageStarts];
     this.cachedMessageBlocks = [...timelineSnapshot.messageBlocks];
     if (this.hasFocusedBlock) {

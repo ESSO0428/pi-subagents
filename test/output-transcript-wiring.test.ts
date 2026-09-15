@@ -141,8 +141,9 @@ describe("output_transcript agent wiring", () => {
     );
 
     expect(createOutputFilePath).toHaveBeenCalledOnce();
-    expect(writeInitialEntry).toHaveBeenCalledOnce();
+    expect(writeInitialEntry).toHaveBeenCalledTimes(2);
     expect(streamToOutputFile).toHaveBeenCalledOnce();
+    expect(streamToOutputFile.mock.calls[0]).toHaveLength(5);
     await lifecycle.get("session_shutdown")?.({}, makeCtx(cwd));
   });
 
@@ -181,8 +182,9 @@ describe("output_transcript agent wiring", () => {
     );
 
     expect(createOutputFilePath).toHaveBeenCalledOnce();
-    expect(writeInitialEntry).toHaveBeenCalledOnce();
+    expect(writeInitialEntry).toHaveBeenCalledTimes(2);
     expect(streamToOutputFile).toHaveBeenCalledOnce();
+    expect(streamToOutputFile.mock.calls[0]).toHaveLength(5);
     await lifecycle.get("session_shutdown")?.({}, makeCtx(cwd));
   });
 });

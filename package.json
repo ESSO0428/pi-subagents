@@ -21,14 +21,15 @@
     "autonomous"
   ],
   "peerDependencies": {
-    "@earendil-works/pi-ai": ">=0.80.0",
-    "@earendil-works/pi-coding-agent": ">=0.80.0",
-    "@earendil-works/pi-tui": ">=0.80.0"
+    "@earendil-works/pi-ai": ">=0.80.8",
+    "@earendil-works/pi-coding-agent": ">=0.80.8",
+    "@earendil-works/pi-tui": ">=0.80.8"
   },
   "dependencies": {
     "@sinclair/typebox": "^0.34.49",
     "croner": "^10.0.1",
-    "nanoid": "^5.0.0"
+    "nanoid": "^5.0.0",
+    "@shikijs/cli": "^4.0.2"
   },
   "scripts": {
     "build": "tsc",

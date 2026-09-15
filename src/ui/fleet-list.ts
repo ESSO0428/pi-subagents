@@ -11,10 +11,10 @@
  * can `consume` keys — gated on `getEditorText() === ""` so normal typing is untouched.
  */
 
-import { Editor, isKeyRelease, Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { AgentManager } from "../agent-manager.js";
+import { Editor, isKeyRelease, Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { canOpenActiveAgent } from "../agent-history-list.js";
+import type { AgentManager } from "../agent-manager.js";
 import type { AgentRecord } from "../types.js";
 import { getLifetimeTotal } from "../usage.js";
 import { type AgentActivity, getDisplayName, type Theme } from "./agent-widget.js";
@@ -175,8 +175,7 @@ export class FleetList {
 
   constructor(
     private manager: AgentManager,
-    private agentActivity: Map<string, AgentActivity>,
-    private getCwd: () => string | undefined = () => undefined,
+    private agentActivity: Map<string, AgentActivity>,_getCwd: () => string | undefined = () => undefined,
     private pi?: ExtensionAPI,
     private getCtx: () => ExtensionContext | undefined = () => undefined,
   ) {}

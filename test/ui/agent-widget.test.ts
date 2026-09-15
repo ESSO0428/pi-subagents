@@ -1,13 +1,13 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../../src/agent-manager.js";
+import type { AgentRecord } from "../../src/types.js";
 import {
+  type AgentActivity,
   AgentWidget,
   getWidgetLineBudget,
   MAX_WIDGET_LINES,
-  type AgentActivity,
   type Theme,
 } from "../../src/ui/agent-widget.js";
-import type { AgentRecord } from "../../src/types.js";
 
 const theme: Theme = {
   fg: (_color, text) => text,

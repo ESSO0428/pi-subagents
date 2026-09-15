@@ -109,11 +109,22 @@ describe("FleetView wiring (real extension lifecycle)", () => {
   });
 
   it("registers the belowEditor widget once a spawned agent has a session, then clears it on shutdown", async () => {
-    vi.mocked(runAgent).mockResolvedValue({
-      responseText: "done",
-      session: { dispose: vi.fn() } as any,
-      aborted: false,
-      steered: false,
+    const liveSession = {
+      messages: [],
+      subscribe: () => () => {},
+      dispose: vi.fn(),
+    } as any;
+    vi.mocked(runAgent).mockImplementation(async (_ctx, _type, _prompt, options) => {
+      options.onSessionCreated?.(liveSession);
+      // Keep the record live long enough for FleetView to register its widget;
+      // a completed record is intentionally hidden from the active FleetView.
+      await new Promise(() => {});
+      return {
+        responseText: "done",
+        session: liveSession,
+        aborted: false,
+        steered: false,
+      } as any;
     });
 
     const { pi, tools, lifecycle } = makePi();

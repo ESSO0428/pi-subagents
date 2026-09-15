@@ -29,12 +29,15 @@ const {
   settingsManagerCreate: vi.fn(() => ({ kind: "settings-manager", getSessionDir: settingsManagerGetSessionDir })),
 }));
 
-vi.mock("@earendil-works/pi-coding-agent", () => ({
-  createAgentSession,
-  // Mock loader simulates pi-mono: reload() applies additionalExtensionPaths
-  // (an unknown path becomes an error row, mirroring a failed load) and then
-  // runs extensionsOverride over the result.
-  DefaultResourceLoader: class {
+vi.mock("@earendil-works/pi-coding-agent", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@earendil-works/pi-coding-agent")>();
+  return {
+    ...actual,
+    createAgentSession,
+    // Mock loader simulates pi-mono: reload() applies additionalExtensionPaths
+    // (an unknown path becomes an error row, mirroring a failed load) and then
+    // runs extensionsOverride over the result.
+    DefaultResourceLoader: class {
     opts: any;
     constructor(options: any) {
       this.opts = options;
@@ -60,8 +63,9 @@ vi.mock("@earendil-works/pi-coding-agent", () => ({
   },
   getAgentDir,
   SessionManager: { inMemory: sessionManagerInMemory, create: sessionManagerCreate },
-  SettingsManager: { create: settingsManagerCreate },
-}));
+    SettingsManager: { create: settingsManagerCreate },
+  };
+});
 
 vi.mock("../src/agent-types.js", () => ({
   BUILTIN_TOOL_NAMES: ["read", "bash", "edit", "write", "grep", "find", "ls"],

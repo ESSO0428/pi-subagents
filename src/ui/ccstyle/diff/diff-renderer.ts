@@ -1,39 +1,37 @@
+import { getLanguageFromPath, highlightCode } from "@earendil-works/pi-coding-agent";
 import {
+	type Component,
 	Text,
 	truncateToWidth,
 	visibleWidth,
 	wrapTextWithAnsi,
-	type Component,
 } from "@earendil-works/pi-tui";
-import { getLanguageFromPath, highlightCode } from "@earendil-works/pi-coding-agent";
 import {
 	ANSI_SGR_PATTERN,
-	STYLE_RESET_PARAMS,
-	filterSgrSequences,
-	toSgrParams,
-	readSgrColorSequence,
-	isFiniteSgrParam,
 	expandSgrReset,
+	filterSgrSequences,
+	readSgrColorSequence,
+	toSgrParams,
 } from "./ansi-utils.js";
 import {
-	buildCollapsedDiffHintText,
-	clampRenderedLineToWidth,
-	clampRenderedLinesToWidth,
-} from "./line-width-safety.js";
-import {
 	buildDiffSummaryText,
+	type DiffPresentationMode,
 	normalizeDiffRenderWidth,
 	resolveDiffPresentationMode,
-	type DiffPresentationMode,
 } from "./diff-presentation.js";
-import { pluralize, sanitizeAnsiForThemedOutput, sanitizeToolResultText, showMoreHintText } from "./render-utils.js";
-import { splitWriteContentLines } from "./write-display-utils.js";
+import {
+	buildCollapsedDiffHintText,
+	clampRenderedLinesToWidth,
+	clampRenderedLineToWidth,
+} from "./line-width-safety.js";
+import { sanitizeAnsiForThemedOutput, sanitizeToolResultText, showMoreHintText } from "./render-utils.js";
 import {
 	DEFAULT_TOOL_DISPLAY_CONFIG,
 	type DiffIndicatorMode,
-	type ToolDisplayConfig,
 	type PersistedDiff,
+	type ToolDisplayConfig,
 } from "./types.js";
+import { splitWriteContentLines } from "./write-display-utils.js";
 
 const MAX_HL_CHARS = 200_000;
 
@@ -267,7 +265,7 @@ function wrapToWidth(text: string, width: number, wordWrap: boolean): string[] {
 }
 
 function resolveLanguageFromPath(rawPath: string | undefined): string | undefined {
-	if (!rawPath || !rawPath.trim()) {
+	if (!rawPath?.trim()) {
 		return undefined;
 	}
 	const normalizedPath = rawPath.replace(/^@/, "").trim();
@@ -281,7 +279,7 @@ function resolveLanguageFromPath(rawPath: string | undefined): string | undefine
 	}
 }
 
-function resolveShikiTheme(theme: DiffTheme): string {
+function _resolveShikiTheme(theme: DiffTheme): string {
 	if (process.env.DIFF_THEME) return process.env.DIFF_THEME;
 	const background =
 		parseAnsiColorCode(readThemeAnsi(theme, "bg", "toolSuccessBg")) ??
@@ -828,7 +826,9 @@ function tokenizeInlineDiff(input: string): Array<{ value: string; start: number
 	const pattern = /(\s+|[A-Za-z0-9_]+|[^A-Za-z0-9_\s])/g;
 	let match: RegExpExecArray | null;
 
-	while ((match = pattern.exec(input)) !== null) {
+	while (true) {
+		match = pattern.exec(input);
+		if (match === null) break;
 		const value = match[0] ?? "";
 		if (!value) {
 			continue;
@@ -1139,13 +1139,15 @@ function mixRgb(base: RgbColor, tint: RgbColor, ratio: number): RgbColor {
 }
 
 function extractThemeBackgroundAnsi(text: string): string | undefined {
-	if (!text || !text.includes("\x1b[")) {
+	if (!text?.includes("\x1b[")) {
 		return undefined;
 	}
 
 	ANSI_SGR_PATTERN.lastIndex = 0;
 	let match: RegExpExecArray | null;
-	while ((match = ANSI_SGR_PATTERN.exec(text)) !== null) {
+	while (true) {
+		match = ANSI_SGR_PATTERN.exec(text);
+		if (match === null) break;
 		const parsed = toSgrParams(match[1] ?? "");
 		for (let index = 0; index < parsed.length; index += 1) {
 			const param = parsed[index] ?? 0;
@@ -1372,7 +1374,6 @@ function resolveIndicatorGlyph(
 				return " ";
 			}
 			return kind === "add" ? "+" : "-";
-		case "none":
 		default:
 			return " ";
 	}

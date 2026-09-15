@@ -1,11 +1,15 @@
-import { describe, expect, it } from "vitest";
 import { visibleWidth } from "@earendil-works/pi-tui";
+import { describe, expect, it } from "vitest";
 import {
   renderEditDiffResult,
   renderWriteDiffResult,
 } from "../../src/ui/ccstyle/diff/diff-renderer.js";
-import { renderRichToolResult } from "../../src/ui/ccstyle/tool-result.js";
 import { DEFAULT_TOOL_DISPLAY_CONFIG } from "../../src/ui/ccstyle/diff/types.js";
+import {
+  createViewerCcstyleResult,
+  renderRichToolResult,
+  resolveToolOutputLanguage,
+} from "../../src/ui/ccstyle/tool-result.js";
 
 const theme = {
   fg(color: string, text: string) {
@@ -87,5 +91,24 @@ describe("viewer-local ccstyle diff renderer", () => {
     for (const width of [20, 40, 100]) {
       expect(component.render(width).every((line) => visibleWidth(line) <= width)).toBe(true);
     }
+  });
+
+  it("uses path metadata before an explicit fence and leaves untagged output plain", () => {
+    expect(resolveToolOutputLanguage({ path: "src/result.ts" }, "```python\nprint(1)\n```")).toBe("typescript");
+    expect(resolveToolOutputLanguage(undefined, "echo hi\nplain output")).toBeUndefined();
+  });
+
+  it("renders ordinary expanded output through the shared Input/Output card", () => {
+    const component = createViewerCcstyleResult(
+      "read",
+      { content: [{ type: "text", text: "const answer = 42;" }] },
+      { expanded: true },
+      theme,
+      { args: { file_path: "src/result.ts" } },
+    );
+    const rendered = component?.render(100).join("\n") ?? "";
+    expect(rendered).toContain("Input");
+    expect(rendered).toContain("Output");
+    expect(rendered).toContain("answer");
   });
 });

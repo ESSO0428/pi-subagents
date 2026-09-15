@@ -1,26 +1,26 @@
 import * as CodingAgent from "@earendil-works/pi-coding-agent";
+import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import {
+  type Component,
   Markdown,
   Text,
-  type Component,
   type TUI,
   type TuiMouseEvent,
   truncateToWidth,
 } from "@earendil-works/pi-tui";
-import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import type { AgentRecord } from "../types.js";
 import type { Theme } from "./agent-widget.js";
+import { showMoreHintText } from "./ccstyle/diff/render-utils.js";
+import {
+  createViewerCcstyleTool,
+  type ViewerToolRenderers,
+} from "./ccstyle/tool-renderer.js";
 import {
   type ConversationBlock,
   type ConversationToolResultSnapshot,
 } from "./conversation-blocks.js";
 import { renderConversationRoleHeader } from "./conversation-role.js";
 import { stripAnsi } from "./conversation-search.js";
-import {
-  createViewerCcstyleTool,
-  type ViewerToolRenderers,
-} from "./ccstyle/tool-renderer.js";
-import { showMoreHintText } from "./ccstyle/diff/render-utils.js";
 
 export interface TimelineRenderLine {
   text: string;

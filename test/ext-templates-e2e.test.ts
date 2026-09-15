@@ -27,13 +27,13 @@ import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
+import { ModelRuntime, parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { runAgent } from "../src/agent-runner.js";
 import { getAgentConfig, registerAgents } from "../src/agent-types.js";
 import { loadCustomAgents } from "../src/custom-agents.js";
 import { resolveAgentInvocationConfig } from "../src/invocation-config.js";
-import { registerFauxProvider } from "./helpers/pi-ai.js";
+import { fauxProvider } from "./helpers/pi-ai.js";
 
 // Real pi-mono (loader + dynamic extension import + session construction) — a
 // cold run under full-suite contention can exceed vitest's 5s default.
@@ -69,9 +69,10 @@ describe("ext: / tools: scoping — template-driven e2e (real pi-mono, headless)
   let prevAgentDir: string | undefined;
   let prevHome: string | undefined;
   let hermeticDir: string;
-  let faux: ReturnType<typeof registerFauxProvider>;
+  let faux: ReturnType<typeof fauxProvider>;
+  let modelRuntime: ModelRuntime;
 
-  beforeAll(() => {
+  beforeAll(async () => {
     // Isolate global discovery (getAgentDir / ~/.pi) so the dev's real agents
     // and extensions can't bleed into the run.
     hermeticDir = mkdtempSync(join(tmpdir(), "subagents-tmpl-"));
@@ -80,7 +81,9 @@ describe("ext: / tools: scoping — template-driven e2e (real pi-mono, headless)
     process.env.PI_CODING_AGENT_DIR = hermeticDir;
     process.env.HOME = hermeticDir;
 
-    faux = registerFauxProvider({ provider: "faux", models: [{ id: "faux-1", contextWindow: 200_000 }] });
+    faux = fauxProvider({ provider: "faux", models: [{ id: "faux-1", contextWindow: 200_000 }] });
+    modelRuntime = await ModelRuntime.create({ refreshOnCreate: false });
+    modelRuntime.registerNativeProvider(faux.provider);
 
     // Load the templates through the REAL loader (project agents come from
     // <cwd>/.pi/agents → FIXTURES_DIR/.pi/agents) and install them in the
@@ -89,7 +92,7 @@ describe("ext: / tools: scoping — template-driven e2e (real pi-mono, headless)
   });
 
   afterAll(() => {
-    faux.unregister();
+    modelRuntime.unregisterProvider("faux");
     if (prevAgentDir == null) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = prevAgentDir;
     if (prevHome == null) delete process.env.HOME;
@@ -100,6 +103,7 @@ describe("ext: / tools: scoping — template-driven e2e (real pi-mono, headless)
   async function runScenario(agentName: string): Promise<{ active: string[]; prompt: string }> {
     const model = faux.getModel();
     const modelRegistry: any = {
+      runtime: modelRuntime,
       find: () => model,
       getAll: () => [model],
       getAvailable: () => [model],

@@ -1,5 +1,5 @@
-import { describe, expect, it, vi } from "vitest";
 import type { TuiMouseEvent } from "@earendil-works/pi-tui";
+import { describe, expect, it, vi } from "vitest";
 import { ConversationViewer, createStaticConversationSource } from "../../src/ui/conversation-viewer.js";
 
 const theme = {

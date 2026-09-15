@@ -1,6 +1,6 @@
-import { createWriteToolDefinition, generateDiffString, generateUnifiedPatch, type ExtensionContext, type ToolDefinition, withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import { lstat, mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, resolve } from "node:path";
+import { createWriteToolDefinition, type ExtensionContext, generateDiffString, generateUnifiedPatch, type ToolDefinition, withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 
 /** Maximum UTF-8 size of the durable display diff plus unified patch. */
 export const MAX_DURABLE_DIFF_BYTES = 4 * 1024 * 1024;
@@ -58,7 +58,7 @@ function resolveWritePath(path: string, cwd: string): string {
 }
 
 async function capturePreviousContent(absolutePath: string): Promise<WriteExecutionMeta> {
-  let info;
+  let info: Awaited<ReturnType<typeof lstat>>;
   try {
     info = await lstat(absolutePath);
   } catch (error: any) {

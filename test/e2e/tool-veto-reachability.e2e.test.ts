@@ -39,11 +39,12 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { runAgent } from "../../src/agent-runner.js";
 import { registerAgents } from "../../src/agent-types.js";
 import type { AgentConfig } from "../../src/types.js";
-import { registerFauxProvider } from "../helpers/pi-ai.js";
+import { fauxProvider } from "../helpers/pi-ai.js";
 
 // Real pi-mono (loader + dynamic extension import + session construction).
 vi.setConfig({ testTimeout: 30_000 });
@@ -59,17 +60,20 @@ function makePi() {
 
 describe("tool veto reachability against real pi-mono", () => {
   let cwd: string;
-  let faux: ReturnType<typeof registerFauxProvider>;
+  let faux: ReturnType<typeof fauxProvider>;
+  let modelRuntime: ModelRuntime;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     cwd = mkdtempSync(join(tmpdir(), "subagents-veto-"));
-    faux = registerFauxProvider({
+    faux = fauxProvider({
       provider: "faux",
       models: [{ id: "faux-1", contextWindow: 200_000 }],
     });
+    modelRuntime = await ModelRuntime.create({ refreshOnCreate: false });
+    modelRuntime.registerNativeProvider(faux.provider);
   });
   afterEach(() => {
-    faux.unregister();
+    modelRuntime.unregisterProvider("faux");
     rmSync(cwd, { recursive: true, force: true });
   });
 
@@ -98,6 +102,7 @@ describe("tool veto reachability against real pi-mono", () => {
 
     const model = faux.getModel();
     const modelRegistry: any = {
+      runtime: modelRuntime,
       find: () => model,
       getAll: () => [model],
       getAvailable: () => [model],

@@ -265,7 +265,7 @@ describe("ConversationViewer", () => {
 
     /** Call the private buildContentLines method directly. */
     function callBuildContentLines(viewer: InstanceType<typeof ConversationViewer>, width: number): string[] {
-      return (viewer as any).buildContentLines(width);
+      return (viewer as any).buildContentLines(width).map((line: { text: string }) => line.text);
     }
 
     it("mock is intercepting wrapTextWithAnsi", async () => {
@@ -415,20 +415,20 @@ describe("ConversationViewer", () => {
       return { viewer, tui, onSteer };
     }
 
-    it("offers the steer affordance for a running agent and opens on Enter", () => {
+    it("offers the steer affordance for a running agent and opens on e", () => {
       const { viewer } = makeViewer();
-      expect(viewer.render(W).join("\n")).toContain("Enter steer");
+      expect(viewer.render(W).join("\n")).toContain("e steer");
 
-      viewer.handleInput("\r"); // Enter
+      viewer.handleInput("e"); // e
       // Composer is shown (its prompt + send/cancel hint), idle footer is gone.
       const out = viewer.render(W).join("\n");
       expect(out).toContain("Enter send · Esc cancel");
-      expect(out).not.toContain("Enter steer");
+      expect(out).not.toContain("e steer");
     });
 
     it("typing then Enter sends the trimmed message and closes the composer", () => {
       const { viewer, onSteer } = makeViewer();
-      viewer.handleInput("\r"); // open composer
+      viewer.handleInput("e"); // open composer
       for (const ch of "  hello  ") viewer.handleInput(ch);
       viewer.handleInput("\r"); // send
 
@@ -438,7 +438,7 @@ describe("ConversationViewer", () => {
 
     it("Esc cancels the composer without sending", () => {
       const { viewer, onSteer } = makeViewer();
-      viewer.handleInput("\r"); // open composer
+      viewer.handleInput("e"); // open composer
       for (const ch of "draft") viewer.handleInput(ch);
       viewer.handleInput("\x1b"); // Esc
 
@@ -448,7 +448,7 @@ describe("ConversationViewer", () => {
 
     it("an empty submit just returns (like Esc), without calling onSteer", () => {
       const { viewer, onSteer } = makeViewer();
-      viewer.handleInput("\r"); // open composer
+      viewer.handleInput("e"); // open composer
       viewer.handleInput("\r"); // empty submit
       expect(onSteer).not.toHaveBeenCalled();
       expect(viewer.render(W).join("\n")).not.toContain("Enter send"); // composer closed
@@ -456,7 +456,7 @@ describe("ConversationViewer", () => {
 
     it("scroll keys are inert while composing (input owns them)", () => {
       const { viewer } = makeViewer();
-      viewer.handleInput("\r"); // open composer
+      viewer.handleInput("e"); // open composer
       // 'j' would normally scroll, but here it types into the composer.
       viewer.handleInput("j");
       expect(viewer.render(W).join("\n")).toContain("Enter send · Esc cancel");
@@ -464,8 +464,8 @@ describe("ConversationViewer", () => {
 
     it("no steer affordance once the agent is no longer running", () => {
       const { viewer, onSteer } = makeViewer({ status: "completed" });
-      expect(viewer.render(W).join("\n")).not.toContain("Enter steer");
-      viewer.handleInput("\r");
+      expect(viewer.render(W).join("\n")).not.toContain("e steer");
+      viewer.handleInput("e");
       expect(viewer.render(W).join("\n")).not.toContain("Enter send");
       expect(onSteer).not.toHaveBeenCalled();
     });
@@ -474,8 +474,8 @@ describe("ConversationViewer", () => {
       const viewer = new ConversationViewer(
         mockTui(30, W), mockSession(), mockRecord({ status: "running" }), undefined, ansiTheme(), vi.fn(),
       );
-      expect(viewer.render(W).join("\n")).not.toContain("Enter steer");
-      expect(() => viewer.handleInput("\r")).not.toThrow();
+      expect(viewer.render(W).join("\n")).not.toContain("e steer");
+      expect(() => viewer.handleInput("e")).not.toThrow();
     });
 
     it("composer rows never exceed width", () => {

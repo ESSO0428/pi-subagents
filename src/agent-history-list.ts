@@ -1,8 +1,8 @@
 /** Helpers for separating openable active agents from terminal history. */
 
 import { hasAgentHistory } from "./agent-history.js";
-import type { AgentRecord } from "./types.js";
 import { getAgentConfig } from "./agent-types.js";
+import type { AgentRecord } from "./types.js";
 import { formatDuration, getDisplayName } from "./ui/agent-widget.js";
 
 export type AgentHistoryStatus =

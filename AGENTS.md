@@ -37,6 +37,21 @@
 - `npm run build` compiles with `tsc`; run it only when verifying the build output or when requested.
 - For ad-hoc scripts, write them to a temp file (e.g. `/tmp`), run, edit if needed, remove when done. Don't embed multi-line scripts in `bash` commands.
 
+### Dependency and release verification reminder
+
+- `vitest`, `typescript`, and Biome are local `devDependencies`; do not install them globally.
+- `@shikijs/cli` is a runtime dependency for the optional async syntax-highlighting path. Do not move it to `devDependencies`; its transitive grammar packages are required at runtime.
+- Before verification or release, install the complete local dependency tree with the repository's lockfile when available, then run the full test/typecheck/build/pack checks. A missing `vitest` or `tsc` binary means the environment was not installed correctly; it is not a test assertion failure.
+- Offline installs are only valid when the npm cache contains the complete dependency tree. If npm reports `ENOTCACHED` (for example, a missing `@shikijs/vscode-textmate`), record the cache miss and do not claim that tests passed.
+
+### Upstream Pi API and test-fixture compatibility
+
+- Pi `v0.80.8` replaced `CreateAgentSessionOptions.authStorage` and `modelRegistry` with async `modelRuntime`. Keep the peer lower bound aligned with the API actually used by source; do not lock verification to an older `0.80.x` patch that predates `ModelRuntime`.
+- A custom `ResourceLoader` must satisfy the complete upstream contract and implement `reload()`; a mock that only exposes `getExtensions()` is not a valid SDK fixture. Prefer a partial mock based on `importOriginal` so newly imported public helpers such as `createWriteToolDefinition` remain available.
+- Faux end-to-end tests must register a real `fauxProvider()` with the test `ModelRuntime` (`models.setProvider()` or `registerNativeProvider()` as appropriate). Do not pass a legacy `modelRegistry` auth shim; missing faux credentials then appears as `No API key found for faux` and is a fixture failure, not a model failure.
+- Classify failures before changing assertions: stale UI wording/shortcut tests may be updated to the current contract; width-safety, durable transcript, wiring, and lifecycle tests must retain their behavioral coverage and require an implementation fix when they fail.
+- Run verification from the canonical repository, not an npm-installed copy under `node_modules`; the latter is intentionally outside Biome's workspace and may omit development tests or repository guidance.
+
 ## Git
 
 - **Never commit.** The user commits manually. At most, suggest a concise commit message as text.

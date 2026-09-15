@@ -1,6 +1,6 @@
-import { truncateToWidth, type Component } from "@earendil-works/pi-tui";
-import { createViewerCcstyleResult, oneLine } from "./tool-result.js";
+import { type Component, truncateToWidth } from "@earendil-works/pi-tui";
 import { DEFAULT_TOOL_DISPLAY_CONFIG } from "./diff/types.js";
+import { createViewerCcstyleResult, oneLine } from "./tool-result.js";
 
 export interface ViewerToolRenderers {
   name: string;
@@ -82,5 +82,5 @@ export function createViewerCcstyleTool(toolName: string, isHovered: () => boole
   };
 }
 
-export { renderRichToolResult } from "./tool-result.js";
 export type { PersistedDiff, ViewerDiffConfig } from "./diff/types.js";
+export { renderRichToolResult } from "./tool-result.js";
