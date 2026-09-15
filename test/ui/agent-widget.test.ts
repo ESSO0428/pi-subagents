@@ -1,9 +1,11 @@
+import { Editor } from "@earendil-works/pi-tui";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../../src/agent-manager.js";
 import type { AgentRecord } from "../../src/types.js";
 import {
   type AgentActivity,
   AgentWidget,
+  type AgentWidgetOpenMode,
   getWidgetLineBudget,
   MAX_WIDGET_LINES,
   type Theme,
@@ -58,6 +60,8 @@ function createWidgetHarness(records: AgentRecord[]) {
   const ui = {
     setStatus: vi.fn(),
     setWidget: vi.fn((_key: string, content: any) => { factory = content; }),
+    onTerminalInput: vi.fn(() => vi.fn()),
+    getEditorText: vi.fn(() => ""),
   };
   const widget = new AgentWidget(manager, new Map(), () => "all");
   widget.setUICtx(ui);
@@ -65,6 +69,50 @@ function createWidgetHarness(records: AgentRecord[]) {
   factory?.(tui, theme).render();
   tui.requestRender.mockClear();
   return { records, tui, ui, widget, render: () => factory?.(tui, theme).render() ?? [] };
+}
+
+function createNavigableWidgetHarness(
+  records: AgentRecord[],
+  overrides: {
+    onOpen?: (record: AgentRecord, mode: AgentWidgetOpenMode) => void;
+    canOpenHistory?: (record: AgentRecord) => boolean;
+    rows?: number;
+  } = {},
+) {
+  const manager = { listAgents: () => records } as unknown as AgentManager;
+  let inputHandler: ((data: string) => { consume?: boolean; data?: string } | undefined) | undefined;
+  let text = "";
+  const tui = {
+    terminal: { columns: 120, rows: overrides.rows ?? 24 },
+    requestRender: vi.fn(),
+    focusedComponent: Object.create(Editor.prototype) as Editor,
+  };
+  let factory: ((tui: any, theme: Theme) => { render(): string[]; invalidate(): void }) | undefined;
+  const ui = {
+    setStatus: vi.fn(),
+    setWidget: vi.fn((_key: string, content: any) => { factory = content; }),
+    onTerminalInput: vi.fn((handler: (data: string) => { consume?: boolean; data?: string } | undefined) => {
+      inputHandler = handler;
+      return vi.fn();
+    }),
+    getEditorText: vi.fn(() => text),
+  };
+  const widget = new AgentWidget(manager, new Map(), () => "all", {
+    canOpenHistory: overrides.canOpenHistory ?? ((record) => record.status !== "running" && record.status !== "queued"),
+    onOpen: overrides.onOpen ?? (() => {}),
+  });
+  widget.setUICtx(ui);
+  widget.update();
+  const component = factory?.(tui, theme);
+  return {
+    tui,
+    ui,
+    widget,
+    input: (data: string) => inputHandler?.(data),
+    render: () => component?.render() ?? [],
+    get text() { return text; },
+    set text(value: string) { text = value; },
+  };
 }
 
 describe("AgentWidget live records", () => {
@@ -168,5 +216,99 @@ describe("AgentWidget live records", () => {
     expect(tui.requestRender).toHaveBeenCalledWith(true);
     widget.dispose();
     expect((widget as any).requestUiRefresh(true)).toBe(false);
+  });
+
+  it("activates only on down at an empty focused editor", () => {
+    const running = makeRecord({ id: "running", status: "running", completedAt: undefined });
+    const harness = createNavigableWidgetHarness([running]);
+
+    expect(harness.input("\u001b[A")).toBeUndefined();
+    expect(harness.input("\u001b[B")).toEqual({ consume: true });
+    expect(harness.render().join("\n")).toContain("Inspect the repository");
+    harness.widget.dispose();
+  });
+
+  it("does not capture editor history navigation when inactive or non-empty", () => {
+    const running = makeRecord({ id: "running", status: "running", completedAt: undefined });
+    const harness = createNavigableWidgetHarness([running]);
+    harness.text = "draft";
+
+    expect(harness.input("\u001b[B")).toBeUndefined();
+    expect(harness.input("\u001b[A")).toBeUndefined();
+    harness.widget.dispose();
+  });
+
+  it("navigates with arrows and opens a selected running agent in live mode", () => {
+    const running = makeRecord({ id: "running", status: "running", completedAt: undefined });
+    const history = makeRecord({ id: "history", description: "saved history" });
+    const opened: Array<{ id: string; mode: AgentWidgetOpenMode }> = [];
+    const harness = createNavigableWidgetHarness([running, history], {
+      onOpen: (record, mode) => opened.push({ id: record.id, mode }),
+      canOpenHistory: (record) => record.id === "history",
+    });
+
+    harness.input("\u001b[B");
+    harness.input("\u001b[B");
+    expect(harness.input("\u001b[A")).toEqual({ consume: true });
+    expect(harness.input("\r")).toEqual({ consume: true });
+    expect(opened).toEqual([{ id: "running", mode: "live" }]);
+    harness.widget.dispose();
+  });
+
+  it("opens terminal records in history mode and queued records in live mode", () => {
+    const running = makeRecord({ id: "running", status: "running", completedAt: undefined });
+    const history = makeRecord({ id: "history" });
+    const queued = makeRecord({ id: "queued", status: "queued", completedAt: undefined, session: undefined });
+    const opened: Array<{ id: string; mode: AgentWidgetOpenMode }> = [];
+    const harness = createNavigableWidgetHarness([running, history, queued], {
+      onOpen: (record, mode) => opened.push({ id: record.id, mode }),
+      canOpenHistory: (record) => record.id === "history",
+    });
+
+    harness.input("\u001b[B");
+    harness.input("\u001b[B");
+    harness.input("\u001b[B");
+    harness.input("\r");
+    expect(opened).toEqual([{ id: "history", mode: "history" }]);
+    harness.input("\u001b[B");
+    harness.input("\u001b[B");
+    harness.input("\r");
+    expect(opened).toEqual([
+      { id: "history", mode: "history" },
+      { id: "queued", mode: "live" },
+    ]);
+    harness.widget.dispose();
+  });
+
+  it("exits navigation with escape or up from the first row, and ignores j/k/left", () => {
+    const running = makeRecord({ id: "running", status: "running", completedAt: undefined });
+    const harness = createNavigableWidgetHarness([running]);
+
+    expect(harness.input("j")).toBeUndefined();
+    expect(harness.input("k")).toBeUndefined();
+    expect(harness.input("\u001b[D")).toBeUndefined();
+    harness.input("\u001b[B");
+    expect(harness.input("\u001b")).toEqual({ consume: true });
+    harness.input("\u001b[B");
+    expect(harness.input("\u001b[A")).toEqual({ consume: true });
+    expect(harness.input("\u001b[B")).toEqual({ consume: true });
+    harness.widget.dispose();
+  });
+
+  it("keeps hidden rows selectable inside the bounded viewport", () => {
+    const running = makeRecord({ id: "running", status: "running", completedAt: undefined });
+    const queued = Array.from({ length: 8 }, (_, index) => makeRecord({
+      id: `queued-${index}`,
+      description: `queued target ${index}`,
+      status: "queued",
+      completedAt: undefined,
+    }));
+    const harness = createNavigableWidgetHarness([running, ...queued], { rows: 8 });
+
+    harness.input("\u001b[B");
+    for (let index = 0; index < queued.length - 1; index++) harness.input("\u001b[B");
+    expect(harness.render().join("\n")).toContain("queued target 7");
+    expect(harness.render().length).toBeLessThanOrEqual(getWidgetLineBudget(8));
+    harness.widget.dispose();
   });
 });

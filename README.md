@@ -14,8 +14,7 @@ https://github.com/user-attachments/assets/8685261b-9338-4fea-8dfe-1c590d5df543
 
 - **Claude Code look & feel** — same tool names, calling conventions, and UI patterns (`Agent`, `get_subagent_result`, `steer_subagent`) — feels native
 - **Parallel background agents** — spawn multiple agents that run concurrently with automatic queuing (configurable concurrency limit, default 4) and smart group join (consolidated notifications)
-- **Live widget UI** — persistent above-editor widget with animated spinners, live tool activity, token counts, and colored status icons. Configurable via `/agents → Settings → Widget`: `all` (every agent), `background` (default — hides foreground runs, which already render inline as the `Agent` tool result), or `off`
-- **FleetView** — Claude Code-style navigable list of `main` + every running subagent rendered below the editor (earliest-launched first). Press `↓` (or `←`) at an empty prompt to jump in, `↑`/`↓`/wheel to move the selection, `Enter` to open the selected agent's live, auto-updating conversation, `Esc` to return. The selected row stays visible while the bounded list window moves through the full roster. Finished agents linger briefly before dropping out, and a viewer stays open through completion so you can read the final output. Toggle via `/agents → Settings → Fleet view`
+- **Agents panel UI** — persistent above-editor widget with animated spinners, live tool activity, token counts, colored status icons, and one focus-gated navigator. It shows every agent by default; press `↓` at an empty prompt to activate the panel, `↑`/`↓` to select, `Enter` to open a live or read-only history viewer, and `Esc` to return. Configure via `/agents → Settings → Widget`: `all`, `background`, or `off`
 - **Conversation viewer** — select any agent in `/agents` to open a live-scrolling overlay of its full conversation (auto-follows new content, scroll up to pause). Steer a running agent inline by pressing `Enter` to open a composer, typing, then `Enter` to send (`Esc` or an empty submit returns) — the message appears as a user message and redirects the agent after its current tool. Stop a still-running agent by pressing `x` (then `x` again to confirm) — both work for background agents too
 - **Custom agent types** — define agents in `.pi/agents/<name>.md` or `.agents/agents/<name>.md` (project) or globally, with YAML frontmatter: custom system prompts, model selection, thinking levels, tool restrictions
 - **Mid-run steering** — inject messages into running agents to redirect their work without restarting
@@ -95,7 +94,7 @@ Restrictions:
 
 ## UI
 
-The extension renders a persistent widget above the editor showing active agents. By default it shows background runs only (`widgetMode: background`) — foreground agents already render inline as the `Agent` tool result, so the widget would otherwise double-render them. Switch to `all` (every agent) or `off` (hide the widget) via `/agents → Settings → Widget`:
+The extension renders a persistent Agents widget above the editor. By default it shows all agents (`widgetMode: all`), including foreground and background runs. Switch to `background` or `off` via `/agents → Settings → Widget`:
 
 ```
 ● Agents
@@ -112,20 +111,19 @@ The token field is annotated with two optional signals inside parens:
 - **`NN%`** — context-window utilization (color-coded: <70% dim, 70–85% warning, ≥85% error). Omitted when the model has no declared `contextWindow`, or briefly right after compaction.
 - **`⇊N`** — number of times the session has compacted, when > 0. Stays dim; the percent's color carries urgency.
 
-### FleetView
+### Agents panel navigator
 
-While subagents are running, a Claude Code-style navigable list renders **below** the editor:
+While agents are running or have openable history, the single Agents panel renders **above** the editor:
 
 ```
-  esc to interrupt · ← for agents · ↓ to manage
-
-  ● main
-  ○ general-purpose  Sleep then report 1                                11s · ↓ 13.1k tokens
-  ○ general-purpose  Sleep then report 2                                11s · ↓ 13.1k tokens
-                                                                                   ↓ 3 more
+● Agents  ↑↓ select · enter view · esc back
+├─ ● Agent  Refactor auth module · ↻5≤30 · 5 tool uses · 12.3s
+│    ⎿  editing 2 files…
+├─ ○ Explore  Find auth files · ↻3 · 4.1s
+└─ +1 more (↓ 1 more; 1 finished)
 ```
 
-The list is ordered earliest-launched first, and only shows agents you can actually open (pending/queued agents with no session yet appear once they start). At an **empty prompt**, press `↓` (or `←`) to move focus from the prompt into the list — the selected row is marked `●`, the rest `○`. `↑`/`↓` move the selection, `Enter` opens the selected agent's live conversation overlay (it auto-updates as the agent works), and `Esc` (or `↑` above `main`) returns to the prompt. Selecting `main` returns to the normal view. Inside the overlay, press `Enter` to steer the running agent — type a message and `Enter` to send it (`Esc` or an empty submit returns), and it redirects the agent the same way the `steer_subagent` tool does. A viewer stays open when its agent finishes so you can read the final output, and finished agents linger in the list for a few seconds before dropping out. Typing anything at a non-empty prompt behaves normally — the list only captures arrow keys when the prompt is empty. Disable it entirely via `/agents → Settings → Fleet view`.
+At an **empty prompt**, press `↓` to activate the panel. The selected row is marked `●`; `↑`/`↓` move through the full bounded roster, `Enter` opens a running agent live or a terminal agent's read-only history. A queued agent remains selectable, but has no live viewer until it starts; `Esc` returns to the prompt. `↑` while the first row is selected also returns to the prompt. Pressing `↑` at an inactive prompt, typing in a non-empty prompt, or using `j`/`k`/`←` behaves normally; the panel only captures the focus-gated arrow sequence described above. Disable it entirely via `/agents → Settings → Widget → off`.
 
 Individual agent results render Claude Code-style in the conversation:
 

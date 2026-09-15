@@ -92,6 +92,8 @@ describe("AgentWidget", () => {
     widget.setUICtx({
       setStatus: () => {},
       setWidget: (_key, content) => { factory = content; },
+      onTerminalInput: () => () => {},
+      getEditorText: () => "",
     });
     widget.update();
     if (!factory) return "";

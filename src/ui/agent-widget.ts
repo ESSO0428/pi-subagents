@@ -5,10 +5,10 @@
  * Uses the callback form of setWidget for themed rendering.
  */
 
-import { truncateToWidth } from "@earendil-works/pi-tui";
+import { Editor, isKeyRelease, Key, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
 import type { AgentManager } from "../agent-manager.js";
 import { getConfig } from "../agent-types.js";
-import type { AgentInvocation, SubagentType, WidgetMode } from "../types.js";
+import type { AgentInvocation, AgentRecord, SubagentType, WidgetMode } from "../types.js";
 import { getLifetimeTotal, getSessionContextPercent, type LifetimeUsage, type SessionLike } from "../usage.js";
 
 // ---- Constants ----
@@ -52,6 +52,19 @@ export type Theme = {
   bold(text: string): string;
 };
 
+export type AgentWidgetOpenMode = "live" | "history";
+export type AgentWidgetOpenCallback = (record: AgentRecord, mode: AgentWidgetOpenMode) => void | Promise<void>;
+export type AgentWidgetOptions = {
+  canOpenHistory: (record: AgentRecord) => boolean;
+  onOpen: AgentWidgetOpenCallback;
+};
+/** @deprecated Use AgentWidgetOpenMode. */
+export type AgentOpenMode = AgentWidgetOpenMode;
+/** @deprecated Use AgentWidgetOpenCallback. */
+export type AgentOpenCallback = AgentWidgetOpenCallback;
+/** @deprecated Use AgentWidgetOptions.canOpenHistory. */
+export type AgentHistoryCapability = AgentWidgetOptions["canOpenHistory"];
+
 export type UICtx = {
   setStatus(key: string, text: string | undefined): void;
   setWidget(
@@ -59,6 +72,8 @@ export type UICtx = {
     content: undefined | ((tui: any, theme: Theme) => { render(): string[]; invalidate(): void }),
     options?: { placement?: "aboveEditor" | "belowEditor" },
   ): void;
+  onTerminalInput(handler: (data: string) => { consume?: boolean; data?: string } | undefined): () => void;
+  getEditorText(): string;
 };
 
 /** Per-agent live activity state. */
@@ -229,10 +244,13 @@ export class AgentWidget {
   private uiCtx: UICtx | undefined;
   private widgetFrame = 0;
   private widgetInterval: ReturnType<typeof setInterval> | undefined;
-  /** Tracks how many turns each finished agent has survived. Key: agent ID, Value: turns since finished. */
-  private finishedTurnAge = new Map<string, number>();
-  /** How many extra turns errors/aborted agents linger (completed agents clear after 1 turn). */
-  private static readonly ERROR_LINGER_TURNS = 2;
+  private inputUnsub: (() => void) | undefined;
+  /** Whether arrow keys currently navigate the agent roster. */
+  private navigationActive = false;
+  /** Stable identity of the selected row, so roster changes do not jump selection. */
+  private selectedAgentId: string | undefined;
+  /** First logical row currently represented by the bounded viewport. */
+  private viewportStart = 0;
 
   /** Whether the widget callback is currently registered with the TUI. */
   private widgetRegistered = false;
@@ -246,12 +264,12 @@ export class AgentWidget {
   constructor(
     private manager: AgentManager,
     private agentActivity: Map<string, AgentActivity>,
-    /**
-     * Read live at render time. Selects which agents the widget shows — see
-     * `WidgetMode`. Defaults to `"all"` when a caller supplies no policy; the
-     * extension supplies one defaulting to `"background"`.
-     */
+    /** Read live at render time. Selects which agents the widget shows. */
     private mode: () => WidgetMode = () => "all",
+    private options: AgentWidgetOptions = {
+      canOpenHistory: (record) => record.session !== undefined || record.completedAt !== undefined,
+      onOpen: () => {},
+    },
   ) {}
 
   /**
@@ -278,13 +296,23 @@ export class AgentWidget {
   setUICtx(ctx: UICtx): boolean {
     if (ctx === this.uiCtx) return false;
 
-    // UICtx changed — the widget registered on the old context is gone.
-    // Force re-registration on next update().
+    // UICtx changed — the widget and input handler registered on the old
+    // context are gone. Re-register both on the next update().
+    this.inputUnsub?.();
+    this.inputUnsub = undefined;
     this.uiCtx = ctx;
     this.widgetRegistered = false;
     this.tui = undefined;
     this.lastStatusText = undefined;
     this.lastRenderKey = undefined;
+    this.navigationActive = false;
+    this.selectedAgentId = undefined;
+    this.viewportStart = 0;
+    // Print/RPC tests and lightweight embedders may provide only the widget
+    // surface; real interactive contexts always implement this hook.
+    if (typeof ctx.onTerminalInput === "function") {
+      this.inputUnsub = ctx.onTerminalInput(data => this.handleKey(data));
+    }
     return true;
   }
 
@@ -295,16 +323,8 @@ export class AgentWidget {
     return true;
   }
 
-  /**
-   * Called on each new turn (tool_execution_start).
-   * Ages finished agents and clears those that have lingered long enough.
-   */
+  /** Called on each new turn (tool_execution_start). */
   onTurnStart() {
-    // Age all finished agents
-    for (const [id, age] of this.finishedTurnAge) {
-      this.finishedTurnAge.set(id, age + 1);
-    }
-    // Trigger a widget refresh (will filter out expired agents)
     this.update();
   }
 
@@ -312,7 +332,7 @@ export class AgentWidget {
   ensureTimer() {
     if (!this.uiCtx || !this.widgetAgents().some(a => a.status === "running")) return;
     if (!this.widgetInterval) {
-      this.widgetInterval = setInterval(() => this.update(true), 80);
+      this.widgetInterval = setInterval(() => this.update(true), 250);
     }
   }
 
@@ -325,18 +345,117 @@ export class AgentWidget {
     }
   }
 
-  /** Check if a finished agent should still be shown in the widget. */
-  private shouldShowFinished(agentId: string, status: string): boolean {
-    const age = this.finishedTurnAge.get(agentId) ?? 0;
-    const maxAge = ERROR_STATUSES.has(status) ? AgentWidget.ERROR_LINGER_TURNS : 1;
-    return age < maxAge;
+  /**
+   * Retained for the lifecycle call sites. Terminal visibility is determined
+   * by the manager record and the history capability, not a one-turn timer.
+   */
+  markFinished(_agentId: string) {}
+
+  /**
+   * Records represented by selectable rows in the above-editor widget.
+   *
+   * Keep this order as the single source of truth for both rendering and key
+   * navigation. `listAgents()` is newest-first; active rows come first so the
+   * panel exposes currently useful work before terminal history.
+   */
+  private roster(): AgentRecord[] {
+    const agents = this.widgetAgents();
+    const finished = agents.filter(record =>
+      record.status !== "running" && record.status !== "queued"
+      && record.completedAt !== undefined
+      && this.options.canOpenHistory(record),
+    );
+    const running = agents.filter(record => record.status === "running");
+    const queued = agents.filter(record => record.status === "queued");
+    return [...running, ...queued, ...finished];
   }
 
-  /** Record an agent as finished (call when agent completes). */
-  markFinished(agentId: string) {
-    if (!this.finishedTurnAge.has(agentId)) {
-      this.finishedTurnAge.set(agentId, 0);
+  /** True when pi's prompt editor owns the keyboard. */
+  private editorHasFocus(): boolean {
+    const focused = (this.tui as { focusedComponent?: unknown } | undefined)?.focusedComponent;
+    return focused == null || focused instanceof Editor;
+  }
+
+  private selectedIndexOf(records: readonly AgentRecord[]): number {
+    if (!this.selectedAgentId) return -1;
+    return records.findIndex(record => record.id === this.selectedAgentId);
+  }
+
+  private deactivate(): void {
+    this.navigationActive = false;
+    this.selectedAgentId = undefined;
+    this.viewportStart = 0;
+    this.update();
+  }
+
+  /** Move the selected row, activating only from an empty focused editor. */
+  private moveSelection(direction: -1 | 1): boolean {
+    const records = this.roster();
+    const ui = this.uiCtx;
+    if (records.length === 0 || !ui) return false;
+
+    if (!this.navigationActive) {
+      if (direction !== 1 || !this.editorHasFocus() || (ui.getEditorText?.() ?? "") !== "") return false;
+      this.navigationActive = true;
+      this.selectedAgentId = records[0].id;
+      this.viewportStart = 0;
+      this.update();
+      return true;
     }
+
+    const currentIndex = Math.max(0, this.selectedIndexOf(records));
+    if (direction === -1 && currentIndex === 0) {
+      this.deactivate();
+      return true;
+    }
+    const nextIndex = Math.max(0, Math.min(records.length - 1, currentIndex + direction));
+    this.selectedAgentId = records[nextIndex].id;
+    this.update();
+    return true;
+  }
+
+  private openSelected(): void {
+    const record = this.roster().find(candidate => candidate.id === this.selectedAgentId);
+    this.deactivate();
+    if (!record) return;
+    const mode: AgentWidgetOpenMode = record.status === "running" || record.status === "queued" ? "live" : "history";
+    void this.options.onOpen(record, mode);
+  }
+
+  /** Handle terminal input before it reaches the focused prompt editor. */
+  handleKey(data: string): { consume?: boolean; data?: string } | undefined {
+    if (!this.uiCtx || isKeyRelease(data)) return undefined;
+    if (!this.editorHasFocus()) {
+      if (this.navigationActive) this.deactivate();
+      return undefined;
+    }
+
+    if (!this.navigationActive) {
+      if (!matchesKey(data, "down") || (this.uiCtx.getEditorText?.() ?? "") !== "" || this.roster().length === 0) {
+        return undefined;
+      }
+      this.navigationActive = true;
+      this.selectedAgentId = this.roster()[0]?.id;
+      this.viewportStart = 0;
+      this.update();
+      return { consume: true };
+    }
+
+    if (matchesKey(data, "escape")) {
+      this.deactivate();
+      return { consume: true };
+    }
+    if (matchesKey(data, "up")) return this.moveSelection(-1) ? { consume: true } : undefined;
+    if (matchesKey(data, "down")) return this.moveSelection(1) ? { consume: true } : undefined;
+    if (matchesKey(data, Key.enter)) {
+      this.openSelected();
+      return { consume: true };
+    }
+
+    // Only ↑/↓ navigate. Other keys, including j/k/←/→, flow to the editor
+    // and leave navigation mode.
+    this.deactivate();
+    return undefined;
   }
 
   /** Render a finished agent line. */
@@ -385,10 +504,11 @@ export class AgentWidget {
     const running = allAgents.filter(a => a.status === "running");
     const queued = allAgents.filter(a => a.status === "queued");
     const finished = allAgents.filter(a =>
-      a.status !== "running" && a.status !== "queued" && a.completedAt
-      && this.shouldShowFinished(a.id, a.status),
+      a.status !== "running" && a.status !== "queued" && a.completedAt !== undefined
+      && this.options.canOpenHistory(a),
     );
 
+    const selectedId = this.navigationActive ? this.selectedAgentId : undefined;
     const hasActive = running.length > 0 || queued.length > 0;
     const hasFinished = finished.length > 0;
 
@@ -406,12 +526,16 @@ export class AgentWidget {
     // Build sections separately for overflow-aware assembly.
     // Each running agent = 2 lines (header + activity), finished = 1 line, queued = 1 line.
 
-    const finishedLines: string[] = [];
+    const finishedLines: { record: AgentRecord; lines: string[] }[] = [];
     for (const a of finished) {
-      finishedLines.push(truncate(theme.fg("dim", "├─") + " " + this.renderFinishedLine(a, theme)));
+      const marker = a.id === selectedId ? theme.fg("accent", "●") : theme.fg("dim", "○");
+      finishedLines.push({
+        record: a,
+        lines: [truncate(theme.fg("dim", "├─") + ` ${marker} ` + this.renderFinishedLine(a, theme))],
+      });
     }
 
-    const runningLines: string[][] = []; // each entry is [header, activity]
+    const runningLines: { record: AgentRecord; lines: string[] }[] = []; // each entry is [header, activity]
     for (const a of running) {
       const name = getDisplayName(a.type);
       const modeLabel = getPromptModeLabel(a.type);
@@ -433,22 +557,32 @@ export class AgentWidget {
 
       const activity = bg ? describeActivity(bg.activeTools, bg.responseText) : "thinking…";
 
-      runningLines.push([
-        truncate(theme.fg("dim", "├─") + ` ${theme.fg("accent", frame)} ${theme.bold(name)}${modeTag}  ${theme.fg("muted", truncateLine(a.description))} ${theme.fg("dim", "·")} ${fgPreservingNestedStyles(theme, "dim", statsText)}`),
-        truncate(theme.fg("dim", "│  ") + theme.fg("dim", `  ⎿  ${activity}`)),
-      ]);
+      const marker = a.id === selectedId ? theme.fg("accent", "●") : theme.fg("dim", "○");
+      runningLines.push({
+        record: a,
+        lines: [
+          truncate(theme.fg("dim", "├─") + ` ${marker} ${theme.fg("accent", frame)} ${theme.bold(name)}${modeTag}  ${theme.fg("muted", truncateLine(a.description))} ${theme.fg("dim", "·")} ${fgPreservingNestedStyles(theme, "dim", statsText)}`),
+          truncate(theme.fg("dim", "│  ") + `   ${theme.fg("dim", `⎿  ${activity}`)}`),
+        ],
+      });
     }
 
-    const queuedLine = queued.length > 0
-      ? truncate(theme.fg("dim", "├─") + ` ${theme.fg("muted", "◦")} ${theme.fg("dim", `${queued.length} queued`)}`)
-      : undefined;
+    const queuedLines: { record: AgentRecord; lines: string[] }[] = queued.map(a => {
+      const marker = a.id === selectedId ? theme.fg("accent", "●") : theme.fg("dim", "○");
+      return {
+        record: a,
+        lines: [truncate(theme.fg("dim", "├─") + ` ${marker} ${theme.fg("muted", "◦")} ${theme.fg("dim", `${getDisplayName(a.type)}  ${truncateLine(a.description)} · queued`)}`)],
+      };
+    });
 
     // Assemble with a responsive cap (heading + overflow indicator = 2
     // reserved lines when content exceeds the available body budget).
     const maxBody = maxLines - 1; // heading takes 1 line
-    const totalBody = finishedLines.length + runningLines.length * 2 + (queuedLine ? 1 : 0);
+    const rows = [...runningLines, ...queuedLines, ...finishedLines];
+    const totalBody = rows.reduce((total, row) => total + row.lines.length, 0);
 
-    const lines: string[] = [truncate(theme.fg(headingColor, headingIcon) + " " + theme.fg(headingColor, "Agents"))];
+    const heading = "Agents  ↑↓ select · enter view · esc back";
+    const lines: string[] = [truncate(theme.fg(headingColor, headingIcon) + " " + theme.fg(headingColor, heading))];
 
     if (maxLines === 1) {
       // There is room only for the heading; do not consume the editor/input row.
@@ -456,71 +590,70 @@ export class AgentWidget {
     }
 
     if (totalBody <= maxBody) {
-      // Everything fits — add all lines and fix up connectors for the last item.
-      lines.push(...finishedLines);
-      for (const pair of runningLines) lines.push(...pair);
-      if (queuedLine) lines.push(queuedLine);
-
-      // Fix last connector: swap ├─ → └─ and │ → space for activity lines.
-      if (lines.length > 1) {
-        const last = lines.length - 1;
-        lines[last] = lines[last].replace("├─", "└─");
-        // If last item is a running agent activity line, fix indent of that line
-        // and fix the header line above it.
-        if (runningLines.length > 0 && !queuedLine) {
-          // The last two lines are the last running agent's header + activity.
-          if (last >= 2) {
-            lines[last - 1] = lines[last - 1].replace("├─", "└─");
-            lines[last] = lines[last].replace("│  ", "   ");
-          }
+      this.viewportStart = 0;
+      for (const row of rows) lines.push(...row.lines);
+      if (rows.length > 0) {
+        const lastRow = rows[rows.length - 1];
+        const lastStart = lines.length - lastRow.lines.length;
+        lines[lastStart] = lines[lastStart].replace("├─", "└─");
+        if (lastRow.lines.length === 2) {
+          lines[lastStart + 1] = lines[lastStart + 1].replace("│  ", "   ");
         }
       }
     } else {
-      // Overflow — prioritize: running > queued > finished.
-      // Reserve 1 line for overflow indicator.
-      let budget = maxBody - 1;
-      let hiddenRunning = 0;
-      let hiddenQueued = 0;
-      let hiddenFinished = 0;
-
-      // 1. Running agents (2 lines each)
-      for (const pair of runningLines) {
-        if (budget >= 2) {
-          lines.push(...pair);
-          budget -= 2;
-        } else {
-          hiddenRunning++;
+      // Reserve one line for a directional overflow summary. The viewport is
+      // a contiguous slice in roster order, so the same slice is navigable and
+      // renderable even when the selected row is currently hidden.
+      const contentBudget = Math.max(0, maxBody - 1);
+      const heightAt = (index: number) => rows[index]?.lines.length ?? 0;
+      const endFor = (start: number): number => {
+        let used = 0;
+        let end = start;
+        while (end < rows.length && used + heightAt(end) <= contentBudget) {
+          used += heightAt(end++);
         }
+        return end;
+      };
+
+      let start = Math.max(0, Math.min(this.viewportStart, Math.max(0, rows.length - 1)));
+      const selectedIndex = this.navigationActive && selectedId
+        ? rows.findIndex(row => row.record.id === selectedId)
+        : -1;
+      if (selectedIndex >= 0) {
+        if (selectedIndex < start) start = selectedIndex;
+        if (selectedIndex >= endFor(start)) start = selectedIndex;
+      }
+      this.viewportStart = start;
+
+      let used = 0;
+      let end = start;
+      while (end < rows.length && used + heightAt(end) <= contentBudget) {
+        lines.push(...rows[end].lines);
+        used += heightAt(end);
+        end++;
+      }
+      // A selected two-line row must remain addressable even if only one body
+      // line is available. Showing its header is preferable to hiding it.
+      if (end === start && rows[start] && contentBudget > 0) {
+        lines.push(rows[start].lines[0]);
+        end = start + 1;
       }
 
-      // 2. Queued line
-      if (queuedLine) {
-        if (budget >= 1) {
-          lines.push(queuedLine);
-          budget--;
-        } else {
-          hiddenQueued = 1;
-        }
-      }
-
-      // 3. Finished agents
-      for (const fl of finishedLines) {
-        if (budget >= 1) {
-          lines.push(fl);
-          budget--;
-        } else {
-          hiddenFinished++;
-        }
-      }
-
-      // Overflow summary
-      const overflowParts: string[] = [];
-      if (hiddenRunning > 0) overflowParts.push(`${hiddenRunning} running`);
-      if (hiddenQueued > 0) overflowParts.push(`${hiddenQueued} queued`);
-      if (hiddenFinished > 0) overflowParts.push(`${hiddenFinished} finished`);
-      const overflowText = overflowParts.join(", ");
-      lines.push(truncate(theme.fg("dim", "└─") + ` ${theme.fg("dim", `+${hiddenRunning + hiddenQueued + hiddenFinished} more (${overflowText})`)}`)
-      );
+      const hiddenBefore = start;
+      const hiddenAfter = Math.max(0, rows.length - end);
+      const hidden = hiddenBefore + hiddenAfter;
+      const hiddenRows = rows.filter((_row, index) => index < start || index >= end);
+      const categoryCounts: string[] = [
+        ["running", hiddenRows.filter(row => row.record.status === "running").length] as [string, number],
+        ["queued", hiddenRows.filter(row => row.record.status === "queued").length] as [string, number],
+        ["finished", hiddenRows.filter(row => row.record.status !== "running" && row.record.status !== "queued").length] as [string, number],
+      ].filter(([, count]) => count > 0).map(([label, count]) => `${count} ${label}`);
+      const direction = [
+        ...(hiddenBefore > 0 ? [`↑ ${hiddenBefore} more`] : []),
+        ...(hiddenAfter > 0 ? [`↓ ${hiddenAfter} more`] : []),
+      ].join(" · ");
+      const summary = `+${hidden} more (${direction}${categoryCounts.length > 0 ? `; ${categoryCounts.join(", ")}` : ""})`;
+      lines.push(truncate(theme.fg("dim", "└─") + ` ${theme.fg("dim", summary)}`));
     }
 
     return lines;
@@ -555,9 +688,14 @@ export class AgentWidget {
         lifetimeUsage: a.lifetimeUsage,
         compactionCount: a.compactionCount,
         isBackground: a.isBackground,
+        hasSession: a.session !== undefined,
+        transcriptPath: a.transcriptPath,
+        openableHistory: this.options.canOpenHistory(a),
       })),
       activities,
-      finishedTurnAge: [...this.finishedTurnAge.entries()],
+      navigationActive: this.navigationActive,
+      selectedAgentId: this.selectedAgentId,
+      viewportStart: this.viewportStart,
     });
   }
 
@@ -565,16 +703,16 @@ export class AgentWidget {
   update(advanceSpinner = false) {
     if (!this.uiCtx) return;
     const allAgents = this.widgetAgents();
+    const roster = this.roster();
 
     // Lightweight existence checks — full categorization happens in renderWidget()
     let runningCount = 0;
     let queuedCount = 0;
-    let hasFinished = false;
-    for (const a of allAgents) {
-      if (a.status === "running") { runningCount++; }
-      else if (a.status === "queued") { queuedCount++; }
-      else if (a.completedAt && this.shouldShowFinished(a.id, a.status)) { hasFinished = true; }
+    for (const a of roster) {
+      if (a.status === "running") runningCount++;
+      else if (a.status === "queued") queuedCount++;
     }
+    const hasFinished = roster.some(a => a.status !== "running" && a.status !== "queued");
     const hasActive = runningCount > 0 || queuedCount > 0;
 
     // Nothing to show — clear widget
@@ -589,11 +727,10 @@ export class AgentWidget {
         this.lastStatusText = undefined;
       }
       this.lastRenderKey = undefined;
+      this.navigationActive = false;
+      this.selectedAgentId = undefined;
+      this.viewportStart = 0;
       this.syncTimer(false);
-      // Clean up stale entries
-      for (const [id] of this.finishedTurnAge) {
-        if (!allAgents.some(a => a.id === id)) this.finishedTurnAge.delete(id);
-      }
       return;
     }
 
@@ -616,6 +753,15 @@ export class AgentWidget {
     // an otherwise idle widget advance.
     if (advanceSpinner && runningCount > 0) this.widgetFrame++;
     this.syncTimer(runningCount > 0);
+    if (this.navigationActive) {
+      if (roster.length === 0) {
+        this.navigationActive = false;
+        this.selectedAgentId = undefined;
+        this.viewportStart = 0;
+      } else if (this.selectedIndexOf(roster) < 0) {
+        this.selectedAgentId = roster[Math.min(this.viewportStart, roster.length - 1)].id;
+      }
+    }
     const renderKey = this.renderKey(allAgents);
 
     // Register widget callback once; subsequent updates use requestRender()
@@ -651,11 +797,15 @@ export class AgentWidget {
       this.uiCtx.setWidget("agents", undefined);
       this.uiCtx.setStatus("subagents", undefined);
     }
+    this.inputUnsub?.();
+    this.inputUnsub = undefined;
     this.widgetRegistered = false;
     this.tui = undefined;
     this.lastStatusText = undefined;
     this.lastRenderKey = undefined;
+    this.navigationActive = false;
+    this.selectedAgentId = undefined;
+    this.viewportStart = 0;
     this.uiCtx = undefined;
-    this.finishedTurnAge.clear();
   }
 }

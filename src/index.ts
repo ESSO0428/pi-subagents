@@ -49,8 +49,6 @@ import {
   type Theme,
   type UICtx,
 } from "./ui/agent-widget.js";
-import { createDeferredUiRefresh } from "./ui/deferred-ui-refresh.js";
-import { FleetList, type FleetUICtx } from "./ui/fleet-list.js";
 import { showSchedulesMenu } from "./ui/schedule-menu.js";
 import { addUsage, getLifetimeTotal, getSessionContextPercent, type LifetimeUsage } from "./usage.js";
 
@@ -372,16 +370,14 @@ export default function (pi: ExtensionAPI) {
   function sendIndividualNudge(record: AgentRecord) {
     agentActivity.delete(record.id);
     widget.markFinished(record.id);
-    fleet.onAgentFinished(record.id);
     scheduleNudge(record.id, () => emitIndividualNudge(record));
     widget.update();
-    scheduleUiRefresh();
   }
 
   // ---- Group join manager ----
   const groupJoin = new GroupJoinManager(
     (records, partial) => {
-      for (const r of records) { agentActivity.delete(r.id); widget.markFinished(r.id); fleet.onAgentFinished(r.id); }
+      for (const r of records) { agentActivity.delete(r.id); widget.markFinished(r.id); }
 
       const groupKey = `group:${records.map(r => r.id).join(",")}`;
       scheduleNudge(groupKey, () => {
@@ -389,7 +385,6 @@ export default function (pi: ExtensionAPI) {
         const unconsumed = records.filter(r => !r.resultConsumed);
         if (unconsumed.length === 0) {
           widget.update();
-          scheduleUiRefresh();
           return;
         }
 
@@ -412,7 +407,6 @@ export default function (pi: ExtensionAPI) {
         }, { deliverAs: "followUp", triggerTurn: true });
       });
       widget.update();
-      scheduleUiRefresh();
     },
     30_000,
   );
@@ -468,9 +462,7 @@ export default function (pi: ExtensionAPI) {
     if (record.resultConsumed) {
       agentActivity.delete(record.id);
       widget.markFinished(record.id);
-      fleet.onAgentFinished(record.id);
       widget.update();
-      scheduleUiRefresh();
       return;
     }
 
@@ -478,7 +470,6 @@ export default function (pi: ExtensionAPI) {
     // don't send an individual nudge — finalizeBatch will pick it up retroactively.
     if (currentBatchAgents.some(a => a.id === record.id)) {
       widget.update();
-      scheduleUiRefresh();
       return;
     }
 
@@ -489,7 +480,6 @@ export default function (pi: ExtensionAPI) {
     // 'held' → do nothing, group will fire later
     // 'delivered' → group callback already fired
     widget.update();
-    scheduleUiRefresh();
   }, undefined, (record) => {
     // Emit started event when agent transitions to running (including from queue)
     pi.events.emit("subagents:started", {
@@ -499,9 +489,6 @@ export default function (pi: ExtensionAPI) {
     });
     widget.ensureTimer();
     widget.update();
-    fleet.ensureTimer();
-    fleet.update();
-    scheduleUiRefresh();
   }, (record, info) => {
     // Emit compacted event when agent's session compacts (preserves count on record).
     pi.events.emit("subagents:compacted", {
@@ -596,7 +583,6 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_before_switch", () => {
-    deferredUiRefresh.cancel();
     manager.clearCompleted(true);
     scheduler.stop();
   });
@@ -618,46 +604,28 @@ export default function (pi: ExtensionAPI) {
     manager.abortAll();
     for (const timer of pendingNudges.values()) clearTimeout(timer);
     pendingNudges.clear();
-    deferredUiRefresh.dispose();
-    fleet.dispose();
+    widget.dispose();
     manager.dispose();
   });
 
-  // Live widget: show running agents above editor.
-  // widgetMode (default "background") selects what the widget shows: "all" =
-  // every agent; "background" = hide foreground (they already render inline as
-  // the Agent tool result, so showing them here too is a duplicate, #118), keep
-  // everything else; "off" = hide the widget entirely. Read live at render time.
-  let widgetMode: WidgetMode = "background";
+  // Live widget: show all agents above the editor. Read live at render time.
+  let widgetMode: WidgetMode = "all";
   function getWidgetMode(): WidgetMode { return widgetMode; }
-  const widget = new AgentWidget(manager, agentActivity, getWidgetMode);
+  const widget = new AgentWidget(
+    manager,
+    agentActivity,
+    getWidgetMode,
+    {
+      canOpenHistory: (record) => canOpenAgentHistory(record, currentCtx?.cwd),
+      onOpen: (record, mode) => {
+        const ctx = currentCtx;
+        if (ctx) void viewAgentConversation(ctx as ExtensionCommandContext, record, mode);
+      },
+    },
+  );
   function setWidgetMode(m: WidgetMode): void {
-    const changed = widgetMode !== m;
     widgetMode = m;
     widget.update();
-    if (changed) scheduleUiRefresh();
-  }
-
-  // Claude Code-style FleetView: navigable list of main + subagents below the editor.
-  const fleet = new FleetList(manager, agentActivity, () => currentCtx?.cwd, pi, () => currentCtx);
-
-  // One render-only scheduler is shared by both widgets. The callback resolves
-  // the live TUI target at fire time because session switches invalidate the
-  // previous widget context; both widgets use the same TUI, so one successful
-  // request is sufficient.
-  const deferredUiRefresh = createDeferredUiRefresh(() => {
-    if (widget.requestUiRefresh(true)) return;
-    fleet.requestUiRefresh(true);
-  });
-  const scheduleUiRefresh = (): void => deferredUiRefresh.schedule();
-
-  let fleetViewEnabled = true;
-  function isFleetViewEnabled(): boolean { return fleetViewEnabled; }
-  function setFleetViewEnabled(b: boolean): void {
-    const changed = fleetViewEnabled !== b;
-    fleetViewEnabled = b;
-    fleet.setEnabled(b);
-    if (changed) scheduleUiRefresh();
   }
 
   // Project/global default for writing the subagent .output transcript. A custom
@@ -758,9 +726,7 @@ export default function (pi: ExtensionAPI) {
 
   // Grab UI context from first tool execution + clear lingering widget on new turn
   pi.on("tool_execution_start", async (_event, ctx) => {
-    const widgetContextChanged = widget.setUICtx(ctx.ui as UICtx);
-    const fleetContextChanged = fleet.setUICtx(ctx.ui as unknown as FleetUICtx);
-    if (widgetContextChanged || fleetContextChanged) scheduleUiRefresh();
+    widget.setUICtx(ctx.ui as UICtx);
     widget.onTurnStart();
   });
 
@@ -820,7 +786,6 @@ export default function (pi: ExtensionAPI) {
       setScopeModels: setScopeModelsEnabled,
       setDisableDefaultAgents: setDisableDefaultAgents,
       setToolDescriptionMode: setToolDescriptionMode,
-      setFleetView: setFleetViewEnabled,
       setWidgetMode: setWidgetMode,
       setOutputTranscript: setOutputTranscript,
     },
@@ -1356,9 +1321,6 @@ Terse command-style prompts produce shallow, generic work.
         agentActivity.set(id, bgState);
         widget.ensureTimer();
         widget.update();
-        fleet.ensureTimer();
-        fleet.update();
-        scheduleUiRefresh();
 
         // Emit created event
         pi.events.emit("subagents:created", {
@@ -1420,9 +1382,6 @@ Terse command-style prompts produce shallow, generic work.
             agentActivity.set(a.id, fgState);
             widget.ensureTimer();
             widget.update();
-            fleet.ensureTimer();
-            fleet.update();
-            scheduleUiRefresh();
             break;
           }
         }
@@ -1474,7 +1433,6 @@ Terse command-style prompts produce shallow, generic work.
       if (fgId) {
         agentActivity.delete(fgId);
         widget.markFinished(fgId);
-        fleet.onAgentFinished(fgId);
       }
 
       // Get final token count
@@ -2278,7 +2236,6 @@ ${systemPrompt}
       scopeModels: isScopeModelsEnabled(),
       disableDefaultAgents: isDefaultsDisabled(),
       toolDescriptionMode: getToolDescriptionMode(),
-      fleetView: isFleetViewEnabled(),
       widgetMode: getWidgetMode(),
       outputTranscript: getOutputTranscriptDefault(),
     };
@@ -2350,13 +2307,6 @@ ${systemPrompt}
           values: ["on", "off"],
         },
         {
-          id: "fleetView",
-          label: "Fleet view",
-          description: "Claude Code-style main+subagents list below the editor (↓/← to navigate, Enter to view)",
-          currentValue: isFleetViewEnabled() ? "on" : "off",
-          values: ["on", "off"],
-        },
-        {
           id: "widgetMode",
           label: "Widget",
           description: "Above-editor agent widget: all = every agent; background = hide foreground (they already render inline); off = hide the widget.",
@@ -2425,10 +2375,6 @@ ${systemPrompt}
       } else if (id === "toolDescriptionMode") {
         setToolDescriptionMode(value as ToolDescriptionMode);
         notifyApplied(ctx, `Tool description set to ${value}. Takes effect on next pi session.`);
-      } else if (id === "fleetView") {
-        const enabled = value === "on";
-        setFleetViewEnabled(enabled);
-        notifyApplied(ctx, `Fleet view ${enabled ? "enabled" : "disabled"}`);
       } else if (id === "widgetMode") {
         setWidgetMode(value as WidgetMode);
         notifyApplied(ctx, `Widget set to ${value}`);

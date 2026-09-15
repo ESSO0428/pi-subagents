@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-09-15
+
+### Changed
+- **The above-editor Agents panel is now the single agent navigator.** It replaces the duplicate FleetView roster, uses focus-gated `↑`/`↓` navigation with `Enter` to open live or read-only history viewers, and removes FleetView's duplicate timer and deferred redraw path.
+
 ## [0.16.0] - 2026-09-15
 
 > **⚠️ Breaking: pi 0.80.8 is now the minimum supported host version.** The package peer dependencies require `@earendil-works/pi-ai`, `@earendil-works/pi-coding-agent`, and `@earendil-works/pi-tui` `>=0.80.8`; upgrade pi before installing this release. This floor matches the `ModelRuntime` API used by the runner and avoids installing a release against the pre-0.80.8 session-creation contract.
