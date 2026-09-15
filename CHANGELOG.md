@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.1] - 2026-09-15
+
+### Fixed
+- **The Agents panel now initializes during TUI session startup after restoring persisted agent records**, so openable completed-agent history is visible immediately when a session starts or resumes instead of waiting for the next tool execution.
+
 ## [0.17.0] - 2026-09-15
 
 ### Changed

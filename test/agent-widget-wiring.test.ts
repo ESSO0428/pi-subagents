@@ -47,14 +47,15 @@ function uiCtx() {
   };
 }
 
-function ctxWith(ui: ReturnType<typeof uiCtx>) {
+function ctxWith(ui: ReturnType<typeof uiCtx>, branch: any[] = []) {
   return {
+    mode: "tui",
     hasUI: true,
     ui,
     cwd: process.cwd(),
     model: undefined,
     modelRegistry: { find: vi.fn(), getAvailable: vi.fn(() => []) },
-    sessionManager: { getSessionId: () => "s1", getBranch: () => [] },
+    sessionManager: { getSessionId: () => "s1", getBranch: () => branch },
     getSystemPrompt: () => "parent",
   } as any;
 }
@@ -106,6 +107,74 @@ describe("Agents panel wiring (real extension lifecycle)", () => {
     await lifecycle.get("tool_execution_start")?.({}, ctxWith(ui));
 
     expect(ui.onTerminalInput).toHaveBeenCalledTimes(1);
+  });
+
+  it("initializes the above-editor panel on session_start after restoring history", async () => {
+    const transcriptPath = join(tmpDir, ".pi-subagents", "agent-transcripts", "restored.jsonl");
+    mkdirSync(join(tmpDir, ".pi-subagents", "agent-transcripts"), { recursive: true });
+    writeFileSync(transcriptPath, JSON.stringify({ message: { role: "user", content: "hello" } }) + "\n");
+
+    const branch = [{
+      type: "custom",
+      customType: "subagents:record",
+      data: {
+        id: "restored-agent",
+        type: "general-purpose",
+        description: "Restored agent",
+        status: "completed",
+        startedAt: 1,
+        completedAt: 2,
+        transcriptPath: ".pi-subagents/agent-transcripts/restored.jsonl",
+      },
+    }];
+    const { pi, lifecycle } = makePi();
+    subagentsExtension(pi);
+    const ui = uiCtx();
+
+    await lifecycle.get("session_start")?.({}, ctxWith(ui, branch));
+
+    expect(ui.onTerminalInput).toHaveBeenCalledTimes(1);
+    expect(ui.setWidget).toHaveBeenCalledWith("agents", expect.any(Function), { placement: "aboveEditor" });
+    const registration = ui.setWidget.mock.calls.find(
+      (call) => call[0] === "agents" && typeof call[1] === "function",
+    );
+    const factory = registration?.[1] as ((tui: any, theme: any) => { render(): string[] }) | undefined;
+    expect(factory).toBeDefined();
+    const rendered = factory?.(
+      { terminal: { columns: 120, rows: 24 } },
+      { fg: (_c: string, s: string) => s, bold: (s: string) => s },
+    ).render().join("\n");
+    expect(rendered).toContain("Restored agent");
+
+    await lifecycle.get("session_shutdown")?.({}, ctxWith(ui));
+  });
+
+  it("does not add a duplicate terminal input listener at startup and first tool execution", async () => {
+    const { pi, lifecycle } = makePi();
+    subagentsExtension(pi);
+    const ui = uiCtx();
+    const ctx = ctxWith(ui);
+
+    await lifecycle.get("session_start")?.({}, ctx);
+    await lifecycle.get("tool_execution_start")?.({}, ctx);
+
+    expect(ui.onTerminalInput).toHaveBeenCalledTimes(1);
+
+    await lifecycle.get("session_shutdown")?.({}, ctx);
+  });
+
+  it("does not register the Agents widget outside TUI mode", async () => {
+    const { pi, lifecycle } = makePi();
+    subagentsExtension(pi);
+    const ui = uiCtx();
+    const nonTuiCtx = { ...ctxWith(ui), mode: "print" };
+
+    await lifecycle.get("session_start")?.({}, nonTuiCtx);
+
+    expect(ui.onTerminalInput).not.toHaveBeenCalled();
+    expect(ui.setWidget).not.toHaveBeenCalled();
+
+    await lifecycle.get("session_shutdown")?.({}, nonTuiCtx);
   });
 
   it("registers only the above-editor agents widget and clears it on shutdown", async () => {

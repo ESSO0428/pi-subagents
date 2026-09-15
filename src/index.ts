@@ -565,6 +565,12 @@ export default function (pi: ExtensionAPI) {
     manager.restoreCompleted(branch
       .filter((entry: any) => entry?.type === "custom" && entry?.customType === "subagents:record")
       .map((entry: any) => entry.data));
+    // Attach the panel during TUI startup, after restored records are present,
+    // so terminal agents from the session branch are immediately visible.
+    if (ctx.mode === "tui") {
+      widget.setUICtx(ctx.ui as UICtx);
+      widget.update();
+    }
     // Guard mirrors the `!scheduler.isActive()` pattern below: session_start
     // fires once per activation, but a double-bind must not leak listeners.
     if (!rpcHandle) {

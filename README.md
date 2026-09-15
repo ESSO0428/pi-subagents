@@ -94,7 +94,7 @@ Restrictions:
 
 ## UI
 
-The extension renders a persistent Agents widget above the editor. By default it shows all agents (`widgetMode: all`), including foreground and background runs. Switch to `background` or `off` via `/agents → Settings → Widget`:
+The extension renders a persistent Agents widget above the editor. It initializes during TUI `session_start`, after the session branch restores completed-agent history, so openable agents are visible immediately when a session starts or resumes. By default it shows all agents (`widgetMode: all`), including foreground and background runs. Switch to `background` or `off` via `/agents → Settings → Widget`:
 
 ```
 ● Agents

@@ -1,6 +1,6 @@
 {
   "name": "@esso0428/pi-subagents",
-  "version": "0.17.0",
+  "version": "0.17.1",
   "description": "A pi extension that brings smart Claude Code-style autonomous sub-agents to pi, with npm:pi-subagents-style JSON agent overrides.",
   "author": "ESSO0428",
   "repository": {
