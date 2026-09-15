@@ -249,6 +249,8 @@ export class AgentWidget {
   private navigationActive = false;
   /** Stable identity of the selected row, so roster changes do not jump selection. */
   private selectedAgentId: string | undefined;
+  /** Last logical roster index of the selected row, used when it disappears. */
+  private selectedRosterIndex = 0;
   /** First logical row currently represented by the bounded viewport. */
   private viewportStart = 0;
 
@@ -307,6 +309,7 @@ export class AgentWidget {
     this.lastRenderKey = undefined;
     this.navigationActive = false;
     this.selectedAgentId = undefined;
+    this.selectedRosterIndex = 0;
     this.viewportStart = 0;
     // Print/RPC tests and lightweight embedders may provide only the widget
     // surface; real interactive contexts always implement this hook.
@@ -382,9 +385,29 @@ export class AgentWidget {
   }
 
   private deactivate(): void {
+    // Keep the selected row and viewport so re-entering navigation can resume
+    // where the user left off. Lifecycle resets (context, dispose, empty
+    // roster) clear this state explicitly instead of treating every exit as a
+    // reset.
     this.navigationActive = false;
-    this.selectedAgentId = undefined;
-    this.viewportStart = 0;
+    this.update();
+  }
+
+  /** Resume navigation from the retained row, or select the first row. */
+  private activate(records: readonly AgentRecord[]): void {
+    this.navigationActive = true;
+    const selectedIndex = this.selectedIndexOf(records);
+    if (selectedIndex >= 0) {
+      this.selectedRosterIndex = selectedIndex;
+    } else {
+      // The previously selected row may have been cleaned up while navigation
+      // was inactive. Resume at its old logical position, clamped to the new
+      // roster, rather than jumping back to the first row.
+      const fallbackIndex = Math.max(0, Math.min(this.selectedRosterIndex, records.length - 1));
+      this.selectedAgentId = records[fallbackIndex].id;
+      this.selectedRosterIndex = fallbackIndex;
+      this.viewportStart = Math.min(this.viewportStart, Math.max(0, records.length - 1));
+    }
     this.update();
   }
 
@@ -396,10 +419,7 @@ export class AgentWidget {
 
     if (!this.navigationActive) {
       if (direction !== 1 || !this.editorHasFocus() || (ui.getEditorText?.() ?? "") !== "") return false;
-      this.navigationActive = true;
-      this.selectedAgentId = records[0].id;
-      this.viewportStart = 0;
-      this.update();
+      this.activate(records);
       return true;
     }
 
@@ -410,6 +430,7 @@ export class AgentWidget {
     }
     const nextIndex = Math.max(0, Math.min(records.length - 1, currentIndex + direction));
     this.selectedAgentId = records[nextIndex].id;
+    this.selectedRosterIndex = nextIndex;
     this.update();
     return true;
   }
@@ -431,13 +452,11 @@ export class AgentWidget {
     }
 
     if (!this.navigationActive) {
-      if (!matchesKey(data, "down") || (this.uiCtx.getEditorText?.() ?? "") !== "" || this.roster().length === 0) {
+      const records = this.roster();
+      if (!matchesKey(data, "down") || (this.uiCtx.getEditorText?.() ?? "") !== "" || records.length === 0) {
         return undefined;
       }
-      this.navigationActive = true;
-      this.selectedAgentId = this.roster()[0]?.id;
-      this.viewportStart = 0;
-      this.update();
+      this.activate(records);
       return { consume: true };
     }
 
@@ -729,6 +748,7 @@ export class AgentWidget {
       this.lastRenderKey = undefined;
       this.navigationActive = false;
       this.selectedAgentId = undefined;
+      this.selectedRosterIndex = 0;
       this.viewportStart = 0;
       this.syncTimer(false);
       return;
@@ -753,13 +773,22 @@ export class AgentWidget {
     // an otherwise idle widget advance.
     if (advanceSpinner && runningCount > 0) this.widgetFrame++;
     this.syncTimer(runningCount > 0);
-    if (this.navigationActive) {
+    const selectedIndex = this.selectedIndexOf(roster);
+    if (selectedIndex >= 0) {
+      this.selectedRosterIndex = selectedIndex;
+    } else if (this.navigationActive) {
       if (roster.length === 0) {
         this.navigationActive = false;
         this.selectedAgentId = undefined;
+        this.selectedRosterIndex = 0;
         this.viewportStart = 0;
-      } else if (this.selectedIndexOf(roster) < 0) {
-        this.selectedAgentId = roster[Math.min(this.viewportStart, roster.length - 1)].id;
+      } else {
+        // Keep the selection near the row that disappeared. Both the saved
+        // logical index and viewport are clamped as the roster shrinks.
+        const fallbackIndex = Math.max(0, Math.min(this.selectedRosterIndex, roster.length - 1));
+        this.selectedAgentId = roster[fallbackIndex].id;
+        this.selectedRosterIndex = fallbackIndex;
+        this.viewportStart = Math.min(this.viewportStart, roster.length - 1);
       }
     }
     const renderKey = this.renderKey(allAgents);
@@ -805,6 +834,7 @@ export class AgentWidget {
     this.lastRenderKey = undefined;
     this.navigationActive = false;
     this.selectedAgentId = undefined;
+    this.selectedRosterIndex = 0;
     this.viewportStart = 0;
     this.uiCtx = undefined;
   }

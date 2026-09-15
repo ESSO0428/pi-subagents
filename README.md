@@ -19,6 +19,7 @@ https://github.com/user-attachments/assets/8685261b-9338-4fea-8dfe-1c590d5df543
 - **Custom agent types** — define agents in `.pi/agents/<name>.md` or `.agents/agents/<name>.md` (project) or globally, with YAML frontmatter: custom system prompts, model selection, thinking levels, tool restrictions
 - **Mid-run steering** — inject messages into running agents to redirect their work without restarting
 - **Session resume** — pick up where an agent left off, preserving full conversation context
+- **Durable interruption recovery** — catchable shutdowns preserve running/queued metadata and partial transcripts so interrupted agents remain indexed after reload; abrupt `SIGKILL` termination cannot be checkpointed
 - **Graceful turn limits** — agents get a "wrap up" warning before hard abort, producing clean partial results instead of cut-off output
 - **Case-insensitive agent types** — `"explore"`, `"Explore"`, `"EXPLORE"` all work. Unknown types fall back to general-purpose with a note
 - **Fuzzy model selection** — specify models by name (`"haiku"`, `"sonnet"`) instead of full IDs, with automatic filtering to only available/configured models
@@ -123,7 +124,7 @@ While agents are running or have openable history, the single Agents panel rende
 └─ +1 more (↓ 1 more; 1 finished)
 ```
 
-At an **empty prompt**, press `↓` to activate the panel. The selected row is marked `●`; `↑`/`↓` move through the full bounded roster, `Enter` opens a running agent live or a terminal agent's read-only history. A queued agent remains selectable, but has no live viewer until it starts; `Esc` returns to the prompt. `↑` while the first row is selected also returns to the prompt. Pressing `↑` at an inactive prompt, typing in a non-empty prompt, or using `j`/`k`/`←` behaves normally; the panel only captures the focus-gated arrow sequence described above. Disable it entirely via `/agents → Settings → Widget → off`.
+At an **empty prompt**, press `↓` to activate the panel. The selected row is marked `●`; `↑`/`↓` move through the full bounded roster, `Enter` opens a running agent live or a terminal agent's read-only history. A queued or interrupted agent remains selectable, and an interrupted agent's partial transcript can be opened read-only after reload. The widget remembers the selected agent and bounded viewport when you return from the prompt or a viewer; if that record disappears, it falls back to the nearest valid row. `Esc` returns to the prompt. `↑` while the first row is selected also returns to the prompt. Pressing `↑` at an inactive prompt, typing in a non-empty prompt, or using `j`/`k`/`←` behaves normally; the panel only captures the focus-gated arrow sequence described above. Disable it entirely via `/agents → Settings → Widget → off`.
 
 Individual agent results render Claude Code-style in the conversation:
 

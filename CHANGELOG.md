@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.2] - 2026-09-15
+
+### Fixed
+- **Agents navigator selection now survives returning to the text input**, restoring the selected agent and bounded viewport on re-entry; if a record disappears, the nearest valid roster position is used.
+- **Running agents and Agent history menus retain their independent selected rows**, and closing a conversation viewer returns to the originating submenu instead of the top-level Agents menu.
+- **Durable transcript results are reloaded on demand after in-memory cleanup**, and full results are no longer duplicated into the parent session branch when a durable transcript exists, reducing long-session heap growth.
+
 ## [0.17.1] - 2026-09-15
 
 ### Fixed

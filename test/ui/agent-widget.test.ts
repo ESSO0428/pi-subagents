@@ -270,8 +270,9 @@ describe("AgentWidget live records", () => {
     harness.input("\u001b[B");
     harness.input("\r");
     expect(opened).toEqual([{ id: "history", mode: "history" }]);
+    // Re-entering resumes the opened history row; move up to the queued row.
     harness.input("\u001b[B");
-    harness.input("\u001b[B");
+    harness.input("\u001b[A");
     harness.input("\r");
     expect(opened).toEqual([
       { id: "history", mode: "history" },
@@ -310,5 +311,97 @@ describe("AgentWidget live records", () => {
     expect(harness.render().join("\n")).toContain("queued target 7");
     expect(harness.render().length).toBeLessThanOrEqual(getWidgetLineBudget(8));
     harness.widget.dispose();
+  });
+
+  it("retains the selected row and viewport when navigation is resumed", () => {
+    const running = makeRecord({ id: "running", status: "running", completedAt: undefined });
+    const queued = Array.from({ length: 8 }, (_, index) => makeRecord({
+      id: `queued-${index}`,
+      description: `queued target ${index}`,
+      status: "queued",
+      completedAt: undefined,
+    }));
+    const harness = createNavigableWidgetHarness([running, ...queued], { rows: 8 });
+
+    harness.input("\u001b[B");
+    for (let index = 0; index < queued.length; index++) harness.input("\u001b[B");
+    harness.render();
+    const selectedId = (harness.widget as any).selectedAgentId;
+    const viewportStart = (harness.widget as any).viewportStart;
+    expect(selectedId).toBe("queued-7");
+    expect(viewportStart).toBeGreaterThan(0);
+
+    // A non-navigation key exits without discarding either piece of state.
+    expect(harness.input("j")).toBeUndefined();
+    expect((harness.widget as any).navigationActive).toBe(false);
+    expect((harness.widget as any).selectedAgentId).toBe(selectedId);
+    expect((harness.widget as any).viewportStart).toBe(viewportStart);
+
+    harness.input("\u001b[B");
+    expect((harness.widget as any).navigationActive).toBe(true);
+    expect((harness.widget as any).selectedAgentId).toBe(selectedId);
+    expect((harness.widget as any).viewportStart).toBe(viewportStart);
+    expect(harness.render().join("\n")).toContain("queued target 7");
+    harness.widget.dispose();
+  });
+
+  it("clamps a disappeared selection from its saved roster index", () => {
+    const records = [
+      makeRecord({ id: "first", status: "queued", completedAt: undefined }),
+      makeRecord({ id: "selected", status: "queued", completedAt: undefined }),
+      makeRecord({ id: "next", status: "queued", completedAt: undefined }),
+      makeRecord({ id: "tail", status: "queued", completedAt: undefined }),
+    ];
+    const harness = createNavigableWidgetHarness(records);
+
+    harness.input("\u001b[B");
+    harness.input("\u001b[B");
+    expect((harness.widget as any).selectedAgentId).toBe("selected");
+
+    records.splice(1, 1);
+    harness.widget.update();
+    expect((harness.widget as any).selectedAgentId).toBe("next");
+
+    harness.input("\u001b[B");
+    records.splice(2, 1);
+    harness.widget.update();
+    expect((harness.widget as any).selectedAgentId).toBe("next");
+    harness.widget.dispose();
+  });
+
+  it("resets retained navigation state for an empty roster, new context, and dispose", () => {
+    const record = makeRecord({ id: "selected", status: "running", completedAt: undefined });
+    const records = [record];
+    const harness = createNavigableWidgetHarness(records);
+
+    harness.input("\u001b[B");
+    harness.input("j");
+    expect((harness.widget as any).selectedAgentId).toBe("selected");
+
+    records.length = 0;
+    harness.widget.update();
+    expect((harness.widget as any).navigationActive).toBe(false);
+    expect((harness.widget as any).selectedAgentId).toBeUndefined();
+    expect((harness.widget as any).viewportStart).toBe(0);
+
+    records.push(record);
+    harness.widget.update();
+    harness.input("\u001b[B");
+    harness.input("j");
+    const nextUi = {
+      setStatus: vi.fn(),
+      setWidget: vi.fn(),
+      onTerminalInput: vi.fn(() => vi.fn()),
+      getEditorText: vi.fn(() => ""),
+    };
+    harness.widget.setUICtx(nextUi);
+    expect((harness.widget as any).navigationActive).toBe(false);
+    expect((harness.widget as any).selectedAgentId).toBeUndefined();
+    expect((harness.widget as any).viewportStart).toBe(0);
+
+    harness.widget.dispose();
+    expect((harness.widget as any).navigationActive).toBe(false);
+    expect((harness.widget as any).selectedAgentId).toBeUndefined();
+    expect((harness.widget as any).viewportStart).toBe(0);
   });
 });

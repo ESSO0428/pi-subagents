@@ -12,10 +12,10 @@
 
 import { existsSync, mkdirSync, readFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
-import { defineTool, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, getAgentDir, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
-import { Container, Key, matchesKey, type SettingItem, SettingsList, Spacer, Text } from "@earendil-works/pi-tui";
+import { defineTool, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, getAgentDir, getSelectListTheme, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
+import { Container, Key, matchesKey, SelectList, type SettingItem, SettingsList, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
-import { agentHistoryLocator, createAgentHistoryPath, readAgentHistory } from "./agent-history.js";
+import { agentHistoryLocator, createAgentHistoryPath, readAgentHistory, readAgentHistoryResult } from "./agent-history.js";
 import { buildAgentStatusMenuEntries, canOpenActiveAgent, canOpenAgentHistory, formatAgentHistoryOption, splitAgentRecords } from "./agent-history-list.js";
 import { AgentManager } from "./agent-manager.js";
 import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, normalizeMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, steerAgent } from "./agent-runner.js";
@@ -171,8 +171,8 @@ const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "ma
  * surfaces (or "" if the run produced nothing). `record.result` is bounded to
  * the run's own turns, so this is never a stale earlier answer (#144).
  */
-function partialOutputSuffix(record: AgentRecord): string {
-  const partial = record.result?.trim();
+function partialOutputSuffix(record: AgentRecord, fallback?: string): string {
+  const partial = record.result?.trim() || fallback?.trim();
   return partial ? `\n\nPartial output before the failure:\n${partial}` : "";
 }
 
@@ -450,7 +450,12 @@ export default function (pi: ExtensionAPI) {
     // Persist final record for cross-extension history reconstruction
     pi.appendEntry("subagents:record", {
       id: record.id, type: record.type, description: record.description,
-      status: record.status, result: record.result, error: record.error,
+      status: record.status,
+      // Durable transcripts are the source of truth for full output. Avoid
+      // copying a potentially large result into the parent session branch;
+      // get_subagent_result reloads it on demand after cleanup/restart.
+      result: record.transcriptPath ? undefined : record.result,
+      error: record.error,
       startedAt: record.startedAt, completedAt: record.completedAt,
       toolUses: record.toolUses,
       lifetimeUsage: record.lifetimeUsage,
@@ -555,16 +560,29 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
+  type AgentMenuSelection = { id?: string; index: number };
+  let runningAgentSelection: AgentMenuSelection = { index: 0 };
+  let historyAgentSelection: AgentMenuSelection = { index: 0 };
+
+  function resetAgentMenuSelections() {
+    runningAgentSelection = { index: 0 };
+    historyAgentSelection = { index: 0 };
+  }
+
   // Capture ctx from session_start for RPC spawn handler + start the scheduler.
   // This also wires the RPC handlers and broadcasts readiness — on the first
   // bound session_start, so a filtered-out activation never advertises (#142).
   pi.on("session_start", async (_event, ctx) => {
+    resetAgentMenuSelections();
     currentCtx = ctx;
     manager.clearCompleted(true);
     const branch = ctx.sessionManager?.getBranch?.() ?? [];
     manager.restoreCompleted(branch
       .filter((entry: any) => entry?.type === "custom" && entry?.customType === "subagents:record")
       .map((entry: any) => entry.data));
+    // Checkpoint files cover agents whose parent session never got a terminal
+    // branch entry (shutdown, session switch, or a process restart).
+    manager.restoreRecovered(ctx.cwd);
     // Attach the panel during TUI startup, after restored records are present,
     // so terminal agents from the session branch are immediately visible.
     if (ctx.mode === "tui") {
@@ -589,6 +607,10 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_before_switch", () => {
+    resetAgentMenuSelections();
+    // A switch is catchable. Stop and checkpoint live/queued agents before the
+    // old session context is discarded, then retain their unread history.
+    manager.abortAll();
     manager.clearCompleted(true);
     scheduler.stop();
   });
@@ -596,6 +618,7 @@ export default function (pi: ExtensionAPI) {
   // On shutdown, abort all agents immediately and clean up.
   // If the session is going down, there's nothing left to consume agent results.
   pi.on("session_shutdown", async () => {
+    resetAgentMenuSelections();
     rpcHandle?.unsubSpawn();
     rpcHandle?.unsubStop();
     rpcHandle?.unsubPing();
@@ -1163,6 +1186,7 @@ Terse command-style prompts produce shallow, generic work.
           rec.historyFile = createAgentHistoryPath(ctx.cwd, agentId);
           rec.transcriptPath = agentHistoryLocator(ctx.cwd, rec.historyFile);
           writeInitialEntry(rec.historyFile, agentId, params.prompt, ctx.cwd);
+          manager.setTranscript(agentId, rec.historyFile, rec.transcriptPath, ctx.cwd);
         } catch (err) {
           rec.historyFile = undefined;
           rec.transcriptPath = undefined;
@@ -1274,9 +1298,10 @@ Terse command-style prompts produce shallow, generic work.
         const { state: bgState, callbacks: bgCallbacks } = createActivityTracker(effectiveMaxTurns);
 
         // Wrap onSessionCreated to wire output file streaming.
-        // The callback lazily reads record.outputFile (set right after spawn)
-        // rather than closing over a value that doesn't exist yet.
+        // The callback reads the transcript paths installed synchronously by
+        // onSpawned before the agent can queue or start.
         let id: string;
+        const joinMode = resolveJoinMode(defaultJoinMode, true);
         const origBgOnSession = bgCallbacks.onSessionCreated;
         bgCallbacks.onSessionCreated = (session: any) => {
           origBgOnSession(session);
@@ -1297,20 +1322,21 @@ Terse command-style prompts produce shallow, generic work.
             isBackground: true,
             isolation,
             invocation: agentInvocation,
+            onSpawned: (spawnedId) => {
+              attachTranscript(manager.getRecord(spawnedId), spawnedId);
+            },
             ...bgCallbacks,
           });
         } catch (err) {
           return textResult(err instanceof Error ? err.message : String(err));
         }
 
-        // Set output file + join mode synchronously after spawn, before the
-        // event loop yields — onSessionCreated is async so this is safe.
-        const joinMode = resolveJoinMode(defaultJoinMode, true);
+        // Set join metadata after spawn. Transcript metadata was installed by
+        // the manager's synchronous onSpawned callback before this point.
         const record = manager.getRecord(id);
         if (record && joinMode) {
           record.joinMode = joinMode;
           record.toolCallId = toolCallId;
-          attachTranscript(record, id);
         }
 
         if (joinMode == null || joinMode === 'async') {
@@ -1512,6 +1538,9 @@ Terse command-style prompts produce shallow, generic work.
         if (record.promise) await abortable(record.promise, signal);
       }
 
+      const durableResult = !record.result?.trim() && record.transcriptPath && currentCtx?.cwd
+        ? readAgentHistoryResult(currentCtx.cwd, record.transcriptPath)
+        : undefined;
       const displayName = getDisplayName(record.type);
       const duration = formatDuration(record.startedAt, record.completedAt);
       const tokens = formatLifetimeTokens(record);
@@ -1530,9 +1559,9 @@ Terse command-style prompts produce shallow, generic work.
       if (record.status === "running") {
         output += "Agent is still running. Use wait: true or check back later.";
       } else if (record.status === "error") {
-        output += `Error: ${record.error}${partialOutputSuffix(record)}`;
+        output += `Error: ${record.error}${partialOutputSuffix(record, durableResult)}`;
       } else {
-        output += record.result?.trim() || "No output.";
+        output += durableResult || record.result?.trim() || "No output.";
       }
 
       // Mark result as consumed — suppresses the completion notification
@@ -1789,6 +1818,59 @@ Terse command-style prompts produce shallow, generic work.
     });
   }
 
+  async function selectAgentFromReadOnlyList(
+    ctx: ExtensionCommandContext,
+    title: string,
+    pairs: Array<{ record: AgentRecord; label: string }>,
+    selection: AgentMenuSelection,
+  ): Promise<AgentRecord | undefined> {
+    const options = pairs.map(({ record, label }) => ({ value: record.id, label }));
+    const rememberedIndex = selection.id
+      ? pairs.findIndex(({ record }) => record.id === selection.id)
+      : -1;
+    const initialIndex = rememberedIndex >= 0
+      ? rememberedIndex
+      : Math.max(0, Math.min(selection.index, pairs.length - 1));
+
+    const remember = (id: string) => {
+      const index = pairs.findIndex(({ record }) => record.id === id);
+      if (index >= 0) {
+        selection.id = id;
+        selection.index = index;
+      }
+    };
+
+    const choice = await ctx.ui.custom<string | undefined>((_tui, _theme, _kb, done) => {
+      const list = new SelectList(
+        options,
+        Math.min(options.length, 10),
+        getSelectListTheme(),
+      );
+      list.setSelectedIndex(initialIndex);
+      const initialItem = options[initialIndex];
+      if (initialItem) remember(initialItem.value);
+      list.onSelectionChange = item => remember(item.value);
+      list.onSelect = item => {
+        remember(item.value);
+        done(item.value);
+      };
+      list.onCancel = () => done(undefined);
+
+      const container = new Container();
+      container.addChild(new Text(title, 0, 0));
+      container.addChild(new Spacer(1));
+      container.addChild(list);
+      return {
+        render: (w: number) => container.render(w),
+        invalidate: () => container.invalidate(),
+        handleInput: (data: string) => list.handleInput(data),
+      };
+    });
+
+    if (!choice) return undefined;
+    return pairs.find(({ record }) => record.id === choice)?.record;
+  }
+
   async function showRunningAgents(ctx: ExtensionCommandContext) {
     const { active: agents } = splitAgentRecords(manager.listAgents(), ctx.cwd);
     if (agents.length === 0) {
@@ -1801,15 +1883,13 @@ Terse command-style prompts produce shallow, generic work.
       const dur = formatDuration(record.startedAt, record.completedAt);
       return { record, label: `${dn} (${record.description}) · ${record.toolUses} tools · ${record.status} · ${dur}` };
     });
-    const options = makeUniqueAgentOptionLabels(pairs);
+    makeUniqueAgentOptionLabels(pairs);
 
-    const choice = await ctx.ui.select("Running agents", options);
-    if (!choice) return;
-    const record = pairs.find((pair) => pair.label === choice)?.record;
+    const record = await selectAgentFromReadOnlyList(ctx, "Running agents", pairs, runningAgentSelection);
     if (!record) return;
 
     await viewAgentConversation(ctx, record, "live");
-    // Back-navigation: re-show the list
+    // Back-navigation: re-show the list at the previously selected agent.
     await showRunningAgents(ctx);
   }
 
@@ -1821,13 +1901,13 @@ Terse command-style prompts produce shallow, generic work.
     }
 
     const pairs = history.map((record) => ({ record, label: formatAgentHistoryOption(record, Date.now()) }));
-    const options = makeUniqueAgentOptionLabels(pairs);
-    const choice = await ctx.ui.select("Agent history", options);
-    if (!choice) return;
-    const record = pairs.find((pair) => pair.label === choice)?.record;
+    makeUniqueAgentOptionLabels(pairs);
+    const record = await selectAgentFromReadOnlyList(ctx, "Agent history", pairs, historyAgentSelection);
     if (!record) return;
 
     await viewAgentConversation(ctx, record, "history");
+    // Back-navigation: re-show the list at the previously selected agent.
+    await showAgentHistory(ctx);
   }
 
   async function viewAgentConversation(

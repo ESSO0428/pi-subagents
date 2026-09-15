@@ -100,3 +100,41 @@ export function readAgentHistory(cwd: string, locator: string): AgentSession["me
   }
   return messages.length > 0 ? messages : undefined;
 }
+
+/**
+ * Read the last assistant text from a durable transcript. Runtime records may
+ * release their in-memory result after the retention TTL; the transcript then
+ * becomes the source of truth for get_subagent_result.
+ */
+export function readAgentHistoryResult(cwd: string, locator: string): string | undefined {
+  const messages = readAgentHistory(cwd, locator);
+  if (!messages) return undefined;
+
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i];
+    if (message.role !== "assistant") continue;
+    // AgentSession types currently model content as an array, but the
+    // persisted JSONL format may also contain a plain string. Cross the
+    // runtime/parser boundary through unknown so both shapes remain safe.
+    const content = (message as unknown as { content?: unknown }).content;
+    if (typeof content === "string") {
+      const text = content.trim();
+      if (text) return text;
+      continue;
+    }
+    if (!Array.isArray(content)) continue;
+    const text = content
+      .filter((part): part is { type: "text"; text: string } =>
+        typeof part === "object"
+        && part !== null
+        && (part as { type?: unknown }).type === "text"
+        && typeof (part as { text?: unknown }).text === "string"
+      )
+      .map((part) => part.text)
+      .join("\n")
+      .trim();
+    if (text) return text;
+  }
+
+  return undefined;
+}

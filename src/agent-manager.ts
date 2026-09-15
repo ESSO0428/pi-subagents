@@ -11,6 +11,14 @@ import { statSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
 import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { readAgentHistory } from "./agent-history.js";
+import {
+  type AgentRecoveryCheckpoint,
+  type AgentRecoveryStatus,
+  readAgentRecoveryCheckpoints,
+  removeAgentRecoveryCheckpoint,
+  writeAgentRecoveryCheckpoint,
+} from "./agent-recovery.js";
 import { resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
 import type { AgentInvocation, AgentRecord, IsolationMode, SubagentType, ThinkingLevel } from "./types.js";
 import { addUsage } from "./usage.js";
@@ -190,6 +198,8 @@ interface SpawnOptions {
   onAssistantUsage?: (usage: { input: number; output: number; cacheWrite: number }) => void;
   /** Called when the session successfully compacts. */
   onCompaction?: (info: CompactionInfo) => void;
+  /** Called synchronously after the record exists, before it is queued or started. */
+  onSpawned?: (id: string) => void;
 }
 
 export class AgentManager {
@@ -202,11 +212,15 @@ export class AgentManager {
   /** Base repos worktrees were created from — so dispose() can prune them all,
    *  not just the parent repo (caller-supplied cwd can target other repos). */
   private worktreeRepos = new Set<string>();
+  /** Project cwd for each record's durable checkpoint. */
+  private recoveryCwds = new Map<string, string>();
 
   /** Queue of background agents waiting to start. */
   private queue: { id: string; args: SpawnArgs }[] = [];
   /** Number of currently running background agents. */
   private runningBackground = 0;
+  /** Prevent late promise settlement from decrementing a replacement run. */
+  private runningBackgroundIds = new Set<string>();
 
   constructor(
     onComplete?: OnAgentComplete,
@@ -232,6 +246,99 @@ export class AgentManager {
 
   getMaxConcurrent(): number {
     return this.maxConcurrent;
+  }
+
+  private finishBackground(id: string): void {
+    if (!this.runningBackgroundIds.delete(id)) return;
+    this.runningBackground = Math.max(0, this.runningBackground - 1);
+  }
+
+  private checkpointStatus(record: AgentRecord): AgentRecoveryStatus {
+    return record.status;
+  }
+
+  private makeCheckpoint(record: AgentRecord): AgentRecoveryCheckpoint {
+    const checkpoint: AgentRecoveryCheckpoint = {
+      version: 1,
+      id: record.id,
+      type: record.type,
+      description: record.description,
+      status: this.checkpointStatus(record),
+      startedAt: record.startedAt,
+      toolUses: record.toolUses,
+      lifetimeUsage: { ...record.lifetimeUsage },
+      compactionCount: record.compactionCount,
+      ...(record.completedAt !== undefined && { completedAt: record.completedAt }),
+      // A durable transcript is the source of truth for partial/full output.
+      // Avoid duplicating potentially sensitive or very large result text.
+      ...(!record.transcriptPath && record.result !== undefined && { result: record.result }),
+      ...(record.error !== undefined && { error: record.error }),
+      ...(record.transcriptPath !== undefined && { transcriptPath: record.transcriptPath }),
+      ...(record.invocation !== undefined && { invocation: cloneInvocation(record.invocation) }),
+    };
+    return checkpoint;
+  }
+
+  private checkpoint(record: AgentRecord): void {
+    const cwd = this.recoveryCwds.get(record.id);
+    if (!cwd) return;
+    writeAgentRecoveryCheckpoint(cwd, this.makeCheckpoint(record));
+  }
+
+  private flushOutput(record: AgentRecord): void {
+    if (!record.outputCleanup) return;
+    try { record.outputCleanup(); } catch { /* recovery must remain best effort */ }
+    record.outputCleanup = undefined;
+  }
+
+  /** Set the durable transcript locator and checkpoint the current state. */
+  setTranscript(id: string, historyFile: string, transcriptPath: string, cwd?: string): void {
+    const record = this.agents.get(id);
+    if (!record) return;
+    record.historyFile = historyFile;
+    record.transcriptPath = transcriptPath;
+    if (cwd) this.recoveryCwds.set(id, cwd);
+    this.checkpoint(record);
+  }
+
+  /** Checkpoint one record explicitly (used after transcript setup). */
+  checkpointRecord(id: string): void {
+    const record = this.agents.get(id);
+    if (record) this.checkpoint(record);
+  }
+
+  /**
+   * Reload durable records from this project's checkpoint directory. A
+   * running/queued checkpoint means the process was killed before it could
+   * write its stopped state; treat it as stopped and retain its transcript.
+   * SIGKILL cannot run a final flush/checkpoint, so this active snapshot is
+   * necessarily the last recoverable state.
+   */
+  restoreRecovered(cwd: string): void {
+    for (const checkpoint of readAgentRecoveryCheckpoints(cwd)) {
+      if (!checkpoint.transcriptPath || !readAgentHistory(cwd, checkpoint.transcriptPath)) continue;
+      const status: RestorableAgentStatus = checkpoint.status === "running" || checkpoint.status === "queued"
+        ? "stopped"
+        : checkpoint.status;
+      const completedAt = checkpoint.completedAt ?? Date.now();
+      const existing = this.agents.get(checkpoint.id);
+      if (existing) {
+        // Parent-branch records can still carry an unread in-memory result.
+        // Never replace that richer record with the checkpoint's transcript
+        // stub during the same session. Merge only durable locator metadata.
+        if (!existing.transcriptPath && checkpoint.transcriptPath) {
+          existing.transcriptPath = checkpoint.transcriptPath;
+        }
+        this.recoveryCwds.set(checkpoint.id, cwd);
+        continue;
+      }
+      this.agents.set(checkpoint.id, this.createRestoredRecord({
+        ...checkpoint,
+        status,
+        completedAt,
+      }));
+      this.recoveryCwds.set(checkpoint.id, cwd);
+    }
   }
 
   /**
@@ -271,6 +378,19 @@ export class AgentManager {
       invocation: options.invocation,
     };
     this.agents.set(id, record);
+    this.recoveryCwds.set(id, ctx.cwd);
+    // Give callers a chance to create the durable transcript before the first
+    // checkpoint. This closes the small spawn→attach window in which a queued
+    // or running agent could be left recoverable only as metadata.
+    try {
+      options.onSpawned?.(id);
+      this.checkpoint(record);
+    } catch (err) {
+      this.agents.delete(id);
+      this.recoveryCwds.delete(id);
+      removeAgentRecoveryCheckpoint(ctx.cwd, id);
+      throw err;
+    }
 
     const args: SpawnArgs = { pi, ctx, type, prompt, options };
 
@@ -286,6 +406,8 @@ export class AgentManager {
       this.startAgent(id, record, args);
     } catch (err) {
       this.agents.delete(id);
+      this.recoveryCwds.delete(id);
+      removeAgentRecoveryCheckpoint(ctx.cwd, id);
       throw err;
     }
     return id;
@@ -327,7 +449,11 @@ export class AgentManager {
 
     record.status = "running";
     record.startedAt = Date.now();
-    if (options.isBackground) this.runningBackground++;
+    this.checkpoint(record);
+    if (options.isBackground) {
+      this.runningBackground++;
+      this.runningBackgroundIds.add(id);
+    }
     this.onStart?.(record);
 
     // Wire parent abort signal to stop the subagent when the parent is interrupted
@@ -386,9 +512,13 @@ export class AgentManager {
           record.pendingSteers = undefined;
         }
         options.onSessionCreated?.(session);
+        this.checkpoint(record);
       },
     })
       .then(({ responseText, session, aborted, steered, failure }) => {
+        // A disposed manager no longer owns this run. Avoid late callbacks
+        // mutating a dead session or emitting completion side effects.
+        if (this.agents.get(id) !== record) return responseText;
         // Don't overwrite status if externally stopped via abort()
         if (record.status !== "stopped") {
           // Precedence: a hard abort keeps "aborted"; then a failed final turn
@@ -427,6 +557,7 @@ export class AgentManager {
               `\n\n---\nChanges saved to branch \`${wtResult.branch}\`${repoNote}. Merge with: \`git merge ${wtResult.branch}\`${customCwd !== undefined ? ` (run in \`${baseCwd}\`)` : ""}`;
           }
         }
+        this.checkpoint(record);
 
         // Fire onComplete for foreground agents too — lifecycle symmetry.
         // Mark resultConsumed so the callback skips notifications (result returned inline).
@@ -434,13 +565,16 @@ export class AgentManager {
           record.resultConsumed = true;
           try { this.onComplete?.(record); } catch { /* ignore completion side-effect errors */ }
         } else {
-          this.runningBackground--;
+          this.finishBackground(id);
           try { this.onComplete?.(record); } catch { /* ignore completion side-effect errors */ }
           this.drainQueue();
         }
         return responseText;
       })
       .catch((err) => {
+        // A disposed manager no longer owns this run. Avoid late callbacks
+        // mutating a dead session or emitting completion side effects.
+        if (this.agents.get(id) !== record) return "";
         // Don't overwrite status if externally stopped via abort()
         if (record.status !== "stopped") {
           record.status = "error";
@@ -463,6 +597,7 @@ export class AgentManager {
             record.worktreeResult = wtResult;
           } catch { /* ignore cleanup errors */ }
         }
+        this.checkpoint(record);
 
         // Fire onComplete for foreground agents too — lifecycle symmetry.
         // Mark resultConsumed so the callback skips notifications (result returned inline).
@@ -470,7 +605,7 @@ export class AgentManager {
           record.resultConsumed = true;
           this.onComplete?.(record);
         } else {
-          this.runningBackground--;
+          this.finishBackground(id);
           this.onComplete?.(record);
           this.drainQueue();
         }
@@ -478,11 +613,6 @@ export class AgentManager {
       });
 
     record.promise = promise;
-
-    // Notify caller that spawn is complete (record is in the map, promise is set).
-    // Called synchronously — onSessionCreated fires asynchronously inside runAgent.
-    // Used by spawnAndWait to let the caller set up output files before streaming starts.
-    this.onSpawned?.(id);
   }
 
   /** Start queued agents up to the concurrency limit. */
@@ -499,17 +629,11 @@ export class AgentManager {
         record.status = "error";
         record.error = err instanceof Error ? err.message : String(err);
         record.completedAt = Date.now();
+        this.checkpoint(record);
         this.onComplete?.(record);
       }
     }
   }
-
-  /**
-   * Called synchronously right after spawn, before onSessionCreated fires.
-   * Lets the caller set up the output file path on the record.
-   * The record is guaranteed to be in this.agents at this point.
-   */
-  private onSpawned?: (id: string) => void;
 
   /**
    * Spawn an agent and wait for completion (foreground use).
@@ -527,17 +651,14 @@ export class AgentManager {
     options: Omit<SpawnOptions, "isBackground">,
     onSpawned?: (id: string) => void,
   ): Promise<{ id: string; record: AgentRecord }> {
-    // Temporarily register the onSpawned hook so startAgent can call it.
-    const prevOnSpawned = this.onSpawned;
-    this.onSpawned = onSpawned;
-    try {
-      const id = this.spawn(pi, ctx, type, prompt, { ...options, isBackground: false });
-      const record = this.agents.get(id)!;
-      await record.promise;
-      return { id, record };
-    } finally {
-      this.onSpawned = prevOnSpawned;
-    }
+    const id = this.spawn(pi, ctx, type, prompt, {
+      ...options,
+      isBackground: false,
+      onSpawned,
+    });
+    const record = this.agents.get(id)!;
+    await record.promise;
+    return { id, record };
   }
 
   /**
@@ -562,6 +683,7 @@ export class AgentManager {
       ...(resumedModel && { effectiveModelName: resumedModel.name ?? resumedModel.id }),
       effectiveThinking: record.session.thinkingLevel,
     };
+    this.checkpoint(record);
 
     try {
       const { text, failure } = await resumeAgent(record.session, prompt, {
@@ -583,10 +705,12 @@ export class AgentManager {
       if (failure) record.error = failure;
       record.result = text;
       record.completedAt = Date.now();
+      this.checkpoint(record);
     } catch (err) {
       record.status = "error";
       record.error = err instanceof Error ? err.message : String(err);
       record.completedAt = Date.now();
+      this.checkpoint(record);
     }
 
     return record;
@@ -652,6 +776,7 @@ export class AgentManager {
     lifetimeUsage?: { input: number; output: number; cacheWrite: number };
     transcriptPath?: string;
     invocation?: AgentInvocation;
+    compactionCount?: number;
   }): AgentRecord {
     return {
       id: record.id,
@@ -668,7 +793,7 @@ export class AgentManager {
       lifetimeUsage: record.lifetimeUsage
         ? { ...record.lifetimeUsage }
         : { input: 0, output: 0, cacheWrite: 0 },
-      compactionCount: 0,
+      compactionCount: record.compactionCount ?? 0,
     };
   }
 
@@ -681,6 +806,7 @@ export class AgentManager {
       this.queue = this.queue.filter(q => q.id !== id);
       record.status = "stopped";
       record.completedAt = Date.now();
+      this.checkpoint(record);
       return true;
     }
 
@@ -688,6 +814,10 @@ export class AgentManager {
     record.abortController?.abort();
     record.status = "stopped";
     record.completedAt = Date.now();
+    this.flushOutput(record);
+    this.checkpoint(record);
+    this.finishBackground(id);
+    this.drainQueue();
     return true;
   }
 
@@ -714,6 +844,10 @@ export class AgentManager {
         record.outputCleanup = undefined;
         record.outputFile = undefined;
         record.historyFile = undefined;
+        // The durable transcript is the source of truth after the TTL. Keep
+        // only the small identity/status record in memory; get_subagent_result
+        // reloads the final answer from transcriptPath on demand.
+        record.result = undefined;
         continue;
       }
       this.removeRecord(id, record);
@@ -750,16 +884,21 @@ export class AgentManager {
       if (record) {
         record.status = "stopped";
         record.completedAt = Date.now();
+        this.checkpoint(record);
         count++;
       }
     }
     this.queue = [];
-    // Abort running agents
+    // Abort running agents. Flush before checkpointing so a catchable
+    // shutdown/session switch leaves the latest assistant message available.
     for (const record of this.agents.values()) {
       if (record.status === "running") {
         record.abortController?.abort();
         record.status = "stopped";
         record.completedAt = Date.now();
+        this.flushOutput(record);
+        this.finishBackground(record.id);
+        this.checkpoint(record);
         count++;
       }
     }
@@ -789,6 +928,9 @@ export class AgentManager {
       record.session?.dispose();
     }
     this.agents.clear();
+    this.recoveryCwds.clear();
+    this.runningBackgroundIds.clear();
+    this.runningBackground = 0;
     // Prune any orphaned git worktrees (crash recovery)
     try { pruneWorktrees(process.cwd()); } catch { /* ignore */ }
     // Also prune repos that caller-supplied cwds created worktrees in — a clean

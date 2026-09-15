@@ -147,6 +147,27 @@ describe("output_transcript agent wiring", () => {
     await lifecycle.get("session_shutdown")?.({}, makeCtx(cwd));
   });
 
+  it("does not copy a durable result into the parent session record", async () => {
+    const { pi, tools, lifecycle } = makePi();
+    subagentsExtension(pi);
+
+    await tools.get("Agent").execute(
+      "tool-call",
+      { prompt: "ordinary work", description: "Do ordinary work", subagent_type: "general-purpose", run_in_background: true },
+      undefined,
+      undefined,
+      makeCtx(cwd),
+    );
+    await new Promise<void>(resolve => setImmediate(resolve));
+
+    const persisted = pi.appendEntry.mock.calls.find(([type]: [string]) => type === "subagents:record")?.[1];
+    expect(persisted).toEqual(expect.objectContaining({
+      result: undefined,
+      transcriptPath: expect.any(String),
+    }));
+    await lifecycle.get("session_shutdown")?.({}, makeCtx(cwd));
+  });
+
   it("suppresses the transcript project-wide when subagents.json sets outputTranscript false", async () => {
     // A plain default agent (no frontmatter) inherits the project default.
     writeFileSync(join(cwd, ".pi", "subagents.json"), JSON.stringify({ schedulingEnabled: false, outputTranscript: false }));
