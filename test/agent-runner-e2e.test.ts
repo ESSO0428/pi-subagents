@@ -113,11 +113,14 @@ describe("agent-runner end-to-end (real pi-mono session + real extension)", () =
         model,
         onSessionCreated: (s) => {
           active = s.getActiveToolNames();
+          // The tool set is fixed before the prompt; stop here instead of
+          // starting an unnecessary faux-provider turn.
+          throw new Error("stop after capturing active tools");
         },
       });
     } catch {
-      // A no-op/erroring prompt turn is fine — the gated tool set is fixed at
-      // construction, which `onSessionCreated` already captured.
+      // onSessionCreated intentionally aborts the run after capturing the
+      // construction-time gated tool set.
     }
     return active;
   }
