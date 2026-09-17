@@ -148,6 +148,7 @@ describe("ConversationViewer", () => {
 
     const initial = viewer.render(120).join("\n");
     expect(initial).toContain("<userMessageText>USER</userMessageText>");
+    expect(initial).toContain("<userMessageText>find model</userMessageText>");
     expect(initial).toContain("<accent>ASSISTANT</accent>");
     expect(initial).toContain("model: claude-sonnet");
     expect(initial).toContain("thinking: high");
@@ -358,13 +359,18 @@ describe("ConversationViewer", () => {
     const previewDone = vi.fn();
     const custom = vi.fn((factory: any) => {
       preview = factory(ui, theme, undefined, previewDone);
-      const initial = preview.render(100).join("\\n");
+      const initialLines = preview.render(100);
+      const initial = initialLines.join("\\n");
       expect(initial).toContain("Input");
       expect(initial).toContain("Output");
       expect(initial).toContain("line 1");
       expect(initial).not.toContain("line 40");
+      expect(initialLines.at(-3)).toContain("↓");
+      expect(initialLines.slice(3, -3).some((line: string) => /[┃█]│$/.test(line))).toBe(true);
       preview.handleInput("G");
-      expect(preview.render(100).join("\\n")).toContain("line 40");
+      const bottomLines = preview.render(100);
+      expect(bottomLines.join("\\n")).toContain("line 40");
+      expect(bottomLines[2]).toContain("↑");
       preview.handleInput("k");
       preview.handleInput("j");
       preview.handleInput("g");
@@ -407,6 +413,34 @@ describe("ConversationViewer", () => {
     expect(timeline.getFocusedToolCallId()).toBe(ids[1]);
     viewer.handleInput("[");
     expect(timeline.getFocusedToolCallId()).toBe(ids[0]);
+  });
+
+  it("recalls submitted steer drafts with Alt+Up and its a-up alias", () => {
+    const ui = tui();
+    const steer = vi.fn();
+    const viewer = new ConversationViewer(
+      ui,
+      createStaticConversationSource([{ role: "assistant", content: "running" }] as any),
+      record({ status: "running", session: {} }),
+      undefined,
+      theme,
+      vi.fn(),
+      undefined,
+      undefined,
+      steer,
+      { pi: {} as any, ctx: {} as any, readOnly: false },
+    );
+
+    viewer.handleInput("e");
+    for (const character of "check output") viewer.handleInput(character);
+    viewer.handleInput("\r");
+    expect(steer).toHaveBeenCalledWith("check output");
+
+    viewer.handleInput("e");
+    viewer.handleInput("\u001bp");
+    expect((viewer as unknown as { composer?: { getValue(): string } }).composer?.getValue()).toBe("check output");
+    viewer.handleInput("a-up");
+    expect((viewer as unknown as { composer?: { getValue(): string } }).composer?.getValue()).toBe("check output");
   });
 
   it("keeps historical viewers read-only and closes on Escape", () => {

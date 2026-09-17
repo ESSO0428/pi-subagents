@@ -29,6 +29,44 @@ const MATCH_BG = "\x1b[48;5;238m";
 const MATCH_BG_CURRENT = "\x1b[48;5;220m\x1b[30m";
 const BG_RESET = "\x1b[49m\x1b[39m";
 
+function renderScrollbarCell(
+  theme: Theme,
+  totalLines: number,
+  viewportHeight: number,
+  scrollOffset: number,
+  lineIndex: number,
+  active: boolean,
+): string {
+  const total = Math.max(0, Math.floor(totalLines));
+  const viewport = Math.max(1, Math.floor(viewportHeight));
+  if (total <= viewport) return theme.fg("scrollbarTrack", " ");
+  const maxOffset = Math.max(0, total - viewport);
+  const offset = Math.max(0, Math.min(maxOffset, Math.floor(scrollOffset)));
+  const thumbHeight = Math.max(1, Math.round((viewport * viewport) / total));
+  const thumbStart = Math.round(((viewport - thumbHeight) * offset) / maxOffset);
+  const inThumb = lineIndex >= thumbStart && lineIndex < thumbStart + thumbHeight;
+  return theme.fg(
+    inThumb ? "scrollbarThumb" : "scrollbarTrack",
+    inThumb ? (active ? "█" : "┃") : "│",
+  );
+}
+
+function renderScrollMoreRule(
+  theme: Theme,
+  width: number,
+  direction: "top" | "bottom",
+  hiddenLines: number,
+): string {
+  const safeWidth = Math.max(1, Math.floor(width));
+  if (hiddenLines <= 0) return theme.fg("border", `├${"─".repeat(safeWidth)}┤`);
+  const label = `${direction === "top" ? "↑" : "↓"} ${hiddenLines} more`;
+  const labelWidth = visibleWidth(label);
+  if (labelWidth + 2 > safeWidth) return theme.fg("border", `├${"─".repeat(safeWidth)}┤`);
+  const left = Math.floor((safeWidth - labelWidth) / 2);
+  const right = Math.max(0, safeWidth - left - labelWidth);
+  return `${theme.fg("border", `├${"─".repeat(left)}`)}${theme.fg("dim", label)}${theme.fg("border", `${"─".repeat(right)}┤`)}`;
+}
+
 /** The live fields needed by the viewer; historical viewers use a static source. */
 export type ConversationSource = Pick<AgentSession, "messages" | "subscribe">;
 
@@ -48,6 +86,7 @@ class FullToolPreview implements Component {
   private totalLines = 1;
   private pendingTop = false;
   private hoveredClose = false;
+  private scrollbarActive = false;
 
   constructor(
     private readonly tui: TUI,
@@ -99,10 +138,12 @@ class FullToolPreview implements Component {
   render(width: number): string[] {
     const safeWidth = Math.max(12, Math.floor(Number.isFinite(width) ? width : 12));
     const inner = Math.max(1, safeWidth - 2);
+    // Reserve the rightmost inner cell for the same track/thumb rail used by
+    // pi-tui's native ScrollView layout.
     const bodyWidth = Math.max(1, inner - 1);
     const terminalRows = Math.max(1, this.tui.terminal.rows);
     const viewport = Math.max(1, Math.min(30, Math.floor(terminalRows * 0.8), terminalRows - 6));
-    const wrapped = this.body.render(bodyWidth);
+    const wrapped = this.body.render(Math.max(1, bodyWidth - 1));
     this.totalLines = wrapped.length;
     this.pageSize = viewport;
     this.scrollOffset = Math.min(this.scrollOffset, Math.max(0, this.totalLines - this.pageSize));
@@ -112,15 +153,28 @@ class FullToolPreview implements Component {
       const clipped = truncateToWidth(text, rowWidth, "…", true);
       return clipped + " ".repeat(Math.max(0, rowWidth - visibleWidth(clipped)));
     };
+    const hiddenAbove = this.scrollOffset;
+    const hiddenBelow = Math.max(0, this.totalLines - this.scrollOffset - this.pageSize);
     const close = this.theme.fg(this.hoveredClose ? "text" : "dim", "[esc]");
     const header = this.theme.bold(this.theme.fg("accent", this.title));
     const status = `${this.scrollOffset + 1}-${Math.min(this.totalLines, this.scrollOffset + this.pageSize)} / ${this.totalLines} lines · j/k gg/G ↑↓ PgUp/PgDn · [esc] close`;
     return [
       border(`╭${"─".repeat(inner)}╮`),
       `${border("│")}${pad(` ${header}`, inner - visibleWidth(close))}${close}${border("│")}`,
-      `${border("├")}${border("─".repeat(inner))}${border("┤")}`,
-      ...Array.from({ length: viewport }, (_, index) => `${border("│")}${pad(` ${visible[index] ?? ""}`, bodyWidth)}${border("│")}`),
-      `${border("├")}${border("─".repeat(inner))}${border("┤")}`,
+      renderScrollMoreRule(this.theme, inner, "top", hiddenAbove),
+      ...Array.from({ length: viewport }, (_, index) => {
+        const content = pad(` ${visible[index] ?? ""}`, bodyWidth);
+        const rail = renderScrollbarCell(
+          this.theme,
+          this.totalLines,
+          this.pageSize,
+          this.scrollOffset,
+          index,
+          this.scrollbarActive,
+        );
+        return `${border("│")}${content}${rail}${border("│")}`;
+      }),
+      renderScrollMoreRule(this.theme, inner, "bottom", hiddenBelow),
       `${border("│")}${pad(this.theme.fg("dim", ` ${status}`))}${border("│")}`,
       border(`╰${"─".repeat(inner)}╯`),
     ];
@@ -134,6 +188,7 @@ class FullToolPreview implements Component {
     const next = Math.max(0, Math.min(Math.max(0, this.totalLines - this.pageSize), offset));
     if (next === this.scrollOffset) return;
     this.scrollOffset = next;
+    this.scrollbarActive = true;
     this.tui.requestRender();
   }
 }
@@ -171,6 +226,10 @@ export class ConversationViewer implements Component {
   private searchQuery = "";
   private searchMatches: ConversationMatch[] = [];
   private currentMatchIdx = -1;
+  /** Follow-up drafts, newest first, matching pi editor history semantics. */
+  private steerHistory: string[] = [];
+  private steerHistoryIndex = -1;
+  private steerHistoryDraft = "";
   private timeline: ConversationTimeline;
 
   constructor(
@@ -202,7 +261,16 @@ export class ConversationViewer implements Component {
 
   handleInput(data: string): void {
     if (this.composer) {
-      this.composer.handleInput(data);
+      if (matchesKey(data, Key.alt("up")) || data === "a-up" || data === "alt+up") {
+        this.recallSteerDraft();
+      } else {
+        const before = this.composer.getValue();
+        this.composer.handleInput(data);
+        if (this.composer && before !== this.composer.getValue()) {
+          this.steerHistoryIndex = -1;
+          this.steerHistoryDraft = "";
+        }
+      }
       this.tui.requestRender();
       return;
     }
@@ -442,7 +510,7 @@ export class ConversationViewer implements Component {
     lines.push(hrMid);
     if (this.composer) {
       lines.push(row(this.composer.render(innerW)[0] ?? ""));
-      const hint = th.fg("dim", "Enter send · Esc cancel");
+      const hint = th.fg("dim", "Enter send · Esc cancel · Alt+Up recall");
       const label = th.fg("accent", "✎ steer");
       lines.push(row(label + " ".repeat(Math.max(1, innerW - visibleWidth(label) - visibleWidth(hint))) + hint));
     } else if (this.searchMode) {
@@ -865,17 +933,39 @@ export class ConversationViewer implements Component {
   private openComposer(): void {
     const input = new Input();
     input.focused = true;
+    this.steerHistoryIndex = -1;
+    this.steerHistoryDraft = "";
     input.onSubmit = (value: string) => {
       const message = value.trim();
       this.composer = undefined;
-      if (message) this.onSteer?.(message);
+      this.steerHistoryIndex = -1;
+      this.steerHistoryDraft = "";
+      if (message) {
+        if (this.steerHistory[0] !== message) this.steerHistory.unshift(message);
+        if (this.steerHistory.length > 100) this.steerHistory.pop();
+        this.onSteer?.(message);
+      }
       this.tui.requestRender();
     };
     input.onEscape = () => {
       this.composer = undefined;
+      this.steerHistoryIndex = -1;
+      this.steerHistoryDraft = "";
       this.tui.requestRender();
     };
     this.composer = input;
     this.tui.requestRender();
+  }
+
+  /** Recall the newest prior steer, preserving the draft for future editing. */
+  private recallSteerDraft(): void {
+    if (!this.composer || this.steerHistory.length === 0) return;
+    if (this.steerHistoryIndex < 0) {
+      this.steerHistoryDraft = this.composer.getValue();
+      this.steerHistoryIndex = 0;
+    } else if (this.steerHistoryIndex < this.steerHistory.length - 1) {
+      this.steerHistoryIndex++;
+    }
+    this.composer.setValue(this.steerHistory[this.steerHistoryIndex] ?? this.steerHistoryDraft);
   }
 }

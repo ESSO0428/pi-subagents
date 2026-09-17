@@ -325,7 +325,10 @@ export class ConversationTimeline implements Component {
 
       try {
         const markdown = new Markdown(block.markdown || "∅", 2, 0, getMarkdownTheme(), {
-          color: (text) => this.theme.fg(block.role === "meta" ? "muted" : "text", text),
+          color: (text) => this.theme.fg(
+            block.role === "user" ? "userMessageText" : block.role === "meta" ? "muted" : "text",
+            text,
+          ),
         });
         for (const line of markdown.render(requestedWidth)) {
           lines.push({ text: truncateToWidth(line, requestedWidth), plain: stripAnsi(line), blockIndex, railable: true });

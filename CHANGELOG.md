@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.3] - 2026-09-18
+
+### Added
+- **The Agents panel now uses a Pi-style right-hand scrollbar for clipped rosters**, reserving a stable track/thumb column and placing `↑ N more` directly below the heading when the viewport is scrolled, while retaining a downward hidden-row affordance at the bottom.
+- **Read-only full tool previews now use the same right-hand track/thumb scrollbar and top/bottom hidden-line affordances**, without adding any transcript mutation or tool execution path.
+
+### Changed
+- **Conversation viewer follow-ups use Pi's muted USER styling and local draft history**, with `Alt+Up`, `a-up`, and `alt+up` aliases recalling submitted steering drafts; the existing `e` composer remains read-only in history mode.
+
+### Fixed
+- **Conversation Markdown bodies now apply the native user-message color while preserving native tool and code token styling**, so follow-up/user content no longer visually merges with assistant output.
+
 ## [0.17.2] - 2026-09-15
 
 ### Fixed

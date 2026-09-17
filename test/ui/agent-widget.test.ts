@@ -307,7 +307,7 @@ describe("AgentWidget live records", () => {
     const harness = createNavigableWidgetHarness([running, ...queued], { rows: 8 });
 
     harness.input("\u001b[B");
-    for (let index = 0; index < queued.length - 1; index++) harness.input("\u001b[B");
+    for (let index = 0; index < queued.length; index++) harness.input("\u001b[B");
     expect(harness.render().join("\n")).toContain("queued target 7");
     expect(harness.render().length).toBeLessThanOrEqual(getWidgetLineBudget(8));
     harness.widget.dispose();
@@ -366,6 +366,31 @@ describe("AgentWidget live records", () => {
     records.splice(2, 1);
     harness.widget.update();
     expect((harness.widget as any).selectedAgentId).toBe("next");
+    harness.widget.dispose();
+  });
+
+  it("renders a scrolling scrollbar and top more indicator for a clipped roster", () => {
+    const running = makeRecord({ id: "running", status: "running", completedAt: undefined });
+    const queued = Array.from({ length: 8 }, (_, index) => makeRecord({
+      id: `queued-${index}`,
+      description: `queued target ${index}`,
+      status: "queued",
+      completedAt: undefined,
+    }));
+    const harness = createNavigableWidgetHarness([running, ...queued], { rows: 10 });
+    const initial = harness.render();
+
+    harness.input("\u001b[B");
+    for (let index = 0; index < queued.length; index++) harness.input("\u001b[B");
+    const scrolled = harness.render();
+    const initialRail = initial.slice(1).map((line) => line.at(-1));
+    const scrolledRail = scrolled.slice(2).map((line) => line.at(-1));
+
+    expect(scrolled[1]).toContain("↑");
+    expect(scrolled.join("\n")).toContain("queued target 7");
+    expect(scrolledRail).toContain("│");
+    expect(scrolledRail.some((cell) => cell === "┃" || cell === "█")).toBe(true);
+    expect(scrolledRail).not.toEqual(initialRail);
     harness.widget.dispose();
   });
 

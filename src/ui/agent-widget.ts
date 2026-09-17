@@ -5,7 +5,7 @@
  * Uses the callback form of setWidget for themed rendering.
  */
 
-import { Editor, isKeyRelease, Key, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
+import { Editor, isKeyRelease, Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { AgentManager } from "../agent-manager.js";
 import { getConfig } from "../agent-types.js";
 import type { AgentInvocation, AgentRecord, SubagentType, WidgetMode } from "../types.js";
@@ -537,7 +537,7 @@ export class AgentWidget {
     const w = tui.terminal.columns;
     const maxLines = getWidgetLineBudget(tui.terminal.rows);
     if (maxLines === 0) return [];
-    const truncate = (line: string) => truncateToWidth(line, w);
+    const truncate = (line: string, width = w) => truncateToWidth(line, Math.max(0, width));
     const headingColor = hasActive ? "accent" : "dim";
     const headingIcon = hasActive ? "●" : "○";
     const frame = SPINNER[this.widgetFrame % SPINNER.length];
@@ -623,12 +623,12 @@ export class AgentWidget {
       // Reserve one line for a directional overflow summary. The viewport is
       // a contiguous slice in roster order, so the same slice is navigable and
       // renderable even when the selected row is currently hidden.
-      const contentBudget = Math.max(0, maxBody - 1);
+      const baseContentBudget = Math.max(0, maxBody - 1);
       const heightAt = (index: number) => rows[index]?.lines.length ?? 0;
-      const endFor = (start: number): number => {
+      const endFor = (start: number, budget: number): number => {
         let used = 0;
         let end = start;
-        while (end < rows.length && used + heightAt(end) <= contentBudget) {
+        while (end < rows.length && used + heightAt(end) <= budget) {
           used += heightAt(end++);
         }
         return end;
@@ -640,21 +640,33 @@ export class AgentWidget {
         : -1;
       if (selectedIndex >= 0) {
         if (selectedIndex < start) start = selectedIndex;
-        if (selectedIndex >= endFor(start)) start = selectedIndex;
+        if (selectedIndex >= endFor(start, baseContentBudget)) start = selectedIndex;
+      }
+
+      // Keep both directional affordances in the viewport chrome: the top
+      // count sits below the heading and the bottom count sits below the
+      // bounded roster. Each consumes one row when that direction is hidden.
+      let showTopMore = start > 0;
+      let contentBudget = Math.max(0, maxBody - (showTopMore ? 2 : 1));
+      if (selectedIndex >= 0 && selectedIndex >= endFor(start, contentBudget)) {
+        start = selectedIndex;
+        showTopMore = start > 0;
+        contentBudget = Math.max(0, maxBody - (showTopMore ? 2 : 1));
       }
       this.viewportStart = start;
 
       let used = 0;
       let end = start;
+      const visibleBody: string[] = [];
       while (end < rows.length && used + heightAt(end) <= contentBudget) {
-        lines.push(...rows[end].lines);
+        visibleBody.push(...rows[end].lines);
         used += heightAt(end);
         end++;
       }
       // A selected two-line row must remain addressable even if only one body
       // line is available. Showing its header is preferable to hiding it.
       if (end === start && rows[start] && contentBudget > 0) {
-        lines.push(rows[start].lines[0]);
+        visibleBody.push(rows[start].lines[0]);
         end = start + 1;
       }
 
@@ -672,7 +684,44 @@ export class AgentWidget {
         ...(hiddenAfter > 0 ? [`↓ ${hiddenAfter} more`] : []),
       ].join(" · ");
       const summary = `+${hidden} more (${direction}${categoryCounts.length > 0 ? `; ${categoryCounts.join(", ")}` : ""})`;
-      lines.push(truncate(theme.fg("dim", "└─") + ` ${theme.fg("dim", summary)}`));
+
+      if (showTopMore) lines.push(truncate(theme.fg("dim", `↑ ${hiddenBefore} more`)));
+
+      // Fill the bounded viewport so the scrollbar track has a stable height.
+      while (visibleBody.length < contentBudget) visibleBody.push("");
+      const totalBody = rows.reduce((total, row) => total + row.lines.length, 0);
+      const startOffset = rows.slice(0, start).reduce((total, row) => total + row.lines.length, 0);
+      const trackHeight = Math.max(0, contentBudget);
+      const minThumbHeight = Math.min(2, trackHeight);
+      const thumbHeight = Math.max(
+        minThumbHeight,
+        Math.min(trackHeight, Math.round((trackHeight * trackHeight) / totalBody)),
+      );
+      const maxScrollTop = Math.max(0, totalBody - trackHeight);
+      const maxThumbTop = Math.max(0, trackHeight - thumbHeight);
+      const thumbOffset = maxScrollTop === 0
+        ? 0
+        : Math.round((startOffset / maxScrollTop) * maxThumbTop);
+      const contentWidth = Math.max(0, w - 1);
+      for (let index = 0; index < visibleBody.length; index++) {
+        const isThumb = index >= thumbOffset && index < thumbOffset + thumbHeight;
+        const scrollbar = isThumb
+          ? theme.fg("scrollbarThumb", this.navigationActive ? "█" : "┃")
+          : theme.fg("scrollbarTrack", "│");
+        const bodyLine = truncate(visibleBody[index] ?? "", contentWidth);
+        lines.push(bodyLine + " ".repeat(Math.max(0, contentWidth - visibleWidth(bodyLine))) + scrollbar);
+      }
+
+      // The directional count is outside the viewport, like ScrollView's
+      // surrounding chrome, and therefore does not consume scrollbar track.
+      if (hiddenAfter > 0) {
+        lines.push(truncate(theme.fg("dim", `↓ ${hiddenAfter} more · +${hidden} more (${categoryCounts.length > 0 ? categoryCounts.join(", ") : ""})`)));
+      } else if (!showTopMore) {
+        lines.push(truncate(theme.fg("dim", "└─") + ` ${theme.fg("dim", summary)}`));
+      } else {
+        // Keep a stable footer row when the selected viewport reaches the end.
+        lines.push(truncate(theme.fg("dim", "└─")));
+      }
     }
 
     return lines;
