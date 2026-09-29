@@ -15,6 +15,7 @@
 - 在 ConversationViewer 的 transcript content rows 右側提供真正可見的 track/thumb rail。
 - thumb 位置與高度反映完整 transcript 行數、目前 viewport 高度與 `scrollOffset`。
 - 保留現有鍵盤與 wheel 滾動行為，不增加滑鼠拖曳或點擊跳轉。
+- 保留 ConversationViewer header 的 `[preview]` action；它必須與 `w` 使用同一個 focused-tool preview handler，並與 `[Esc]` 保持不重疊。
 - 保留 message/tool focus、search highlight、sticky header、composer、read-only 行為與 Tool Output preview 行為。
 - 內容寬度預留 rail，避免文字覆蓋 scrollbar。
 
@@ -55,7 +56,9 @@ content line 的文字、focus rail 與 search highlight 先完成，再將結�
 
 ### 互動與事件
 
-本次 scrollbar 是視覺 track/thumb，不是滑鼠控制元件。`ConversationViewer.handleMouse()` 的 wheel 路由維持不變；click/press 仍依現有 timeline 與 header close hit-test 處理，不讓 scrollbar rail 新增意外 focus target。
+本次 scrollbar 是視覺 track/thumb，不是滑鼠控制元件。`ConversationViewer.handleMouse()` 的 wheel 路由維持不變；click/press 仍依現有 timeline 與 header action hit-test 處理，不讓 scrollbar rail 新增意外 focus target。
+
+ConversationViewer header 保留兩個 action：`[preview] [Esc]`。`[preview]` 的 click/press geometry 必須固定在 close action 左側，並呼叫與 `w` 相同的 `openFocusedToolPreview()`；沒有 focused tool 時維持 no-op。Scrollbar rail 不得改變 header action 的 hit-test。
 
 Tool Preview 開啟時仍由 `FullToolPreview` 完全接管 render/input/mouse，不將主 viewer rail 與 preview rail 混用。
 
@@ -66,8 +69,9 @@ Tool Preview 開啟時仍由 `FullToolPreview` 完全接管 render/input/mouse�
 1. 建立超過 viewport 的長 transcript，確認 content row 最右側出現 track/thumb 字元。
 2. 使用 `j`、PageDown 或 wheel 後重新 render，確認 thumb 位置會改變，且 hidden content 仍可到達。
 3. 建立不超過 viewport 的短 transcript，確認不顯示 thumb，且既有文字與外框寬度不變。
-4. 確認 search、message/tool focus 與 Tool Output preview 仍可正常使用，沒有因 rail 保留而改變快捷鍵或 close 行為。
-5. 執行 targeted viewer test，再執行完整 unit tests、lint、typecheck、build、e2e 與 pack。
+4. 確認 header `[preview]` 仍可見且可 click，並與 `w` 開啟相同的 read-only Tool Output preview；沒有 focused tool 時不會誤觸 close。
+5. 確認 search、message/tool focus 與 Tool Output preview 仍可正常使用，沒有因 rail 保留而改變快捷鍵或 close 行為。
+6. 執行 targeted viewer test，再執行完整 unit tests、lint、typecheck、build、e2e 與 pack。
 
 ## 驗收條件
 

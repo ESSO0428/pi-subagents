@@ -22,6 +22,7 @@
 - 只修改 `/tmp/pi-canonical/pi-subagents-work` canonical checkout，不修改 npm-installed copy 或研究專案根目錄。
 - Scrollbar 只提供視覺 track/thumb；不新增 mouse click-to-jump 或 drag-to-scroll。
 - 保留 `j/k`、方向鍵、PageUp/PageDown、Home/End、wheel、`g/G`、search match、message/tool focus 的既有語意。
+- 保留 ConversationViewer header 的 `[preview] [Esc]` actions；`[preview]` 與 `w` 必須呼叫同一個 focused-tool preview handler，且 action hit-test 不得重疊。
 - Tool Preview 維持 parent-owned in-place preview 與既有 scrollbar，不與主 viewer rail 共用 offset。
 - 不新增跨 package renderer dependency，不改變 transcript read-only 性質。
 - 新增或改寫的測試必須使用 local `vitest`；不能以全域 binary 或 npm-installed package 取代 canonical repo 驗證。
@@ -139,11 +140,16 @@ Build content lines at `contentWidth`, compute `visibleStart` and `viewportHeigh
 
 Do not add a rail to the outer header, invocation row, separator, composer/search row, or footer. When `totalLines <= viewportHeight`, `renderScrollbarCell()` must leave the rail visually empty while preserving its width.
 
-- [ ] **Step 4: Keep mouse hit-testing out of the visual rail**
+- [ ] **Step 4: Preserve the `[preview] [Esc]` header actions**
 
-In `handleMouse()`, use the same `contentWidth = Math.max(1, innerW - 1)` for content geometry. Preserve wheel scrolling over the viewport, but do not pass click/press/move events from the reserved rail column into `ConversationTimeline`; the rail is visual-only and must not become a focus target. Header close-button hit testing continues to use full `innerW`.
+Keep the header action geometry separate from the content rail. Render `[preview]` immediately to the left of `[Esc]`, reserve both labels before truncating the agent header title, and route `[preview]` press/click through the same `openFocusedToolPreview()` method used by `w`. With no focused tool, `[preview]` remains a handled no-op and must never trigger close. Add mouse press capture for both actions so release/click cannot fall through to the timeline.
 
-- [ ] **Step 5: Run the focused tests and iterate**
+- [ ] **Step 5: Keep mouse hit-testing out of the visual rail**
+
+In `handleMouse()`, use the same `contentWidth = Math.max(1, innerW - 1)` for content geometry. Preserve wheel scrolling over the viewport, but do not pass click/press/move events from the reserved rail column into `ConversationTimeline`; the rail is visual-only and must not become a focus target. Header `[preview]`/`[Esc]` hit testing continues to use full `innerW`.
+
+
+- [ ] **Step 6: Run the focused tests and iterate**
 
 Run:
 
