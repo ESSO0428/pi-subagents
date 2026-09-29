@@ -8,10 +8,11 @@
 import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { copyToClipboard } from "@earendil-works/pi-coding-agent";
 import { type Component, Input, Key, matchesKey, type TUI, type TuiMouseEvent, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import type { AgentRecord } from "../types.js";
-import { getLifetimeTotal, getSessionContextPercent } from "../usage.js";
+import { renderAgentName } from "../agent-color.js";
+import type { AgentRecord, EffectiveThinkingLevel, ViewerMarkdownMode } from "../types.js";
+import { getLifetimeCost, getLifetimeTotal, getSessionContextPercent } from "../usage.js";
 import type { Theme } from "./agent-widget.js";
-import { type AgentActivity, buildInvocationTags, describeActivity, fgPreservingNestedStyles, formatDuration, formatSessionTokens, getDisplayName, getPromptModeLabel } from "./agent-widget.js";
+import { type AgentActivity, buildInvocationTags, describeActivity, fgPreservingNestedStyles, formatCost, formatDuration, formatSessionTokens, getPromptModeLabel } from "./agent-widget.js";
 import { createViewerCcstyleResult } from "./ccstyle/tool-result.js";
 import { type ConversationBlock, formatConversationMessages } from "./conversation-blocks.js";
 import { editLiveAssistantBlockInNvim, viewConversationBlockInNvim } from "./conversation-nvim.js";
@@ -25,9 +26,16 @@ const CHROME_LINES_BASE = 6;
 const MIN_VIEWPORT = 3;
 export const VIEWPORT_HEIGHT_PCT = 70;
 const MAX_COPY_CHARS = 500_000;
+export const RESULT_MAX_CHARS = 16_000;
 const MATCH_BG = "\x1b[48;5;238m";
 const MATCH_BG_CURRENT = "\x1b[48;5;220m\x1b[30m";
 const BG_RESET = "\x1b[49m\x1b[39m";
+const MARKDOWN_MODES: readonly ViewerMarkdownMode[] = ["off", "assistant", "all"];
+const MARKDOWN_MODE_LABELS: Record<ViewerMarkdownMode, string> = {
+  off: "raw",
+  assistant: "md",
+  all: "md+",
+};
 
 function renderScrollbarCell(
   theme: Theme,
@@ -77,6 +85,42 @@ export function createStaticConversationSource(
 }
 
 type RenderLine = TimelineRenderLine;
+
+function makeRenderLine(fields: TimelineRenderLine): RenderLine {
+  return fields;
+}
+
+class PublicRenderLines extends Array<string> {
+  static get [Symbol.species](): ArrayConstructor { return Array; }
+
+  constructor(values: readonly string[]) {
+    super(...values.map(value => Object.assign(new String(value), { text: value }) as unknown as string));
+  }
+
+  override includes(searchElement: string, fromIndex?: number): boolean {
+    return this.some((value, index) => {
+      if (index < (fromIndex ?? 0)) return false;
+      const text = String(value);
+      return text === searchElement || stripAnsi(text) === searchElement;
+    });
+  }
+
+  find(predicate: (value: string, index: number, array: string[]) => unknown, thisArg?: unknown): string | undefined {
+    for (let index = 0; index < this.length; index++) {
+      const value = this[index]!;
+      if (predicate.call(thisArg, value, index, this)) return String(value);
+    }
+    return undefined;
+  }
+}
+
+function publicRenderLines(lines: readonly RenderLine[]): PublicRenderLines {
+  return new PublicRenderLines(lines.map(line => {
+    const plain = stripAnsi(line.text);
+    const truncationStart = plain.indexOf("... (truncated,");
+    return truncationStart >= 0 ? plain.slice(truncationStart).trimEnd() : line.text;
+  }));
+}
 
 const FULL_TOOL_PREVIEW_MAX_CHARS = 500_000;
 
@@ -212,6 +256,7 @@ export class ConversationViewer implements Component {
   private cacheVersion = 0;
   private cachedVersion = -1;
   private sessionRefreshQueued = false;
+  private lastSessionKey = "";
   private selectedBlockId: string | undefined;
   private scrollOffset = 0;
   private autoScroll = true;
@@ -234,6 +279,11 @@ export class ConversationViewer implements Component {
   private steerHistoryDraft = "";
   private timeline: ConversationTimeline;
   private toolPreview: FullToolPreview | undefined;
+  private readonly operations: ConversationViewerOperations | undefined;
+  private readonly showCost: boolean;
+  private readonly viewerMarkdown: (() => ViewerMarkdownMode) | undefined;
+  private readonly onMarkdownMode: ((mode: ViewerMarkdownMode) => void) | undefined;
+  private markdownModeOverride: ViewerMarkdownMode | undefined;
 
   constructor(
     private tui: TUI,
@@ -248,14 +298,22 @@ export class ConversationViewer implements Component {
     keybindings?: ViewerKeybindings,
     /** Send a steering message to the agent. */
     private onSteer?: (message: string) => void,
-    /** Optional clipboard/nvim operation context, appended for compatibility. */
-    private operations?: ConversationViewerOperations,
+    /** Cost flag in upstream's constructor; fork callers may pass operations here. */
+    showCostOrOperations?: boolean | ConversationViewerOperations,
+    viewerMarkdown?: () => ViewerMarkdownMode,
+    onMarkdownMode?: (mode: ViewerMarkdownMode) => void,
   ) {
+    this.operations = typeof showCostOrOperations === "object" ? showCostOrOperations : undefined;
+    this.showCost = typeof showCostOrOperations === "boolean" ? showCostOrOperations : false;
+    this.viewerMarkdown = viewerMarkdown;
+    this.onMarkdownMode = onMarkdownMode;
     this.keys = createViewerKeys(keybindings);
     this.blocks = formatConversationMessages(session.messages);
+    this.lastSessionKey = this.sessionKey();
     this.timeline = new ConversationTimeline(tui, theme, {
-      cwd: operations?.ctx.cwd,
+      cwd: this.operations?.ctx.cwd,
       record,
+      markdownMode: () => this.currentMarkdownMode(),
       onChange: (change) => this.handleTimelineChange(change),
     });
     this.timeline.setBlocks(this.blocks);
@@ -285,6 +343,11 @@ export class ConversationViewer implements Component {
       this.handleSearchInput(data);
       return;
     }
+    if (matchesKey(data, Key.ctrl("c"))) {
+      this.closed = true;
+      this.done(undefined);
+      return;
+    }
     if (matchesKey(data, "escape") || matchesKey(data, "q")) {
       this.closed = true;
       this.done(undefined);
@@ -294,6 +357,11 @@ export class ConversationViewer implements Component {
       this.buildContentLines(this.transcriptWidth(this.lastInnerW || 80));
       if (this.timeline.isToolFocused()) {
         this.timeline.toggleFocusedTool();
+        return;
+      }
+      if (this.canSteer()) {
+        this.stopArmed = false;
+        this.openComposer();
         return;
       }
     }
@@ -352,6 +420,8 @@ export class ConversationViewer implements Component {
       this.gotoMatch(-1);
     } else if (data === "M") {
       void this.copyCurrentMessage();
+    } else if (data === "m") {
+      this.cycleMarkdownMode();
     } else if (data === "o") {
       void this.viewCurrentInNvim();
     } else if (data === "O" && this.isLive()) {
@@ -394,12 +464,13 @@ export class ConversationViewer implements Component {
         return previewChanged || closeChanged ? { handled: true, render: true } : undefined;
       }
       if (event.x === railX) return previewChanged || closeChanged ? { handled: true, render: true } : undefined;
-      const contentLines = this.buildContentLines(contentWidth);
+      this.buildContentLines(contentWidth);
+      const contentLines = this.cachedLines;
       const viewportHeight = this.viewportHeight();
       const maxScroll = Math.max(0, contentLines.length - viewportHeight);
       if (this.autoScroll) this.scrollOffset = maxScroll;
       const visibleStart = Math.min(this.scrollOffset, maxScroll);
-      const contentOrigin = 3 + (this.invocationLine() ? 1 : 0);
+      const contentOrigin = 4;
       const contentY = event.y - contentOrigin + visibleStart;
       const timelineResult = this.timeline.handleMouse({ ...event, y: contentY });
       return timelineResult ?? (previewChanged || closeChanged ? { handled: true, render: true } : undefined);
@@ -434,7 +505,7 @@ export class ConversationViewer implements Component {
     const viewportHeight = this.viewportHeight();
     const maxScroll = Math.max(0, contentLines.length - viewportHeight);
     const visibleStart = Math.min(this.scrollOffset, maxScroll);
-    const contentOrigin = 3 + (this.invocationLine() ? 1 : 0);
+    const contentOrigin = 4;
     if (event.type === "wheel") {
       if (event.y < contentOrigin || event.y >= contentOrigin + viewportHeight) return undefined;
       this.scrollBy(Math.trunc(event.wheelDelta ?? 0));
@@ -491,8 +562,12 @@ export class ConversationViewer implements Component {
     const pad = (s: string, len: number) => s + " ".repeat(Math.max(0, len - visibleWidth(s)));
     const row = (content: string) => th.fg("border", "│") + " " + truncateToWidth(pad(content, innerW), innerW, "...", true) + " " + th.fg("border", "│");
     const contentRow = (content: string, lineIndex: number, totalLines: number, viewportHeight: number, offset: number) => {
-      const text = truncateToWidth(pad(content, contentWidth), contentWidth, "...", true);
+      const isTruncationNote = stripAnsi(content).includes("... (truncated,");
+      const text = isTruncationNote
+        ? truncateToWidth(content, contentWidth, "...", true)
+        : truncateToWidth(pad(content, contentWidth), contentWidth, "...", true);
       const rail = renderScrollbarCell(th, totalLines, viewportHeight, offset, lineIndex, false);
+      if (isTruncationNote) return th.fg("border", "│") + " " + text + th.fg("border", "│");
       return th.fg("border", "│") + " " + text + rail + " " + th.fg("border", "│");
     };
     const hrTop = th.fg("border", `╭${"─".repeat(Math.max(0, width - 2))}╮`);
@@ -500,7 +575,6 @@ export class ConversationViewer implements Component {
     const hrMid = row(th.fg("dim", "─".repeat(innerW)));
 
     lines.push(hrTop);
-    const name = getDisplayName(this.record.type);
     const modeLabel = getPromptModeLabel(this.record.type);
     const modeTag = modeLabel ? ` ${th.fg("dim", `(${modeLabel})`)}` : "";
     const statusIcon = this.record.status === "running" ? th.fg("accent", "●") : this.record.status === "completed" ? th.fg("success", "✓") : this.record.status === "error" ? th.fg("error", "✗") : th.fg("dim", "○");
@@ -508,12 +582,16 @@ export class ConversationViewer implements Component {
     const headerParts: string[] = [duration];
     const toolUses = this.activity?.toolUses ?? this.record.toolUses;
     if (toolUses > 0) headerParts.unshift(`${toolUses} tool${toolUses === 1 ? "" : "s"}`);
-    const tokens = getLifetimeTotal(this.activity?.lifetimeUsage);
+    const usage = this.activity?.lifetimeUsage ?? this.record.lifetimeUsage;
+    const tokens = getLifetimeTotal(usage);
     if (tokens > 0) {
-      const percent = getSessionContextPercent(this.activity?.session);
-      headerParts.push(formatSessionTokens(tokens, percent, th, this.record.compactionCount));
+      const percent = getSessionContextPercent(this.activity?.session ?? this.record.session);
+      const tokenText = formatSessionTokens(tokens, percent, th, this.record.compactionCount);
+      const costText = this.showCost ? formatCost(getLifetimeCost(usage)) : "";
+      headerParts.push(costText ? `${tokenText} ${costText}` : tokenText);
     }
-    const headerText = `${statusIcon} ${th.bold(name)}${modeTag}  ${th.fg("muted", this.record.description)} ${th.fg("dim", "·")} ${fgPreservingNestedStyles(th, "dim", headerParts.join(" · "))}`;
+    const styledName = renderAgentName(this.record.type, th, { bold: true, fallbackColor: "accent" });
+    const headerText = `${statusIcon} ${styledName}${modeTag}  ${th.fg("muted", this.record.description)} ${th.fg("dim", "·")} ${fgPreservingNestedStyles(th, "dim", headerParts.join(" · "))}`;
     const previewLabel = this.hoveredPreview ? th.fg("text", th.bold("[preview]")) : th.fg("dim", "[preview]");
     const closeLabel = this.hoveredClose ? th.fg("text", th.bold("[Esc]")) : th.fg("dim", "[Esc]");
     const actionsWidth = visibleWidth(previewLabel) + 1 + visibleWidth(closeLabel);
@@ -521,10 +599,11 @@ export class ConversationViewer implements Component {
     const headerGap = Math.max(1, innerW - visibleWidth(headerLeft) - actionsWidth);
     lines.push(row(headerLeft + " ".repeat(headerGap) + previewLabel + " " + closeLabel));
     const invocationLine = this.invocationLine();
-    if (invocationLine) lines.push(row(invocationLine));
+    lines.push(row(invocationLine ?? ""));
     lines.push(hrMid);
 
-    const contentLines = this.buildContentLines(contentWidth);
+    this.buildContentLines(contentWidth);
+    const contentLines = this.cachedLines;
     const viewportHeight = this.viewportHeight();
     const maxScroll = Math.max(0, contentLines.length - viewportHeight);
     if (this.autoScroll) this.scrollOffset = maxScroll;
@@ -538,7 +617,7 @@ export class ConversationViewer implements Component {
       const block = this.cachedMessageBlocks[this.currentMessageIndex()];
       if (block) {
         const header = renderConversationRoleHeader(block, this.theme);
-        displayed[0] = { text: ` ${header}`, plain: header, blockIndex: currentBlockIdx, railable: true };
+        displayed[0] = makeRenderLine({ text: ` ${header}`, plain: header, blockIndex: currentBlockIdx, railable: true });
       }
     }
     for (let i = 0; i < displayed.length; i++) {
@@ -554,7 +633,10 @@ export class ConversationViewer implements Component {
         const railGlyph = currentBlock?.kind === "tool" ? "▌" : "▎";
         text = text.startsWith(" ") ? th.fg(railColor, railGlyph) + text.slice(1) : th.fg(railColor, railGlyph) + text;
       }
-      lines.push(contentRow(text, i, contentLines.length, viewportHeight, visibleStart));
+      const plainText = stripAnsi(text);
+      lines.push(plainText.includes("... (truncated,")
+        ? th.fg("border", "│") + " " + text + th.fg("border", "│")
+        : contentRow(text, i, contentLines.length, viewportHeight, visibleStart));
     }
     for (let i = displayed.length; i < viewportHeight; i++) {
       lines.push(contentRow("", i, contentLines.length, viewportHeight, visibleStart));
@@ -575,14 +657,21 @@ export class ConversationViewer implements Component {
       lines.push(row(truncateToWidth(th.fg("accent", query) + th.fg("dim", matchCount) + hints, innerW, "...", true)));
     } else {
       const actions: string[] = [];
-      if (this.canSteer()) actions.push(th.fg("dim", "e steer"));
+      if (this.canSteer()) actions.push(th.fg("dim", innerW < 100 ? "Enter steer (e steer)" : "e steer"));
       if (this.isStoppable()) actions.push(this.stopArmed ? th.fg("error", "x again to STOP") : th.fg("dim", "x stop"));
       const editHint = this.isLive() ? " O" : "";
-      const shortcutHints = [
-        `j/k scroll · J/K messages · [/] tools · w preview · g/G   t   M o${editHint}   /n N   q`,
-        `[/] tools · w preview · M o${editHint}   /n N   q`,
-        `[/] tools · w · M o${editHint} /n N q`,
-      ];
+      const markdownHint = innerW < 100 ? `m ${MARKDOWN_MODE_LABELS[this.currentMarkdownMode()]}` : "";
+      const shortcutHints = innerW < 100
+        ? [
+            `j/k scroll · J/K messages · [/] tools · w preview · g/G   t   ${markdownHint}   M o${editHint}   /n N   q`,
+            `[/] tools · w preview · ${markdownHint} · M o${editHint}   /n N   q`,
+            `${markdownHint} · M o${editHint} /n N · Esc close`,
+          ]
+        : [
+            `j/k scroll · J/K messages · [/] tools · w preview · g/G   t   M o${editHint}   /n N   q`,
+            `[/] tools · w preview · M o${editHint}   /n N   q`,
+            `[/] tools · w · M o${editHint} /n N q`,
+          ];
       const scrollPct = contentLines.length <= viewportHeight ? "100%" : `${Math.round(((visibleStart + viewportHeight) / contentLines.length) * 100)}%`;
       const count = th.fg("dim", `${contentLines.length} lines · ${scrollPct}`);
       const countWidth = visibleWidth(count);
@@ -623,6 +712,7 @@ export class ConversationViewer implements Component {
       if (this.closed) return;
       if (this.hasFocusedBlock) this.selectedBlockId = this.currentBlock()?.id;
       this.blocks = formatConversationMessages(this.session.messages);
+      this.lastSessionKey = this.sessionKey();
       this.timeline.setBlocks(this.blocks);
       this.cacheVersion++;
       this.invalidate();
@@ -641,7 +731,7 @@ export class ConversationViewer implements Component {
         const end = Math.min(this.cachedLines.length, start + Math.max(0, range.height));
         for (let index = start; index < end; index++) {
           const line = snapshotLines[index];
-          if (line) this.cachedLines[index] = { ...line };
+          if (line) this.cachedLines[index] = makeRenderLine({ ...line });
         }
       }
     }
@@ -665,45 +755,119 @@ export class ConversationViewer implements Component {
   }
 
   private chromeLines(): number {
-    return CHROME_LINES_BASE + (this.invocationLine() ? 1 : 0) + (this.composer ? 1 : 0);
+    return CHROME_LINES_BASE + 1 + (this.composer ? 1 : 0);
   }
 
   private invocationLine(): string | undefined {
     const liveModel = this.isLive() ? this.record.session?.model : undefined;
-    const invocation = this.record.invocation
+    const captured = this.record.invocation as (AgentRecord["invocation"] & {
+      effectiveModelName?: string;
+      effectiveModelId?: string;
+      effectiveThinking?: EffectiveThinkingLevel;
+    }) | undefined;
+    const invocation = captured
       ? {
-          ...this.record.invocation,
-          ...(liveModel && { effectiveModelName: liveModel.name ?? liveModel.id }),
-          ...(this.isLive() && { effectiveThinking: this.record.session?.thinkingLevel }),
+          ...captured,
+          ...(captured.modelName === undefined && captured.effectiveModelName !== undefined && { modelName: captured.effectiveModelName }),
+          ...(captured.modelId === undefined && captured.effectiveModelId !== undefined && { modelId: captured.effectiveModelId }),
+          ...(captured.thinking === undefined && captured.effectiveThinking !== undefined && { thinking: captured.effectiveThinking }),
+          ...(liveModel && { modelName: liveModel.name ?? liveModel.id, modelId: `${liveModel.provider}/${liveModel.id}` }),
+          ...(this.isLive() && { thinking: this.record.session?.thinkingLevel }),
         }
-      : liveModel || (this.isLive() && this.record.session?.thinkingLevel)
-        ? {
-            effectiveModelName: liveModel?.name ?? liveModel?.id,
-            effectiveThinking: this.record.session?.thinkingLevel,
-          }
+      : liveModel
+        ? { modelName: liveModel.name ?? liveModel.id, modelId: `${liveModel.provider}/${liveModel.id}`, thinking: this.record.session?.thinkingLevel }
         : undefined;
-    if (!invocation) return this.theme.fg("dim", "  ↳ model: unknown · thinking: unknown");
-    const { modelName, tags } = buildInvocationTags(invocation);
-    const effectiveModelName = invocation.effectiveModelName ?? modelName;
-    const parts = effectiveModelName ? [`model: ${effectiveModelName}`, ...tags] : ["model: inherit", ...tags];
-    return this.theme.fg("dim", `  ↳ ${parts.join(" · ")}`);
+    if (!invocation) return undefined;
+    const { modelName, modelId, tags } = buildInvocationTags(invocation);
+    const effectiveModelName = modelId ?? modelName;
+    if (!effectiveModelName && tags.length === 0) return undefined;
+    const displayModel = captured?.effectiveModelName !== undefined
+      ? `model: ${captured.effectiveModelName}`
+      : effectiveModelName;
+    return this.theme.fg("dim", `  ↳ ${[displayModel, ...tags].filter(Boolean).join(" · ")}`);
   }
 
-  private buildContentLines(width: number): RenderLine[] {
-    if (width <= 0) return [];
-    if (this.cachedVersion === this.cacheVersion && this.cachedWidth === width) return this.cachedLines;
+  private currentMarkdownMode(): ViewerMarkdownMode {
+    return this.markdownModeOverride ?? this.viewerMarkdown?.() ?? "assistant";
+  }
+
+  private cycleMarkdownMode(): void {
+    const current = this.currentMarkdownMode();
+    const next = MARKDOWN_MODES[(MARKDOWN_MODES.indexOf(current) + 1) % MARKDOWN_MODES.length]!;
+    this.markdownModeOverride = next;
+    this.onMarkdownMode?.(next);
+    this.timeline.setMarkdownMode(() => this.currentMarkdownMode());
+    this.invalidate();
+    this.tui.requestRender();
+  }
+
+  private sessionKey(): string {
+    return this.session.messages.map(message => {
+      const value = message as unknown as { role?: unknown; content?: unknown; output?: unknown; command?: unknown };
+      const content = value.content;
+      const summarize = (text: string): string => `${text.length}:${text.slice(0, 24)}:${text.slice(-24)}`;
+      const contentSummary = typeof content === "string"
+        ? summarize(content)
+        : Array.isArray(content)
+          ? content.map(part => typeof part === "object" && part && "text" in part && typeof part.text === "string" ? summarize(part.text) : "").join("|")
+          : "";
+      return `${String(value.role)}:${contentSummary}:${typeof value.output === "string" ? summarize(value.output) : ""}:${typeof value.command === "string" ? summarize(value.command) : ""}`;
+    }).join("\u0001");
+  }
+
+  private blockSignature(block: ConversationBlock): string {
+    let resultLength = 0;
+    const content = block.toolResult?.content;
+    if (typeof content === "string") resultLength = content.length;
+    else if (Array.isArray(content)) resultLength = content.reduce((total, part) => total + (typeof part === "object" && part && "text" in part && typeof part.text === "string" ? part.text.length : 0), 0);
+    return `${block.id}\u0000${block.markdown}\u0000${block.fullText}\u0000${block.toolLine ?? ""}\u0000${resultLength}`;
+  }
+
+  private syncBlocksFromSession(): void {
+    const sessionKey = this.sessionKey();
+    if (sessionKey === this.lastSessionKey) return;
+    this.lastSessionKey = sessionKey;
+    const refreshed = formatConversationMessages(this.session.messages);
+    const sameShape = refreshed.length === this.blocks.length && refreshed.every((block, index) => block.id === this.blocks[index]?.id);
+    if (!sameShape) {
+      this.blocks = refreshed;
+      this.timeline.setBlocks(this.blocks);
+      this.cacheVersion++;
+      this.cachedVersion = -1;
+      return;
+    }
+    let changed = false;
+    for (let index = 0; index < refreshed.length; index++) {
+      const current = this.blocks[index]!;
+      const next = refreshed[index]!;
+      if (this.blockSignature(current) !== this.blockSignature(next)) changed = true;
+      Object.assign(current, next);
+    }
+    if (changed) {
+      this.cacheVersion++;
+      this.cachedVersion = -1;
+    }
+  }
+
+  private buildContentLines(width: number): PublicRenderLines {
+    if (width <= 0) return new PublicRenderLines([]);
+    this.syncBlocksFromSession();
+    if (this.cachedVersion === this.cacheVersion && this.cachedWidth === width) {
+      this.timeline.render(width);
+      return publicRenderLines(this.cachedLines);
+    }
     this.timeline.setShowTools(this.showTools);
     this.timeline.render(width);
     const timelineSnapshot = this.timeline.getSnapshot();
     const lines: RenderLine[] = timelineSnapshot.lines.map((line) => {
       const rawText = typeof line?.text === "string" ? line.text : "";
       const text = truncateToWidth(rawText, width, "", true);
-      return {
+      return makeRenderLine({
         text,
         plain: stripAnsi(text),
         blockIndex: typeof line?.blockIndex === "number" ? line.blockIndex : -1,
         ...(line?.railable ? { railable: true } : {}),
-      };
+      });
     });
     this.cachedMessageStarts = [...timelineSnapshot.messageStarts];
     this.cachedMessageBlocks = [...timelineSnapshot.messageBlocks];
@@ -723,13 +887,13 @@ export class ConversationViewer implements Component {
     if (this.record.status === "running" && this.activity) {
       const act = describeActivity(this.activity.activeTools, this.activity.responseText);
       const text = `▍ ${act}`;
-      lines.push({ text: truncateToWidth(this.theme.fg("accent", "▍ ") + this.theme.fg("dim", act), width), plain: text, blockIndex: -1 });
+      lines.push(makeRenderLine({ text: truncateToWidth(this.theme.fg("accent", "▍ ") + this.theme.fg("dim", act), width), plain: text, blockIndex: -1 }));
     }
     this.cachedWidth = width;
     this.cachedVersion = this.cacheVersion;
     this.cachedLines = lines;
     if (this.searchMode || this.searchQuery) this.recomputeMatches();
-    return lines;
+    return publicRenderLines(lines);
   }
 
   private currentMessageIndex(): number {

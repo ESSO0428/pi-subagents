@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.7] - 2026-09-30
+
+### Added
+- **Durable `.pi-subagents` histories now capture every spawn, tool/message turn, partial run, stop, abort, error, timeout, and shutdown path**, independently of the optional `.output` transcript switch.
+- **Upstream workflow, lifecycle/RPC event handling, recovery checkpoints, and historical conversation reopening** are integrated while preserving the fork's fleet UI, scrollbar, preview, and in-place tool output behavior.
+
+### Fixed
+- **ConversationViewer Markdown modes, cost/invocation metadata, terminal controls, truncation notices, and render-width safety** now work for live and recovered history.
+
 ## [0.17.6] - 2026-09-30
 
 ### Fixed
