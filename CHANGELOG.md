@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.6] - 2026-09-30
+
+### Fixed
+- **The main ConversationViewer now reserves a right-hand scrollbar rail and exposes an explicit `[preview]` action**, keeping transcript scrolling visible while opening the focused tool's full read-only preview without changing the conversation view's layout or focus behavior.
+
 ## [0.17.5] - 2026-09-30
 
 ### Fixed
