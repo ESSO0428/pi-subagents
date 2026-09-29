@@ -220,6 +220,8 @@ export class ConversationViewer implements Component {
   private closed = false;
   private stopArmed = false;
   private hoveredClose = false;
+  private hoveredPreview = false;
+  private pressedHeaderAction: "preview" | "close" | undefined;
   private keys: ViewerKeys;
   private composer: Input | undefined;
   private searchMode = false;
@@ -289,7 +291,7 @@ export class ConversationViewer implements Component {
       return;
     }
     if (matchesKey(data, "enter")) {
-      this.buildContentLines(this.lastInnerW || 80);
+      this.buildContentLines(this.transcriptWidth(this.lastInnerW || 80));
       if (this.timeline.isToolFocused()) {
         this.timeline.toggleFocusedTool();
         return;
@@ -315,7 +317,7 @@ export class ConversationViewer implements Component {
     if (this.stopArmed) this.stopArmed = false;
 
     // Input can arrive before the first render in tests and in a freshly-opened overlay.
-    this.buildContentLines(this.lastInnerW || 80);
+    this.buildContentLines(this.transcriptWidth(this.lastInnerW || 80));
     const viewportHeight = this.viewportHeight();
     const maxScroll = Math.max(0, this.cachedLines.length - viewportHeight);
 
@@ -379,12 +381,20 @@ export class ConversationViewer implements Component {
   handleMouse(event: TuiMouseEvent): { handled?: boolean; capture?: boolean; render?: boolean } | undefined {
     if (this.toolPreview) return this.toolPreview.handleMouse(event);
     const innerW = Math.max(1, this.lastInnerW || event.width - 4);
+    const contentWidth = this.transcriptWidth(innerW);
+    const railX = 2 + contentWidth;
+    const previewHit = this.isPreviewButtonHit(event.x, event.y, innerW);
     const closeHit = this.isCloseButtonHit(event.x, event.y, innerW);
     if (event.type === "move") {
+      const previewChanged = previewHit !== this.hoveredPreview;
       const closeChanged = closeHit !== this.hoveredClose;
+      this.hoveredPreview = previewHit;
       this.hoveredClose = closeHit;
-      if (this.composer || this.searchMode) return closeChanged ? { handled: true, render: true } : undefined;
-      const contentLines = this.buildContentLines(innerW);
+      if (this.composer || this.searchMode) {
+        return previewChanged || closeChanged ? { handled: true, render: true } : undefined;
+      }
+      if (event.x === railX) return previewChanged || closeChanged ? { handled: true, render: true } : undefined;
+      const contentLines = this.buildContentLines(contentWidth);
       const viewportHeight = this.viewportHeight();
       const maxScroll = Math.max(0, contentLines.length - viewportHeight);
       if (this.autoScroll) this.scrollOffset = maxScroll;
@@ -392,18 +402,35 @@ export class ConversationViewer implements Component {
       const contentOrigin = 3 + (this.invocationLine() ? 1 : 0);
       const contentY = event.y - contentOrigin + visibleStart;
       const timelineResult = this.timeline.handleMouse({ ...event, y: contentY });
-      return timelineResult ?? (closeChanged ? { handled: true, render: true } : undefined);
+      return timelineResult ?? (previewChanged || closeChanged ? { handled: true, render: true } : undefined);
     }
-    if (closeHit && event.button === "left") {
-      if (event.type === "press") return { handled: true, capture: true, render: false };
-      if (event.type === "click") {
+    if (event.button === "left") {
+      if (event.type === "press" && previewHit) {
+        this.pressedHeaderAction = "preview";
+        return { handled: true, capture: true, render: false };
+      }
+      if (event.type === "press" && closeHit) {
+        this.pressedHeaderAction = "close";
+        return { handled: true, capture: true, render: false };
+      }
+      if (event.type === "release" && this.pressedHeaderAction) {
+        this.pressedHeaderAction = undefined;
+        return { handled: true, render: false };
+      }
+      if (event.type === "click" && previewHit) {
+        this.pressedHeaderAction = undefined;
+        this.openFocusedToolPreview();
+        return { handled: true, render: false };
+      }
+      if (event.type === "click" && closeHit) {
+        this.pressedHeaderAction = undefined;
         this.closed = true;
         this.done(undefined);
         return { handled: true, render: false };
       }
     }
     if (this.composer || this.searchMode) return undefined;
-    const contentLines = this.buildContentLines(innerW);
+    const contentLines = this.buildContentLines(contentWidth);
     const viewportHeight = this.viewportHeight();
     const maxScroll = Math.max(0, contentLines.length - viewportHeight);
     const visibleStart = Math.min(this.scrollOffset, maxScroll);
@@ -415,9 +442,11 @@ export class ConversationViewer implements Component {
     }
     const contentY = event.y - contentOrigin + visibleStart;
     if (contentY < 0 || contentY >= contentLines.length) return undefined;
+    // The reserved rail is visual-only; wheel events above remain handled by the viewport.
+    if ((event.type === "click" || event.type === "press") && event.x === railX) return undefined;
     // Rows have one leading space and one trailing space inside the frame.
-    // Neither padding nor the frame itself is a focus target.
-    if ((event.type === "click" || event.type === "press") && (event.x < 2 || event.x >= 2 + innerW)) return undefined;
+    // Neither padding, the rail, nor the frame itself is a focus target.
+    if ((event.type === "click" || event.type === "press") && (event.x < 2 || event.x >= 2 + contentWidth)) return undefined;
     const result = this.timeline.handleMouse({ ...event, y: contentY });
     if (result?.handled && event.type === "click") {
       let selected = result.focusedBlockIndex;
@@ -426,7 +455,7 @@ export class ConversationViewer implements Component {
         selected = this.timeline.getSnapshot().messageBlocks.findIndex((block) => block.toolCallId === focusedTool);
       }
       if (selected !== undefined && selected >= 0) {
-        this.buildContentLines(innerW);
+        this.buildContentLines(contentWidth);
         this.setFocusFromMessageIndex(selected);
         this.autoScroll = false;
         this.scrollTargetIntoView(selected);
@@ -436,9 +465,17 @@ export class ConversationViewer implements Component {
     return result;
   }
 
+  private isPreviewButtonHit(x: number, y: number, innerW: number): boolean {
+    if (y !== 1) return false;
+    const previewWidth = visibleWidth("[preview]");
+    const closeWidth = visibleWidth("[Esc]");
+    const labelStart = 2 + Math.max(0, innerW - previewWidth - 1 - closeWidth);
+    return x >= labelStart && x < labelStart + previewWidth;
+  }
+
   private isCloseButtonHit(x: number, y: number, innerW: number): boolean {
     if (y !== 1) return false;
-    const labelWidth = visibleWidth("[esc]");
+    const labelWidth = visibleWidth("[Esc]");
     const labelStart = 2 + Math.max(0, innerW - labelWidth);
     return x >= labelStart && x < 2 + innerW;
   }
@@ -449,9 +486,15 @@ export class ConversationViewer implements Component {
     const th = this.theme;
     const innerW = Math.max(1, width - 4);
     this.lastInnerW = innerW;
+    const contentWidth = this.transcriptWidth(innerW);
     const lines: string[] = [];
     const pad = (s: string, len: number) => s + " ".repeat(Math.max(0, len - visibleWidth(s)));
     const row = (content: string) => th.fg("border", "│") + " " + truncateToWidth(pad(content, innerW), innerW, "...", true) + " " + th.fg("border", "│");
+    const contentRow = (content: string, lineIndex: number, totalLines: number, viewportHeight: number, offset: number) => {
+      const text = truncateToWidth(pad(content, contentWidth), contentWidth, "...", true);
+      const rail = renderScrollbarCell(th, totalLines, viewportHeight, offset, lineIndex, false);
+      return th.fg("border", "│") + " " + text + rail + " " + th.fg("border", "│");
+    };
     const hrTop = th.fg("border", `╭${"─".repeat(Math.max(0, width - 2))}╮`);
     const hrBot = th.fg("border", `╰${"─".repeat(Math.max(0, width - 2))}╯`);
     const hrMid = row(th.fg("dim", "─".repeat(innerW)));
@@ -471,16 +514,17 @@ export class ConversationViewer implements Component {
       headerParts.push(formatSessionTokens(tokens, percent, th, this.record.compactionCount));
     }
     const headerText = `${statusIcon} ${th.bold(name)}${modeTag}  ${th.fg("muted", this.record.description)} ${th.fg("dim", "·")} ${fgPreservingNestedStyles(th, "dim", headerParts.join(" · "))}`;
-    const closeLabel = this.hoveredClose ? th.fg("text", th.bold("[esc]")) : th.fg("dim", "[esc]");
-    const closeWidth = visibleWidth(closeLabel);
-    const headerLeft = truncateToWidth(headerText, Math.max(0, innerW - closeWidth - 1), "", true);
-    const headerGap = Math.max(1, innerW - visibleWidth(headerLeft) - closeWidth);
-    lines.push(row(headerLeft + " ".repeat(headerGap) + closeLabel));
+    const previewLabel = this.hoveredPreview ? th.fg("text", th.bold("[preview]")) : th.fg("dim", "[preview]");
+    const closeLabel = this.hoveredClose ? th.fg("text", th.bold("[Esc]")) : th.fg("dim", "[Esc]");
+    const actionsWidth = visibleWidth(previewLabel) + 1 + visibleWidth(closeLabel);
+    const headerLeft = truncateToWidth(headerText, Math.max(0, innerW - actionsWidth - 1), "", true);
+    const headerGap = Math.max(1, innerW - visibleWidth(headerLeft) - actionsWidth);
+    lines.push(row(headerLeft + " ".repeat(headerGap) + previewLabel + " " + closeLabel));
     const invocationLine = this.invocationLine();
     if (invocationLine) lines.push(row(invocationLine));
     lines.push(hrMid);
 
-    const contentLines = this.buildContentLines(innerW);
+    const contentLines = this.buildContentLines(contentWidth);
     const viewportHeight = this.viewportHeight();
     const maxScroll = Math.max(0, contentLines.length - viewportHeight);
     if (this.autoScroll) this.scrollOffset = maxScroll;
@@ -510,9 +554,11 @@ export class ConversationViewer implements Component {
         const railGlyph = currentBlock?.kind === "tool" ? "▌" : "▎";
         text = text.startsWith(" ") ? th.fg(railColor, railGlyph) + text.slice(1) : th.fg(railColor, railGlyph) + text;
       }
-      lines.push(row(text));
+      lines.push(contentRow(text, i, contentLines.length, viewportHeight, visibleStart));
     }
-    for (let i = displayed.length; i < viewportHeight; i++) lines.push(row(""));
+    for (let i = displayed.length; i < viewportHeight; i++) {
+      lines.push(contentRow("", i, contentLines.length, viewportHeight, visibleStart));
+    }
 
     lines.push(hrMid);
     if (this.composer) {
@@ -611,6 +657,11 @@ export class ConversationViewer implements Component {
   private viewportHeight(): number {
     const maxRows = Math.floor((this.tui.terminal.rows * VIEWPORT_HEIGHT_PCT) / 100);
     return Math.max(MIN_VIEWPORT, maxRows - this.chromeLines());
+  }
+
+  /** Full inner width includes the one column reserved for the transcript rail. */
+  private transcriptWidth(innerW: number): number {
+    return Math.max(1, innerW - 1);
   }
 
   private chromeLines(): number {
@@ -744,7 +795,7 @@ export class ConversationViewer implements Component {
   private moveToolFocus(direction: 1 | -1): void {
     if (!this.timeline.moveFocus(direction)) return;
     const focused = this.timeline.getFocusedToolCallId();
-    this.buildContentLines(this.lastInnerW || 80);
+    this.buildContentLines(this.transcriptWidth(this.lastInnerW || 80));
     const index = this.cachedMessageBlocks.findIndex((block) => block.toolCallId === focused);
     if (index >= 0) {
       this.setFocusFromMessageIndex(index);
@@ -755,7 +806,7 @@ export class ConversationViewer implements Component {
   }
 
   private focusNearbyTool(direction: 1 | -1): void {
-    this.buildContentLines(this.lastInnerW || 80);
+    this.buildContentLines(this.transcriptWidth(this.lastInnerW || 80));
     const toolIndices = this.cachedMessageBlocks
       .map((block, index) => block.kind === "tool" && block.toolCallId ? index : -1)
       .filter((index): index is number => index >= 0);
@@ -786,7 +837,7 @@ export class ConversationViewer implements Component {
   }
 
   private openFocusedToolPreview(): void {
-    this.buildContentLines(this.lastInnerW || 80);
+    this.buildContentLines(this.transcriptWidth(this.lastInnerW || 80));
     const focusedToolCallId = this.timeline.getFocusedToolCallId();
     const block = focusedToolCallId
       ? this.cachedMessageBlocks.find((candidate) => candidate.toolCallId === focusedToolCallId)

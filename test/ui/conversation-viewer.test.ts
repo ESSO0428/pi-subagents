@@ -70,6 +70,38 @@ describe("ConversationViewer", () => {
     expect(rendered).toMatch(/\x1b\[/);
   });
 
+  it("renders a main transcript scrollbar and moves its thumb with the viewport", () => {
+    const longText = Array.from({ length: 80 }, (_, index) => `line ${index + 1}`).join("\n");
+    const viewer = new ConversationViewer(
+      tui(),
+      createStaticConversationSource([{ role: "assistant", content: [{ type: "text", text: longText }] }] as any),
+      record(),
+      undefined,
+      theme,
+      vi.fn(),
+    );
+
+    const bottomLines = viewer.render(100);
+    const bottomThumb = bottomLines.findIndex((line) => line.includes("┃") || line.includes("█"));
+    expect(bottomThumb).toBeGreaterThan(-1);
+
+    viewer.handleInput("g");
+    const topLines = viewer.render(100);
+    const topThumb = topLines.findIndex((line) => line.includes("┃") || line.includes("█"));
+    expect(topThumb).toBeGreaterThanOrEqual(0);
+    expect(bottomThumb).toBeGreaterThan(topThumb);
+
+    const shortViewer = new ConversationViewer(
+      tui(),
+      createStaticConversationSource([{ role: "assistant", content: [{ type: "text", text: "short" }] }] as any),
+      record(),
+      undefined,
+      theme,
+      vi.fn(),
+    );
+    expect(shortViewer.render(100).join("\\n")).not.toMatch(/[┃█]/u);
+  });
+
   it("toggles compact tool rows without changing the transcript", () => {
     const ui = tui();
     const viewer = new ConversationViewer(
@@ -341,13 +373,23 @@ describe("ConversationViewer", () => {
       done,
     );
     const initial = viewer.render(120).join("\n");
+    expect(initial).toContain("[preview]");
     const span = (viewer as any).timeline.getSnapshot().toolSpans[0];
     const hintY = viewerY(span.clickStartLine);
     expect(initial).not.toContain("<text>click to show more</text>");
     viewer.handleMouse(mouse("move", hintY, { button: "none" }));
     expect(viewer.render(120).join("\n")).toContain("<text>click to show more</text>");
+    viewer.handleMouse(mouse("move", 1, { button: "none", x: 104, screenX: 104, screenY: 1 }));
+    expect(viewer.render(120).join("\n")).toContain("<text><bold>[preview]</bold></text>");
+    viewer.handleMouse(mouse("press", 1, { x: 104, screenX: 104, screenY: 1 }));
+    viewer.handleMouse(mouse("release", 1, { x: 104, screenX: 104, screenY: 1 }));
+    viewer.handleMouse(mouse("click", 1, { x: 104, screenX: 104, clickCount: 1 }));
+    expect((viewer as any).toolPreview).toBeDefined();
+    viewer.handleInput("q");
+    expect((viewer as any).toolPreview).toBeUndefined();
+
     viewer.handleMouse(mouse("move", 1, { button: "none", x: 114, screenX: 114, screenY: 1 }));
-    expect(viewer.render(120).join("\n")).toContain("<text><bold>[esc]</bold></text>");
+    expect(viewer.render(120).join("\n")).toContain("<text><bold>[Esc]</bold></text>");
     expect(viewer.handleMouse(mouse("press", 1, { x: 114, screenX: 114 }))?.handled).toBe(true);
     expect(viewer.handleMouse(mouse("click", 1, { x: 114, screenX: 114, clickCount: 1 }))?.handled).toBe(true);
     expect(done).toHaveBeenCalledTimes(1);
