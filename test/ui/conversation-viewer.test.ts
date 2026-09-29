@@ -353,33 +353,10 @@ describe("ConversationViewer", () => {
     expect(done).toHaveBeenCalledTimes(1);
   });
 
-  it("focuses nearby tools with [ and ] and opens a complete read-only preview with w", () => {
+  it("renders the read-only tool preview in place and restores the parent on q", () => {
     const ui = tui();
-    let preview: any;
-    const previewDone = vi.fn();
-    const custom = vi.fn((factory: any) => {
-      preview = factory(ui, theme, undefined, previewDone);
-      const initialLines = preview.render(100);
-      const initial = initialLines.join("\\n");
-      expect(initial).toContain("Input");
-      expect(initial).toContain("Output");
-      expect(initial).toContain("line 1");
-      expect(initial).not.toContain("line 40");
-      expect(initialLines.at(-3)).toContain("↓");
-      expect(initialLines.slice(3, -3).some((line: string) => /[┃█]│$/.test(line))).toBe(true);
-      preview.handleInput("G");
-      const bottomLines = preview.render(100);
-      expect(bottomLines.join("\\n")).toContain("line 40");
-      expect(bottomLines[2]).toContain("↑");
-      preview.handleInput("k");
-      preview.handleInput("j");
-      preview.handleInput("g");
-      preview.handleInput("g");
-      expect(preview.render(100).join("\\n")).toContain("line 1");
-      preview.handleInput("q");
-      expect(previewDone).toHaveBeenCalledTimes(1);
-      return Promise.resolve(undefined);
-    });
+    const done = vi.fn();
+    const custom = vi.fn();
     const viewer = new ConversationViewer(
       ui,
       createStaticConversationSource([
@@ -391,7 +368,7 @@ describe("ConversationViewer", () => {
       record(),
       undefined,
       theme,
-      vi.fn(),
+      done,
       undefined,
       undefined,
       undefined,
@@ -402,17 +379,71 @@ describe("ConversationViewer", () => {
     const ids = timeline.getSnapshot().interactiveToolIds;
     viewer.handleInput("]");
     expect(timeline.getFocusedToolCallId()).toBe(ids[0]);
-    viewer.render(120);
+
     viewer.handleInput("w");
-    expect(custom).toHaveBeenCalledWith(expect.any(Function), expect.objectContaining({ overlay: true }));
-    preview.handleInput("G");
-    preview.handleInput("g");
-    preview.handleInput("g");
-    preview.handleInput("q");
+    expect(custom).not.toHaveBeenCalled();
+    expect((viewer as any).toolPreview).toBeDefined();
+    const initialLines = viewer.render(100);
+    const initial = initialLines.join("\n");
+    expect(initial).toContain("Input");
+    expect(initial).toContain("Output");
+    expect(initial).toContain("line 1");
+    expect(initial).not.toContain("line 40");
+    expect(initialLines.at(-3)).toContain("↓");
+
+    const parentMouse = vi.spyOn(timeline, "handleMouse");
+    viewer.handleMouse(mouse("click", viewerY(0)));
+    expect(parentMouse).not.toHaveBeenCalled();
+    viewer.handleInput("G");
+    expect(viewer.render(100).join("\n")).toContain("line 40");
+    viewer.handleInput("q");
+    expect(done).not.toHaveBeenCalled();
+    expect((viewer as any).toolPreview).toBeUndefined();
+
+    viewer.handleInput("w");
+    expect((viewer as any).toolPreview).toBeDefined();
+    viewer.handleInput("\x1b");
+    expect(done).not.toHaveBeenCalled();
+    expect((viewer as any).toolPreview).toBeUndefined();
+
     viewer.handleInput("]");
     expect(timeline.getFocusedToolCallId()).toBe(ids[1]);
     viewer.handleInput("[");
     expect(timeline.getFocusedToolCallId()).toBe(ids[0]);
+    viewer.handleInput("q");
+    expect(done).toHaveBeenCalledTimes(1);
+  });
+
+  it("closes the in-place tool preview from its mouse close control", () => {
+    const ui = tui();
+    const done = vi.fn();
+    const viewer = new ConversationViewer(
+      ui,
+      createStaticConversationSource([
+        { role: "assistant", content: [{ type: "toolCall", name: "read", arguments: { path: "first" } }] },
+        { role: "toolResult", toolName: "read", content: [{ type: "text", text: "preview output" }] },
+      ] as any),
+      record(),
+      undefined,
+      theme,
+      done,
+      undefined,
+      undefined,
+      undefined,
+      { pi: {} as any, ctx: { ui: { custom: vi.fn() } } as any, readOnly: true },
+    );
+    viewer.render(120);
+    viewer.handleInput("]");
+    viewer.handleInput("w");
+    expect((viewer as any).toolPreview).toBeDefined();
+
+    const press = viewer.handleMouse(mouse("press", 1, { x: 114, screenX: 114 }));
+    expect(press).toMatchObject({ handled: true, capture: true });
+    const click = viewer.handleMouse(mouse("click", 1, { x: 114, screenX: 114, clickCount: 1 }));
+    expect(click).toMatchObject({ handled: true });
+    expect((viewer as any).toolPreview).toBeUndefined();
+    expect(done).not.toHaveBeenCalled();
+    expect(viewer.render(120).join("\n")).toContain("read");
   });
 
   it("recalls submitted steer drafts with Alt+Up and its a-up alias", () => {

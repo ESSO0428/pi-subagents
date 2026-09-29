@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.5] - 2026-09-30
+
+### Fixed
+- **Read-only Tool Output previews now replace the parent conversation viewer in place instead of opening a nested overlay**, giving the preview the full viewer viewport and exclusive keyboard/mouse ownership; `Esc`, `q`, or the preview close control returns cleanly to the subagent conversation.
+
 ## [0.17.3] - 2026-09-18
 
 ### Added

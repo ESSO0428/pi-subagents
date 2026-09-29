@@ -29,19 +29,20 @@
   ```bash
   npm run lint        # biome
   npm run typecheck   # tsc --noEmit
-  npm run test        # vitest run
+  npm test            # vitest run
   ```
 - `npm run lint:fix` auto-fixes most style issues.
-- `npm run test` runs the whole suite, including `*-e2e.test.ts` files. To iterate on a single file, run it directly: `npx vitest run test/<file>.test.ts`.
+- `npm test` is the project test entrypoint and runs the full Vitest suite, including `*-e2e.test.ts` files. Targeted Vitest runs are allowed for iteration: `npx vitest run test/<file>.test.ts`; they do not replace the full-suite gate.
 - If you create or modify a test file, run it and iterate on the test or implementation until it passes.
 - `npm run build` compiles with `tsc`; run it only when verifying the build output or when requested.
 - For ad-hoc scripts, write them to a temp file (e.g. `/tmp`), run, edit if needed, remove when done. Don't embed multi-line scripts in `bash` commands.
 
 ### Dependency and release verification reminder
 
-- `vitest`, `typescript`, and Biome are local `devDependencies`; do not install them globally.
+- Vitest, TypeScript, and Biome are local `devDependencies`; the complete local dependency tree is mandatory. Do not install these tools globally or rely on globally available binaries.
 - `@shikijs/cli` is a runtime dependency for the optional async syntax-highlighting path. Do not move it to `devDependencies`; its transitive grammar packages are required at runtime.
-- Before verification or release, install the complete local dependency tree with the repository's lockfile when available, then run the full test/typecheck/build/pack checks. A missing `vitest` or `tsc` binary means the environment was not installed correctly; it is not a test assertion failure.
+- Run verification and release checks from the canonical repository checkout, not an npm-installed copy under `node_modules`. Install the complete local dependency tree with the repository's lockfile when available before checking anything.
+- A missing `vitest` or `tsc` binary means the environment was not installed correctly; it is not a test assertion failure. Targeted Vitest runs are iteration aids only; release verification must include the full project entrypoint, `npm test`.
 - Offline installs are only valid when the npm cache contains the complete dependency tree. If npm reports `ENOTCACHED` (for example, a missing `@shikijs/vscode-textmate`), record the cache miss and do not claim that tests passed.
 
 ### Upstream Pi API and test-fixture compatibility
@@ -93,6 +94,7 @@ Before a release:
   ```bash
   npm run lint
   npm run typecheck
+  npm test
   npm run test:e2e                 # faux/scripted e2e — no network, no keys
   npm run build
   ```
@@ -103,7 +105,7 @@ Before a release:
   `PI_E2E_LIVE=1` swaps the scripted faux suite for the live one (the faux suite is `skipIf(LIVE)`).
   (`prepublishOnly` runs lint + typecheck + test + build; the live e2e is the smoke test to run by hand before publishing.)
 
-**Never publish.** The user runs `npm version` / `npm publish` and any tagging manually. Do not run those commands unless the user explicitly asks.
+**Release, push, and publish gates are explicit.** Do not push release commits or publish the package until the required verification above has passed and the user has explicitly approved that action. The user runs `npm version`, any push/tagging, and `npm publish` manually. Never run `npm publish` or push on the user's behalf unless explicitly asked.
 
 ## User Override
 

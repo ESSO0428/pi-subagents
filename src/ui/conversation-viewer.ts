@@ -231,6 +231,7 @@ export class ConversationViewer implements Component {
   private steerHistoryIndex = -1;
   private steerHistoryDraft = "";
   private timeline: ConversationTimeline;
+  private toolPreview: FullToolPreview | undefined;
 
   constructor(
     private tui: TUI,
@@ -260,6 +261,10 @@ export class ConversationViewer implements Component {
   }
 
   handleInput(data: string): void {
+    if (this.toolPreview) {
+      this.toolPreview.handleInput(data);
+      return;
+    }
     if (this.composer) {
       if (matchesKey(data, Key.alt("up")) || data === "a-up" || data === "alt+up") {
         this.recallSteerDraft();
@@ -372,6 +377,7 @@ export class ConversationViewer implements Component {
   }
 
   handleMouse(event: TuiMouseEvent): { handled?: boolean; capture?: boolean; render?: boolean } | undefined {
+    if (this.toolPreview) return this.toolPreview.handleMouse(event);
     const innerW = Math.max(1, this.lastInnerW || event.width - 4);
     const closeHit = this.isCloseButtonHit(event.x, event.y, innerW);
     if (event.type === "move") {
@@ -438,6 +444,7 @@ export class ConversationViewer implements Component {
   }
 
   render(width: number): string[] {
+    if (this.toolPreview) return this.toolPreview.render(width);
     if (width < 6) return [];
     const th = this.theme;
     const innerW = Math.max(1, width - 4);
@@ -784,26 +791,24 @@ export class ConversationViewer implements Component {
     const block = focusedToolCallId
       ? this.cachedMessageBlocks.find((candidate) => candidate.toolCallId === focusedToolCallId)
       : this.currentBlock();
-    const custom = this.operations?.ctx?.ui?.custom;
-    if (block?.kind !== "tool" || typeof custom !== "function") return;
+    if (block?.kind !== "tool") return;
 
     const toolName = block.toolName || "tool";
     const args = block.args ?? block.toolArguments;
     const result = block.toolResult ?? block.result ?? { content: [] };
     const title = `${toolName} · full preview`;
-    void custom.call(this.operations!.ctx.ui, (tui, overlayTheme, _keybindings, done) => {
-      const body = createViewerCcstyleResult(
-        toolName,
-        result,
-        { expanded: true, isError: result.isError === true },
-        overlayTheme,
-        { args, maxChars: FULL_TOOL_PREVIEW_MAX_CHARS, diffConfig: { expandedPreviewMaxLines: Number.MAX_SAFE_INTEGER } },
-      );
-      return new FullToolPreview(tui, overlayTheme as Theme, title, body, done);
-    }, {
-      overlay: true,
-      overlayOptions: { anchor: "center", width: "85%", minWidth: 50, maxHeight: "80%", margin: 2 },
-    }).catch(() => undefined);
+    const body = createViewerCcstyleResult(
+      toolName,
+      result,
+      { expanded: true, isError: result.isError === true },
+      this.theme,
+      { args, maxChars: FULL_TOOL_PREVIEW_MAX_CHARS, diffConfig: { expandedPreviewMaxLines: Number.MAX_SAFE_INTEGER } },
+    );
+    this.toolPreview = new FullToolPreview(this.tui, this.theme, title, body, () => {
+      this.toolPreview = undefined;
+      this.tui.requestRender();
+    });
+    this.tui.requestRender();
   }
 
   private scrollBy(delta: number): void {
