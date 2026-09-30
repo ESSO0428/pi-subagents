@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.15] - 2026-09-30
+
+### Changed
+- **Removed the deprecated FleetView UI and its settings/runtime wiring**, leaving the Agents widget and workflow menu as the supported status surfaces.
+- **Capped Vitest at four workers** so local, CI, E2E, and prepublish test runs avoid CPU saturation on common development hosts.
+
+### Fixed
+- **Reduced Agents widget redraw latency** by making UI refresh requests use normal unforced renders by default.
+
 ## [0.17.14] - 2026-09-30
 
 ### Fixed

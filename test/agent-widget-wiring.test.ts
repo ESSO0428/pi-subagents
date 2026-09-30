@@ -208,7 +208,6 @@ describe("Agents panel wiring (real extension lifecycle)", () => {
     );
     expect(widgetRegistrations.length, "agents widget should register with a render factory").toBeGreaterThan(0);
     expect(widgetRegistrations.every((call) => call[2]?.placement === "aboveEditor")).toBe(true);
-    expect(ui.setWidget.mock.calls.some((call) => call[0] === "fleet")).toBe(false);
 
     await lifecycle.get("session_shutdown")?.({}, ctxWith(uiCtx()));
     expect(ui.setWidget).toHaveBeenCalledWith("agents", undefined);

@@ -12,6 +12,9 @@ export default defineConfig({
   // subagent session the extension spawns. dedupe alone is insufficient (it only
   // affects modules Vite resolves; without inline the runtime stays externalized).
   test: {
+    // Keep routine local, E2E, CI, and prepublish runs from occupying every CPU
+    // on common 8-core hosts while retaining enough parallelism for a fast suite.
+    maxWorkers: 4,
     server: { deps: { inline: [/@earendil-works\/pi-/] } },
     // Local reporting only — deliberately no `thresholds`, and not wired into
     // CI. src/index.ts is mostly the /agents wizard, which is TUI flow with

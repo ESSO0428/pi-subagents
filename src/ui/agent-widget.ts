@@ -437,7 +437,7 @@ export class AgentWidget {
   }
 
   /** Request a render on the currently registered TUI without touching input. */
-  requestUiRefresh(force = true): boolean {
+  requestUiRefresh(force = false): boolean {
     if (!this.tui || typeof this.tui.requestRender !== "function") return false;
     this.tui.requestRender(force);
     return true;

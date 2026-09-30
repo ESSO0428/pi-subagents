@@ -117,8 +117,8 @@ describe("createWorkflowHost — spawn mapping", () => {
     const [, , type, prompt, options] = stub.spawnAndWait.mock.calls[0];
     expect(type).toBe("general-purpose");
     expect(prompt).toBe("do the thing");
-    // The label is the child's display description, so the fleet list and the
-    // workflow tree name the same agent the same way.
+    // The label is the child's display description, so the workflow tree names
+    // the same agent the same way as the other agent surfaces.
     expect(options.description).toBe("review:bugs");
   });
 
@@ -197,7 +197,7 @@ describe("createWorkflowHost — spawn mapping", () => {
 
   it("stamps its children with the run id and keeps them out of the pool", async () => {
     // Ownership, not decoration: the stamp is what removes a workflow's agents
-    // from the fleet list, the widget and the `/agents` menus, and what keeps
+    // from the widget and the `/agents` menus, and what keeps
     // one fan-out from filling the session's concurrency pool.
     const stub = stubManager();
     const host = createWorkflowHost({
@@ -1053,38 +1053,6 @@ describe("--subagents-workflow-file", () => {
       },
       ...overrides,
     });
-
-  it("registers the fleet row as soon as a run starts, not when it settles", async () => {
-    // The regression this guards: a run's agents are owned by it, so their
-    // lifecycle callbacks no longer refresh the fleet — and nothing else did,
-    // which left a running workflow invisible in FleetView.
-    const booted = makePi();
-    subagentsExtension(booted.pi);
-    const context = uiCtx();
-    await booted.lifecycle.get("session_start")?.({}, context);
-    context.ui.setWidget.mockClear();
-
-    await booted.tools.get("SubagentWorkflow").execute(
-      "tc-fleet",
-      { script: inlineScript },
-      undefined, undefined, ctx({ cwd: hermetic.dir }),
-    );
-
-    const keys = context.ui.setWidget.mock.calls.map((call: any[]) => call[0]);
-    expect(keys, "the run has to claim its row before its first agent starts").toContain("fleet");
-  });
-
-  it("captures the UI at session_start, before any tool has executed", () => {
-    // A flag-launched workflow runs from session_start, so a UI captured only
-    // from tool_execution_start would leave it with no widget and no fleet row.
-    const booted = makePi();
-    subagentsExtension(booted.pi);
-    const context = uiCtx();
-
-    booted.lifecycle.get("session_start")?.({}, context);
-
-    expect(context.ui.onTerminalInput, "the fleet list only hooks input once it has a UI").toHaveBeenCalled();
-  });
 
   it("registers the flag at activation but does not read it there", () => {
     const booted = makePi({ [WORKFLOW_FILE_FLAG]: "ignored-at-activation.js" });

@@ -4,7 +4,6 @@ import subagentsExtension from "../src/index.js";
 import type { AgentConfig, AgentRecord } from "../src/types.js";
 import { type AgentActivity, AgentWidget } from "../src/ui/agent-widget.js";
 import { ConversationViewer } from "../src/ui/conversation-viewer.js";
-import { FleetList, type FleetUICtx } from "../src/ui/fleet-list.js";
 
 const TYPE = "colored-reviewer";
 const DISPLAY_NAME = "Code Reviewer";
@@ -179,47 +178,6 @@ describe("custom agent color runtime surfaces", () => {
       expect(output).toContain(PURPLE_BACKGROUND);
     } finally {
       widget.dispose();
-    }
-  });
-
-  it("renders the FleetView row with the display name and color", () => {
-    const record = makeRecord();
-    const manager = {
-      listAgents: () => [record],
-      abort: vi.fn(() => true),
-      steer: vi.fn(() => true),
-    } as unknown as ConstructorParameters<typeof FleetList>[0];
-    const fleet = new FleetList(manager, new Map());
-    let factory: WidgetFactory | undefined;
-    fleet.setUICtx({
-      setWidget: (_key, content) => {
-        if (typeof content === "function") factory = content as WidgetFactory;
-      },
-      onTerminalInput: vi.fn(() => vi.fn()),
-      getEditorText: vi.fn(() => ""),
-      notify: vi.fn(),
-      custom: (() => new Promise<undefined>(() => {})) as FleetUICtx["custom"],
-    });
-
-    try {
-      fleet.update();
-      const output = factory?.(
-        { requestRender: vi.fn(), terminal: { columns: 120, rows: 40 } },
-        theme,
-      ).render(120).join("\n");
-
-      expect(output).toContain(DISPLAY_NAME);
-      expect(output).toContain(PURPLE_BACKGROUND);
-
-      registerColoredReviewer("invalid");
-      const fallback = factory?.(
-        { requestRender: vi.fn(), terminal: { columns: 120, rows: 40 } },
-        theme,
-      ).render(120).join("\n");
-      expect(fallback).toContain(`<muted>${DISPLAY_NAME}</muted>`);
-      expect(fallback).not.toContain(PURPLE_BACKGROUND);
-    } finally {
-      fleet.dispose();
     }
   });
 
