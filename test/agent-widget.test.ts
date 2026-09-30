@@ -116,22 +116,20 @@ describe("AgentWidget", () => {
     expect(renderLines(manager, "foreground", () => "all")).toContain("foreground description");
   });
 
-  it("hides nested children in every coordinator widget mode", () => {
+  it("shows nested children in every coordinator widget mode", () => {
     const manager = {
       listAgents: () => [makeRecord("nested", { isBackground: true, parentAgentId: "parent" })],
     };
-    expect(renderLines(manager, "nested", () => "all")).toBe("");
-    expect(renderLines(manager, "nested", () => "background")).toBe("");
+    expect(renderLines(manager, "nested", () => "all")).toContain("nested description");
+    expect(renderLines(manager, "nested", () => "background")).toContain("nested description");
   });
 
-  it("hides a workflow's agents in every coordinator widget mode", () => {
-    // They belong to the run, which reports for them through its own card and
-    // its own row in the fleet list.
+  it("shows workflow child agents in every coordinator widget mode", () => {
     const manager = {
       listAgents: () => [makeRecord("child", { isBackground: true, workflowId: "wf_abc" })],
     };
-    expect(renderLines(manager, "child", () => "all")).toBe("");
-    expect(renderLines(manager, "child", () => "background")).toBe("");
+    expect(renderLines(manager, "child", () => "all")).toContain("child description");
+    expect(renderLines(manager, "child", () => "background")).toContain("child description");
   });
 
   it("excludes foreground agents in 'background' mode", () => {
@@ -491,11 +489,9 @@ describe("AgentWidget overflow accounting", () => {
     expect(footer(lines)).toBeUndefined();
   });
 
-  // A background resume runs an agent that already finished once. markFinished
-  // only seeds an age it has not seen before, so without markRunning the agent
-  // carries its previous run's age — already past the linger limit — and the
-  // resumed run's ✓ line never renders: the agent just disappears.
-  it("shows the completion line again after a finished agent is resumed", () => {
+  // Terminal records remain in the widget while their history is openable;
+  // resuming one does not require resetting a finished-turn age.
+  it("keeps the completion line visible after a finished agent is resumed", () => {
     const agent = record("resumed", "completed");
     const activity = new Map([[agent.id, {
       activeTools: new Map(),
@@ -511,11 +507,11 @@ describe("AgentWidget overflow accounting", () => {
       return (factory?.({ terminal: { columns: 200 }, requestRender: () => {} }, theme).render() ?? []).join("\n");
     };
 
-    // First run finishes and ages out of the widget.
+    // A completed record remains visible across turns.
     widget.markFinished(agent.id);
     widget.onTurnStart();
     widget.onTurnStart();
-    expect(render()).not.toContain("resumed description");
+    expect(render()).toContain("resumed description");
 
     // Background resume puts it back on the running list.
     agent.status = "running";

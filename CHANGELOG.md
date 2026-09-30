@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.13] - 2026-10-01
+
+### Fixed
+- **Repaired the Agents widget lifecycle and interaction model**: runtime agent updates are cached and rendered without stale rows, modal history selectors suspend background widget input, and nested agents remain visible under their owning parent.
+- **Preserved durable transcript-backed agents after runtime cleanup**, including model and accumulated-cost details for completed and historical rows.
+- **Improved widget layout resilience** with correct scrollbar bounds and restoration of the v0.17.6 selector foundation across short and long terminal layouts.
+
 ## [0.17.12] - 2026-09-30
 
 ### Fixed
