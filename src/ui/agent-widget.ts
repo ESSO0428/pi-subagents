@@ -286,6 +286,7 @@ export class AgentWidget {
   private lastStatusText: string | undefined;
   private lastSnapshot = "";
   private inputCleanup: (() => void) | undefined;
+  private navigationSuspended = false;
   private navigationActive = false;
   private selectedAgentId: string | undefined;
   private viewportStart = 0;
@@ -348,6 +349,16 @@ export class AgentWidget {
     }
   }
 
+  /** Temporarily stop global navigation from consuming input handled by another UI surface. */
+  suspendNavigation(): void {
+    this.navigationSuspended = true;
+  }
+
+  /** Resume global navigation after another UI surface has closed. */
+  resumeNavigation(): void {
+    this.navigationSuspended = false;
+  }
+
   /** Set the UI context (grabbed from first tool execution). */
   setUICtx(ctx: UICtx): boolean {
     if (ctx === this.uiCtx) return false;
@@ -357,6 +368,7 @@ export class AgentWidget {
     this.widgetRegistered = false;
     this.tui = undefined;
     this.lastStatusText = undefined;
+    this.navigationSuspended = false;
     this.navigationActive = false;
     this.selectedAgentId = undefined;
     this.viewportStart = 0;
@@ -385,7 +397,11 @@ export class AgentWidget {
   }
 
   /** Check if a finished agent should still be shown in the widget. */
-  private shouldShowFinished(agentId: string, status: string): boolean {
+  private shouldShowFinished(agentId: string, status: string, durable = false): boolean {
+    // A persisted transcript is a durable history row, not a transient
+    // completion notification. Keep it navigable after the one-turn visual
+    // linger expires; runtime GC must not make `/agents` history disappear.
+    if (durable) return true;
     const age = this.finishedTurnAge.get(agentId) ?? 0;
     const maxAge = ERROR_STATUSES.has(status) ? AgentWidget.ERROR_LINGER_TURNS : 1;
     return age < maxAge;
@@ -411,7 +427,7 @@ export class AgentWidget {
 
   private navigationAgents(): AgentRecord[] {
     const agents = this.widgetAgents().filter(agent =>
-      agent.status === "running" || agent.status === "queued" || (agent.completedAt !== undefined && this.shouldShowFinished(agent.id, agent.status)),
+      agent.status === "running" || agent.status === "queued" || (agent.completedAt !== undefined && this.shouldShowFinished(agent.id, agent.status, agent.transcriptPath !== undefined)),
     );
     return agents.filter(agent =>
       agent.status === "running" || agent.status === "queued" || (this.openOptions.canOpenHistory?.(agent) ?? true),
@@ -442,6 +458,7 @@ export class AgentWidget {
 
   private handleInput(data: string): { consume?: boolean; data?: string } | undefined {
     if (!this.uiCtx || isKeyRelease(data)) return undefined;
+    if (this.navigationSuspended) return undefined;
     if (!this.editorHasFocus()) {
       if (this.navigationActive) this.deactivate();
       return undefined;
@@ -556,7 +573,7 @@ export class AgentWidget {
     const queued = allAgents.filter(a => a.status === "queued");
     const finished = allAgents.filter(a =>
       a.status !== "running" && a.status !== "queued" && a.completedAt
-      && this.shouldShowFinished(a.id, a.status),
+      && this.shouldShowFinished(a.id, a.status, a.transcriptPath !== undefined),
     );
 
     const hasActive = running.length > 0 || queued.length > 0;
@@ -766,7 +783,7 @@ export class AgentWidget {
     for (const a of allAgents) {
       if (a.status === "running") { runningCount++; }
       else if (a.status === "queued") { queuedCount++; }
-      else if (a.completedAt && this.shouldShowFinished(a.id, a.status)) { hasFinished = true; }
+      else if (a.completedAt && this.shouldShowFinished(a.id, a.status, a.transcriptPath !== undefined)) { hasFinished = true; }
     }
     const hasActive = runningCount > 0 || queuedCount > 0;
 

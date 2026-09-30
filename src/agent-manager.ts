@@ -378,6 +378,8 @@ async function shutdownChildSession(session: AgentSession | undefined): Promise<
 
 export class AgentManager {
   private agents = new Map<string, AgentRecord>();
+  /** Lightweight terminal rows retained after runtime GC so durable history stays discoverable. */
+  private historyRecords = new Map<string, AgentRecord>();
   private cleanupInterval: ReturnType<typeof setInterval>;
   private onComplete?: OnAgentComplete;
   private onStart?: OnAgentStart;
@@ -709,6 +711,7 @@ export class AgentManager {
       const status = candidate.status;
       if (!id || !status || !terminal.has(status)) continue;
       if (this.agents.has(id) && !restoredIds.has(id)) continue;
+      this.historyRecords.delete(id);
       const type = typeof candidate.type === "string" ? candidate.type : undefined;
       const description = typeof candidate.description === "string" ? candidate.description : undefined;
       const startedAt = candidate.startedAt;
@@ -1588,9 +1591,12 @@ export class AgentManager {
   }
 
   listAgents(): AgentRecord[] {
-    return [...this.agents.values()].sort(
-      (a, b) => b.startedAt - a.startedAt,
-    );
+    // Prefer live records when a restored transcript shares an id with a
+    // runtime record. This keeps the history archive additive without ever
+    // producing duplicate menu rows.
+    const records = new Map(this.historyRecords);
+    for (const [id, record] of this.agents) records.set(id, record);
+    return [...records.values()].sort((a, b) => b.startedAt - a.startedAt);
   }
 
   abort(id: string): boolean {
@@ -1625,6 +1631,19 @@ export class AgentManager {
     // Detached before the shutdown starts, so the record leaves the map at once and
     // nothing can observe a session that is half torn down.
     record.session = undefined;
+    if (record.transcriptPath) {
+      // Keep a lightweight row discoverable by `/agents` and the Agents widget
+      // after runtime GC. The JSONL transcript is the source of truth; no live
+      // session, promise, or cleanup callback is retained in this archive.
+      record.abortController = undefined;
+      record.promise = undefined;
+      record.startGate = undefined;
+      record.outputCleanup = undefined;
+      record.historyCleanup = undefined;
+      record.worktree = undefined;
+      record.result = undefined;
+      this.historyRecords.set(id, record);
+    }
     this.agents.delete(id);
     // A failed startup keeps its (rejected) entry so a late awaitStartup still
     // sees it; drop it with the record so the map can't grow unbounded.
@@ -1670,10 +1689,12 @@ export class AgentManager {
   }
 
   /**
-   * Remove all completed/stopped/errored records immediately.
-   * Called on session start/switch so tasks from a prior session don't persist.
-   * Pass skipUnconsumed=true to preserve records the LLM hasn't read yet
-   * (resultConsumed=false) — they will be evicted by the 10-minute cleanup timer instead.
+   * Remove completed/stopped/errored runtime records immediately.
+   * Called on session start/switch so live handles from a prior session do not
+   * remain addressable. Transcript-backed rows move to `historyRecords` and
+   * stay visible to the UI; their JSONL history is the durable source of truth.
+   * Pass skipUnconsumed=true to preserve records the LLM has not read yet
+   * (resultConsumed=false) so the result remains available to the caller.
    */
   clearCompleted(skipUnconsumed = false): void {
     for (const [id, record] of this.agents) {

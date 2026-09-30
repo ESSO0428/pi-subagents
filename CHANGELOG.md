@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.12] - 2026-09-30
+
+### Fixed
+- **Agent history selectors now own arrow and Enter input while open**, preventing the background Agents widget from moving instead of the `/agents` history list.
+
+## [0.17.11] - 2026-09-30
+
+### Fixed
+- **Restored the v0.17.6 read-only agent selectors** with Pi's native `SelectList`, stable selected-row state, key-release filtering, and reliable `↑`/`↓`/`Enter`/`Esc`/`Ctrl-C` behavior.
+- **Kept transcript-backed history rows after runtime GC and session cleanup**, so the Agents panel and `/agents` history can reopen durable `.pi-subagents` conversations after completion.
+
 ## [0.17.10] - 2026-09-30
 
 ### Fixed

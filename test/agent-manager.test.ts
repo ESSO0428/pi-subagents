@@ -491,7 +491,8 @@ describe("AgentManager — Bug 3 clearCompleted", () => {
 
     expect(manager.listAgents()).toHaveLength(1);
     manager.clearCompleted();
-    expect(manager.listAgents()).toHaveLength(0);
+    expect(manager.getRecord(id)).toBeUndefined();
+    expect(manager.listAgents().map(record => record.id)).toContain(id);
   });
 
   it("clearCompleted does not remove running or queued agents", async () => {

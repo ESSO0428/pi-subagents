@@ -79,7 +79,9 @@ describe("AgentManager — record GC", () => {
     await vi.advanceTimersByTimeAsync(TICK);
 
     expect(manager.getRecord(id)).toBeUndefined();
-    expect(manager.listAgents().map(a => a.id)).not.toContain(id);
+    // Runtime state is evicted, but the transcript-backed row remains visible
+    // to `/agents` so GC cannot erase a conversation the user can reopen.
+    expect(manager.listAgents().map(a => a.id)).toContain(id);
     expect(dispose).toHaveBeenCalled();
   });
 

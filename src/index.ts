@@ -12,14 +12,14 @@
 
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
-import { defineTool, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, getAgentDir, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
-import { Container, isKeyRelease, Key, matchesKey, type SettingItem, SettingsList, Spacer, Text } from "@earendil-works/pi-tui";
+import { defineTool, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, getAgentDir, getSelectListTheme, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
+import { Container, isKeyRelease, Key, matchesKey, SelectList, type SettingItem, SettingsList, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { abortable } from "./abortable.js";
 import { hasAgentBadge, renderAgentName } from "./agent-color.js";
 import { buildNewAgentFile, disableInContent, enableInContent, isEmptyStub, locateAgentFile, personalAgentsDir, projectAgentsDir, serializeAgentFile } from "./agent-file-toggle.js";
 import { readAgentHistory } from "./agent-history.js";
-import { canOpenAgentHistory, splitAgentRecords } from "./agent-history-list.js";
+import { canOpenAgentHistory, formatAgentHistoryOption, splitAgentRecords } from "./agent-history-list.js";
 import { AgentManager, isTopLevelAgent } from "./agent-manager.js";
 import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, getRememberAgents, normalizeMaxTurns, resolveEffectiveMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, setRememberAgents, steerAgent } from "./agent-runner.js";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, getConfig, getFallbackSubagent, isDefaultsDisabled, NO_FALLBACK, registerAgents, resolveSpawnType, resolveType, setDefaultsDisabled, setFallbackSubagent } from "./agent-types.js";
@@ -572,8 +572,9 @@ export default function (pi: ExtensionAPI) {
   }
 
   // Background completion: route through group join or send individual nudge
-  let historySelectionIndex = 0;
-  let runningSelectionIndex = 0;
+  type AgentMenuSelection = { id?: string; index: number };
+  const historyAgentSelection: AgentMenuSelection = { index: 0 };
+  const runningAgentSelection: AgentMenuSelection = { index: 0 };
   const manager = new AgentManager((record) => {
     // Owned children — nested, or a workflow's — report only through their
     // owner: the parent's scoped tools, or the workflow's card, notification
@@ -804,8 +805,10 @@ export default function (pi: ExtensionAPI) {
       .filter((entry: any) => entry?.customType === "subagents:record" && entry?.data && typeof entry.data.id === "string")
       .map((entry: any) => entry.data as Partial<AgentRecord>);
     manager.restoreCompleted(restoredRecords);
-    historySelectionIndex = 0;
-    runningSelectionIndex = 0;
+    historyAgentSelection.id = undefined;
+    historyAgentSelection.index = 0;
+    runningAgentSelection.id = undefined;
+    runningAgentSelection.index = 0;
     if (ctx.hasUI && (ctx.mode === undefined || ctx.mode === "tui")) {
       widget.setUICtx(ctx.ui);
       widget.update();
@@ -2975,7 +2978,15 @@ Terse command-style prompts produce shallow, generic work.
       ctx.ui.notify(noAgentsMsg, "info");
     }
 
-    const choice = await ctx.ui.select("Agents", options);
+    // The widget also listens through the global terminal-input hook. Pause it
+    // while the top-level menu owns the same arrow/Enter keys.
+    widget.suspendNavigation();
+    let choice: string | undefined;
+    try {
+      choice = await ctx.ui.select("Agents", options);
+    } finally {
+      widget.resumeNavigation();
+    }
     if (!choice) return;
 
     if (choice.startsWith("Running agents (")) {
@@ -3069,52 +3080,110 @@ Terse command-style prompts produce shallow, generic work.
     }
   }
 
+  function makeUniqueAgentOptionLabels(pairs: Array<{ record: AgentRecord; label: string }>): void {
+    const counts = new Map<string, number>();
+    for (const pair of pairs) counts.set(pair.label, (counts.get(pair.label) ?? 0) + 1);
+    const used = new Set<string>();
+    for (const pair of pairs) {
+      if ((counts.get(pair.label) ?? 0) === 1) {
+        used.add(pair.label);
+        continue;
+      }
+      const suffix = ` · #${pair.record.id.slice(-8)}`;
+      let candidate = `${pair.label}${suffix}`;
+      let n = 2;
+      while (used.has(candidate)) candidate = `${pair.label}${suffix}-${n++}`;
+      pair.label = candidate;
+      used.add(candidate);
+    }
+  }
+
+  async function selectAgentFromReadOnlyList(
+    ctx: ExtensionCommandContext,
+    title: string,
+    pairs: Array<{ record: AgentRecord; label: string }>,
+    selection: AgentMenuSelection,
+  ): Promise<AgentRecord | undefined> {
+    const options = pairs.map(({ record, label }) => ({ value: record.id, label }));
+    const rememberedIndex = selection.id ? pairs.findIndex(({ record }) => record.id === selection.id) : -1;
+    const initialIndex = rememberedIndex >= 0
+      ? rememberedIndex
+      : Math.max(0, Math.min(selection.index, pairs.length - 1));
+
+    const remember = (id: string) => {
+      const index = pairs.findIndex(({ record }) => record.id === id);
+      if (index >= 0) {
+        selection.id = id;
+        selection.index = index;
+      }
+    };
+
+    widget.suspendNavigation();
+    let choice: string | undefined;
+    try {
+      choice = await ctx.ui.custom<string | undefined>((_tui, _theme, _kb, done) => {
+        const list = new SelectList(options, Math.min(options.length, 10), getSelectListTheme());
+        list.setSelectedIndex(initialIndex);
+        const initialItem = options[initialIndex];
+        if (initialItem) remember(initialItem.value);
+        list.onSelectionChange = item => remember(item.value);
+        list.onSelect = item => {
+          remember(item.value);
+          done(item.value);
+        };
+        list.onCancel = () => done(undefined);
+
+        const container = new Container();
+        container.addChild(new Text(title, 0, 0));
+        container.addChild(new Spacer(1));
+        container.addChild(list);
+        return {
+          render: (width: number) => container.render(width),
+          invalidate: () => container.invalidate(),
+          handleInput: (data: string) => {
+            if (!isKeyRelease(data)) list.handleInput(data);
+          },
+        };
+      });
+    } finally {
+      widget.resumeNavigation();
+    }
+
+    if (!choice) return undefined;
+    return pairs.find(({ record }) => record.id === choice)?.record;
+  }
+
   async function showRunningAgents(ctx: ExtensionCommandContext) {
-    const agents = manager.listAgents().filter(record => isTopLevelAgent(record) && (record.status === "running" || record.status === "queued"));
+    const agents = manager.listAgents().filter(record =>
+      isTopLevelAgent(record) && (record.status === "running" || record.status === "queued"),
+    );
     if (agents.length === 0) {
       ctx.ui.notify("No agents.", "info");
       return;
     }
-    const record = await ctx.ui.custom<AgentRecord | undefined>((_tui, _theme, _keys, done) => {
-      let index = Math.min(runningSelectionIndex, agents.length - 1);
-      return {
-        render: (width: number) => agents.map((agent, row) => `${row === index ? "→" : " "} ${agent.description}`.slice(0, width)),
-        invalidate() {},
-        handleInput(data: string) {
-          if (isKeyRelease(data)) return;
-          if (matchesKey(data, Key.down)) index = Math.min(agents.length - 1, index + 1);
-          else if (matchesKey(data, Key.up)) index = Math.max(0, index - 1);
-          else if (matchesKey(data, Key.enter)) { runningSelectionIndex = index; done(agents[index]); }
-          else if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) { runningSelectionIndex = index; done(undefined); }
-        },
-      };
-    });
+    const pairs = agents.map(record => ({
+      record,
+      label: `${getDisplayName(record.type)} (${record.description}) · ${record.toolUses} tools · ${record.status} · ${formatDuration(record.startedAt, record.completedAt)}`,
+    }));
+    makeUniqueAgentOptionLabels(pairs);
+    const record = await selectAgentFromReadOnlyList(ctx, "Running agents", pairs, runningAgentSelection);
     if (!record) return;
     await viewAgentConversation(ctx, record);
     await showRunningAgents(ctx);
   }
 
   async function showAgentHistory(ctx: ExtensionCommandContext): Promise<void> {
-    const history = manager.listAgents().filter(record => isTopLevelAgent(record) && canOpenAgentHistory(record, ctx.cwd));
-    if (history.length === 0) return;
-    const selected = await ctx.ui.custom<AgentRecord | undefined>((_tui, _theme, _keys, done) => {
-      let index = Math.min(historySelectionIndex, history.length - 1);
-      return {
-        render: (width: number) => history.map((record, row) => `${row === index ? "→" : " "} ${record.description}`.slice(0, width)),
-        invalidate() {},
-        handleInput(data: string) {
-          if (isKeyRelease(data)) return;
-          if (matchesKey(data, Key.down)) index = Math.min(history.length - 1, index + 1);
-          else if (matchesKey(data, Key.up)) index = Math.max(0, index - 1);
-          else if (matchesKey(data, Key.enter)) { historySelectionIndex = index; done(history[index]); }
-          else if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) done(undefined);
-        },
-      };
-    });
-    if (selected) {
-      await viewAgentConversation(ctx, selected);
-      await showAgentHistory(ctx);
+    const { history } = splitAgentRecords(manager.listAgents().filter(isTopLevelAgent), ctx.cwd);
+    if (history.length === 0) {
+      ctx.ui.notify("No agent history.", "info");
+      return;
     }
+    const pairs = history.map(record => ({ record, label: formatAgentHistoryOption(record, Date.now()) }));
+    makeUniqueAgentOptionLabels(pairs);
+    const record = await selectAgentFromReadOnlyList(ctx, "Agent history", pairs, historyAgentSelection);
+    if (!record) return;
+    await viewAgentConversation(ctx, record);
+    await showAgentHistory(ctx);
   }
 
   async function viewAgentConversation(ctx: ExtensionCommandContext, record: AgentRecord) {
