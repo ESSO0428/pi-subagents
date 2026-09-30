@@ -2978,15 +2978,7 @@ Terse command-style prompts produce shallow, generic work.
       ctx.ui.notify(noAgentsMsg, "info");
     }
 
-    // The widget also listens through the global terminal-input hook. Pause it
-    // while the top-level menu owns the same arrow/Enter keys.
-    widget.suspendNavigation();
-    let choice: string | undefined;
-    try {
-      choice = await ctx.ui.select("Agents", options);
-    } finally {
-      widget.resumeNavigation();
-    }
+    const choice = await ctx.ui.select("Agents", options);
     if (!choice) return;
 
     if (choice.startsWith("Running agents (")) {
@@ -3118,36 +3110,30 @@ Terse command-style prompts produce shallow, generic work.
       }
     };
 
-    widget.suspendNavigation();
-    let choice: string | undefined;
-    try {
-      choice = await ctx.ui.custom<string | undefined>((_tui, _theme, _kb, done) => {
-        const list = new SelectList(options, Math.min(options.length, 10), getSelectListTheme());
-        list.setSelectedIndex(initialIndex);
-        const initialItem = options[initialIndex];
-        if (initialItem) remember(initialItem.value);
-        list.onSelectionChange = item => remember(item.value);
-        list.onSelect = item => {
-          remember(item.value);
-          done(item.value);
-        };
-        list.onCancel = () => done(undefined);
+    const choice = await ctx.ui.custom<string | undefined>((_tui, _theme, _kb, done) => {
+      const list = new SelectList(options, Math.min(options.length, 10), getSelectListTheme());
+      list.setSelectedIndex(initialIndex);
+      const initialItem = options[initialIndex];
+      if (initialItem) remember(initialItem.value);
+      list.onSelectionChange = item => remember(item.value);
+      list.onSelect = item => {
+        remember(item.value);
+        done(item.value);
+      };
+      list.onCancel = () => done(undefined);
 
-        const container = new Container();
-        container.addChild(new Text(title, 0, 0));
-        container.addChild(new Spacer(1));
-        container.addChild(list);
-        return {
-          render: (width: number) => container.render(width),
-          invalidate: () => container.invalidate(),
-          handleInput: (data: string) => {
-            if (!isKeyRelease(data)) list.handleInput(data);
-          },
-        };
-      });
-    } finally {
-      widget.resumeNavigation();
-    }
+      const container = new Container();
+      container.addChild(new Text(title, 0, 0));
+      container.addChild(new Spacer(1));
+      container.addChild(list);
+      return {
+        render: (width: number) => container.render(width),
+        invalidate: () => container.invalidate(),
+        handleInput: (data: string) => {
+          if (!isKeyRelease(data)) list.handleInput(data);
+        },
+      };
+    });
 
     if (!choice) return undefined;
     return pairs.find(({ record }) => record.id === choice)?.record;

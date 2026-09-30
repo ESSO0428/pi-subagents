@@ -267,8 +267,6 @@ export class AgentWidget {
   private inputUnsub: (() => void) | undefined;
   /** Whether arrow keys currently navigate the agent roster. */
   private navigationActive = false;
-  /** Number of modal surfaces currently owning this listener's input suspension. */
-  private navigationSuspensionDepth = 0;
   /** Stable identity of the selected row, so roster changes do not jump selection. */
   private selectedAgentId: string | undefined;
   /** Last logical roster index of the selected row, used when it disappears. */
@@ -408,16 +406,6 @@ export class AgentWidget {
     return this.cachedRoster;
   }
 
-  /** Suspend only this listener's keyboard ownership; never alter the widget. */
-  suspendNavigation(): void {
-    this.navigationSuspensionDepth++;
-  }
-
-  /** Restore one layer of this listener's keyboard ownership. */
-  resumeNavigation(): void {
-    if (this.navigationSuspensionDepth > 0) this.navigationSuspensionDepth--;
-  }
-
   /** Set the UI context (grabbed from first tool execution). */
   setUICtx(ctx: UICtx): boolean {
     if (ctx === this.uiCtx) return false;
@@ -431,7 +419,6 @@ export class AgentWidget {
     this.tui = undefined;
     this.lastStatusText = undefined;
     this.lastRenderKey = undefined;
-    this.navigationSuspensionDepth = 0;
     this.navigationActive = false;
     this.selectedAgentId = undefined;
     this.selectedRosterIndex = 0;
@@ -573,7 +560,6 @@ export class AgentWidget {
   /** Handle terminal input before it reaches the focused prompt editor. */
   handleKey(data: string): { consume?: boolean; data?: string } | undefined {
     if (!this.uiCtx || isKeyRelease(data)) return undefined;
-    if (this.navigationSuspensionDepth > 0) return undefined;
     if (!this.editorHasFocus()) {
       if (this.navigationActive) this.deactivate();
       return undefined;
@@ -1111,7 +1097,6 @@ export class AgentWidget {
     this.tui = undefined;
     this.lastStatusText = undefined;
     this.lastRenderKey = undefined;
-    this.navigationSuspensionDepth = 0;
     this.navigationActive = false;
     this.selectedAgentId = undefined;
     this.selectedRosterIndex = 0;

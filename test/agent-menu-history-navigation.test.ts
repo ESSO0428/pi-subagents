@@ -47,7 +47,6 @@ function selectedRow(component: CustomComponent): string {
 
 function makeHarness(custom: (factory: CustomFactory, options?: unknown) => Promise<unknown>) {
   const eventHandlers = new Map<string, Set<(...args: any[]) => any>>();
-  let terminalInputHandler: ((data: string) => { consume?: boolean; data?: string } | undefined) | undefined;
   const events = {
     on: (name: string, handler: (...args: any[]) => any) => {
       const handlersForEvent = eventHandlers.get(name) ?? new Set<(...args: any[]) => any>();
@@ -78,12 +77,7 @@ function makeHarness(custom: (factory: CustomFactory, options?: unknown) => Prom
     notify: () => {},
     setWidget: () => {},
     setStatus: () => {},
-    onTerminalInput: (handler: (data: string) => { consume?: boolean; data?: string } | undefined) => {
-      terminalInputHandler = handler;
-      return () => {
-        if (terminalInputHandler === handler) terminalInputHandler = undefined;
-      };
-    },
+    onTerminalInput: () => () => {},
     select: async (title: string, options: string[]) => {
       if (title !== "Agents" || agentsMenuVisits++ > 0) return undefined;
       return options.find(option => option.startsWith("Agent history ("));
@@ -95,7 +89,6 @@ function makeHarness(custom: (factory: CustomFactory, options?: unknown) => Prom
     command: command!,
     handlers,
     tools,
-    terminalInput: (data: string) => terminalInputHandler?.(data),
     context: (cwd: string, branch: unknown[]) => ({
       cwd,
       ui,
@@ -169,17 +162,12 @@ describe("/agents history navigation", () => {
         return new Promise(resolve => {
           const component = factory({}, {}, {}, resolve);
           selectedRows.push(selectedRow(component));
-          const dispatch = (data: string) => {
-            const result = harness.terminalInput(data);
-            if (!result?.consume) component.handleInput?.(data);
-            return result;
-          };
           if (call === 0) {
-            expect(dispatch("\x1b[B")).toBeUndefined();
+            component.handleInput?.("\x1b[B");
             expect(selectedRow(component)).toContain("Second history");
-            expect(dispatch("\r")).toBeUndefined();
+            component.handleInput?.("\r");
           } else {
-            dispatch("\x1b");
+            component.handleInput?.("\x1b");
           }
         });
       }
