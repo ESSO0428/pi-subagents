@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.17.14] - 2026-10-01
+## [0.17.14] - 2026-09-30
 
 ### Fixed
 - **Restored focus-gated selector routing** so agent history selectors receive navigation input without suspending the background Agents widget.
