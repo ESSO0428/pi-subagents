@@ -184,6 +184,8 @@ interface SpawnOptions {
   cwd?: string;
   /** Resolved invocation snapshot captured for UI display. */
   invocation?: AgentInvocation;
+  /** Explicit nonblocking completion wait group for this background agent. */
+  waitGroupId?: string;
   /** Parent abort signal — when aborted, the subagent is also stopped. */
   signal?: AbortSignal;
   /** Called on tool start/end with activity info (for streaming progress to UI). */
@@ -376,6 +378,7 @@ export class AgentManager {
       // have no inline surface — stay visible instead of vanishing.
       isBackground: options.isBackground,
       invocation: options.invocation,
+      waitGroupId: options.waitGroupId,
     };
     this.agents.set(id, record);
     this.recoveryCwds.set(id, ctx.cwd);
@@ -807,6 +810,9 @@ export class AgentManager {
       record.status = "stopped";
       record.completedAt = Date.now();
       this.checkpoint(record);
+      if (record.waitGroupId) {
+        try { this.onComplete?.(record); } catch { /* ignore completion side-effect errors */ }
+      }
       return true;
     }
 
@@ -885,6 +891,9 @@ export class AgentManager {
         record.status = "stopped";
         record.completedAt = Date.now();
         this.checkpoint(record);
+        if (record.waitGroupId) {
+          try { this.onComplete?.(record); } catch { /* ignore completion side-effect errors */ }
+        }
         count++;
       }
     }

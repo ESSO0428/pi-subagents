@@ -37,6 +37,7 @@ export const SUBAGENT_TOOL_NAMES = {
   AGENT: "Agent",
   GET_RESULT: "get_subagent_result",
   STEER: "steer_subagent",
+  WAIT_GROUP: "subagent_wait_group",
 } as const;
 
 /** Names of tools registered by this extension that subagents must NOT inherit. */

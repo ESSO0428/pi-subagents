@@ -61,6 +61,38 @@ Agent({
 
 Foreground agents block until complete and return results inline. Background agents return an ID immediately and notify you on completion.
 
+### Wait groups
+
+Use `wait: true` on background agents to suppress individual completion notifications and receive one grouped notification instead:
+
+```
+const group = subagent_wait_group({
+  action: "create",
+  summary: "Compare notification group API designs",
+})
+
+Agent({
+  subagent_type: "Explore",
+  prompt: "Design a group-handle API",
+  description: "Design group handle",
+  run_in_background: true,
+  wait: true,
+  wait_group: group.group_id,
+})
+
+Agent({
+  subagent_type: "Plan",
+  prompt: "Design a batch API",
+  description: "Design batch API",
+  run_in_background: true,
+  wait: true,
+  wait_group: group.group_id,
+  wait_group_done: true,
+})
+```
+
+`subagent_wait_group` supports `create`, `update`, and `seal`. A sealed group sends one notification after every member reaches a terminal state (`completed`, `steered`, `error`, `stopped`, or `aborted`). If `wait: true` is used without `wait_group`, the extension creates and seals a one-agent implicit group.
+
 ### Scheduling
 
 Add a `schedule` field to register the agent to fire later instead of running now:

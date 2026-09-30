@@ -103,6 +103,8 @@ export interface AgentRecord {
   worktreeResult?: { hasChanges: boolean; branch?: string };
   /** The tool_use_id from the original Agent tool call. */
   toolCallId?: string;
+  /** Explicit nonblocking completion wait group for this background agent. */
+  waitGroupId?: string;
   /** Path to the streaming output transcript file. */
   outputFile?: string;
   /** Absolute path to the durable project-local transcript while live. */
@@ -164,6 +166,10 @@ export interface NotificationDetails {
   resultPreview: string;
   /** Additional agents in a group notification. */
   others?: NotificationDetails[];
+  /** Stable ID for an explicit wait-group notification. */
+  groupId?: string;
+  /** Human-readable summary for an explicit wait-group notification. */
+  groupSummary?: string;
 }
 
 export interface EnvInfo {

@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.19] - 2026-09-30
+
+### Added
+- **Added nonblocking subagent wait groups**: `Agent` now accepts `wait: true` for background notification grouping, with `wait_group` and `wait_group_done` for explicit multi-agent groups, plus the `subagent_wait_group` tool to create, rename, and seal groups. A sealed wait group emits one completion notification after all members reach a terminal state, avoiding blocking waits and notification spam.
+
 ## [0.17.18] - 2026-09-30
 
 ### Changed

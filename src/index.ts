@@ -5,6 +5,7 @@
  *   Agent             — LLM-callable: spawn a sub-agent
  *   get_subagent_result  — LLM-callable: check background agent status/result
  *   steer_subagent       — LLM-callable: send a steering message to a running agent
+ *   subagent_wait_group  — LLM-callable: create, update, or seal a wait group
  *
  * Commands:
  *   /agents                 — Interactive agent management menu
@@ -51,6 +52,7 @@ import {
 } from "./ui/agent-widget.js";
 import { showSchedulesMenu } from "./ui/schedule-menu.js";
 import { addUsage, getLifetimeTotal, getSessionContextPercent, type LifetimeUsage } from "./usage.js";
+import { WaitGroupManager } from "./wait-group.js";
 
 // ---- Shared helpers ----
 
@@ -310,7 +312,10 @@ export default function (pi: ExtensionAPI) {
       }
 
       const all = [d, ...(d.others ?? [])];
-      return new Text(all.map(renderOne).join("\n"), 0, 0);
+      const groupHeader = d.groupSummary
+        ? theme.fg("dim", `Wait group: ${d.groupSummary} (${d.groupId ?? ""})`)
+        : undefined;
+      return new Text([groupHeader, all.map(renderOne).join("\n")].filter(Boolean).join("\n"), 0, 0);
     }
   );
 
@@ -411,6 +416,42 @@ export default function (pi: ExtensionAPI) {
     30_000,
   );
 
+  // Explicit wait groups are separate from smart/group join mode: they never
+  // time out or partially deliver, and are released only when sealed.
+  const waitGroups = new WaitGroupManager((groupId, summary, records) => {
+    for (const record of records) {
+      agentActivity.delete(record.id);
+      widget.markFinished(record.id);
+    }
+
+    const groupKey = `wait-group:${groupId}`;
+    scheduleNudge(groupKey, () => {
+      const notifications = records.map(record => {
+        const consumed = record.resultConsumed ? "\n(Result already retrieved via get_subagent_result.)" : "";
+        return formatTaskNotification(record, 300) + consumed;
+      }).join("\n\n");
+      const consumedCount = records.filter(record => record.resultConsumed).length;
+      const consumedNote = consumedCount > 0
+        ? ` ${consumedCount} result${consumedCount === 1 ? " was" : "s were"} already retrieved.`
+        : "";
+      const [first, ...rest] = records;
+      const details = buildNotificationDetails(first, 300, agentActivity.get(first.id));
+      details.groupId = groupId;
+      details.groupSummary = summary;
+      if (rest.length > 0) {
+        details.others = rest.map(record => buildNotificationDetails(record, 300, agentActivity.get(record.id)));
+      }
+
+      pi.sendMessage<NotificationDetails>({
+        customType: "subagent-notification",
+        content: `Background agent wait group completed: ${summary} (group ${groupId}).${consumedNote}\n\n${notifications}\n\nUse get_subagent_result for full output.`,
+        display: true,
+        details,
+      }, { deliverAs: "followUp", triggerTurn: true });
+    });
+    widget.update();
+  });
+
   /** Helper: build event data for lifecycle events from an AgentRecord. */
   function buildEventData(record: AgentRecord) {
     const durationMs = record.completedAt ? record.completedAt - record.startedAt : Date.now() - record.startedAt;
@@ -462,6 +503,17 @@ export default function (pi: ExtensionAPI) {
       invocation: record.invocation,
       transcriptPath: record.transcriptPath,
     });
+
+    // Explicit wait-group members never emit individual notifications. Result
+    // consumption does not remove membership; the sealed group still delivers
+    // exactly one notification for all terminal members.
+    if (record.waitGroupId) {
+      waitGroups.onAgentComplete(record);
+      agentActivity.delete(record.id);
+      widget.markFinished(record.id);
+      widget.update();
+      return;
+    }
 
     // Skip notification if result was already consumed via get_subagent_result
     if (record.resultConsumed) {
@@ -633,6 +685,8 @@ export default function (pi: ExtensionAPI) {
     manager.abortAll();
     for (const timer of pendingNudges.values()) clearTimeout(timer);
     pendingNudges.clear();
+    groupJoin.dispose();
+    waitGroups.dispose();
     widget.dispose();
     manager.dispose();
   });
@@ -856,6 +910,7 @@ Custom agents: .pi/agents/<name>.md (project) or ${getAgentDir()}/agents/<name>.
 Notes:
 - description: 3-5 words (shown in UI). Prompts must be self-contained — the agent has not seen this conversation.
 - Parallel work: one message, multiple Agent calls, run_in_background: true on each. You are notified when background agents finish — never poll or sleep.
+- For nonblocking grouped notification, add wait: true. Use subagent_wait_group to create/update/seal explicit groups; wait_group_done seals after the final spawn.
 - The result is not shown to the user — summarize it for them. Verify an agent's claimed code changes before reporting work done.
 - resume continues a previous agent by ID; steer_subagent messages a running one.
 - isolation: "worktree" runs the agent in an isolated git worktree; changes land on a branch.`;
@@ -880,6 +935,7 @@ If the target is already known, use a direct tool — \`read\` for a known path,
 - When the agent is done, it returns a single message back to you. The result is not visible to the user — to show the user, send a text message with a concise summary.
 - Trust but verify: an agent's summary describes what it intended to do, not necessarily what it did. When an agent writes or edits code, check the actual changes before reporting work as done.
 - Use run_in_background for work you don't need immediately. You will be notified when it completes — do NOT poll or sleep waiting for it. Continue with other work or respond to the user instead.
+- For nonblocking grouped notification, set wait: true with run_in_background: true. Omit wait_group for a one-agent implicit group, or create an explicit group with subagent_wait_group and seal it (or set wait_group_done: true on the final Agent call).
 - Foreground vs background: use foreground (default) when you need the agent's results before you can proceed. Use background when you have genuinely independent work to do in parallel.
 - Use resume with an agent ID to continue a previous agent's work. A new (non-resume) Agent call starts a fresh agent with no memory of prior runs, so the prompt must be self-contained.
 - Use steer_subagent to send mid-run messages to a running background agent.
@@ -959,6 +1015,7 @@ Terse command-style prompts produce shallow, generic work.
       "Use Agent with specialized agents when the task matches an agent type's description. Subagents are valuable for parallelizing independent queries or for protecting the main context window from excessive results, but should not be used excessively when not needed. Importantly, avoid duplicating work that subagents are already doing — if you delegate research to a subagent, do not also perform the same searches yourself.",
       "For broad codebase exploration or research, spawn Agent with an appropriate subagent_type (e.g. Explore). Otherwise use direct tools (read, grep, find) when the target is already known.",
       "When an agent runs in the background, you will be notified on completion — do not poll or sleep waiting for it. Continue with other work instead.",
+      "For a nonblocking grouped notification, use wait: true with run_in_background: true; create/update/seal explicit groups with subagent_wait_group.",
       "Trust but verify: an agent's summary describes intent, not outcome. When an agent writes or edits code, check the actual changes before reporting work as done.",
     ],
     parameters: Type.Object({
@@ -991,6 +1048,22 @@ Terse command-style prompts produce shallow, generic work.
       run_in_background: Type.Optional(
         Type.Boolean({
           description: "Set to true to run in background. Returns agent ID immediately. You will be notified on completion.",
+        }),
+      ),
+      wait: Type.Optional(
+        Type.Boolean({
+          description: "With run_in_background: true, suppress individual completion notification and wait for a sealed group notification. This never blocks execution.",
+        }),
+      ),
+      wait_group: Type.Optional(
+        Type.String({
+          minLength: 1,
+          description: "Existing explicit wait-group ID created by subagent_wait_group. Requires wait: true.",
+        }),
+      ),
+      wait_group_done: Type.Optional(
+        Type.Boolean({
+          description: "With wait: true, seal wait_group after this agent is spawned. Use on the final member.",
         }),
       ),
       resume: Type.Optional(
@@ -1169,6 +1242,9 @@ Terse command-style prompts produce shallow, generic work.
       const thinking = resolvedConfig.thinking;
       const inheritContext = resolvedConfig.inheritContext;
       const runInBackground = resolvedConfig.runInBackground;
+      const wait = params.wait === true;
+      const waitGroup = typeof params.wait_group === "string" ? params.wait_group.trim() : undefined;
+      const waitGroupDone = params.wait_group_done === true;
       const isolated = resolvedConfig.isolated;
       const isolation = resolvedConfig.isolation;
       // Whether this spawn writes its .output transcript. Per-agent
@@ -1227,6 +1303,19 @@ Terse command-style prompts produce shallow, generic work.
         modelName,
         tags: agentTags.length > 0 ? agentTags : undefined,
       };
+
+      if ((waitGroup || waitGroupDone) && !wait) {
+        return textResult("wait_group and wait_group_done require wait: true.");
+      }
+      if (wait && !runInBackground) {
+        return textResult("wait: true requires run_in_background: true; it controls nonblocking background notifications.");
+      }
+      if (wait && params.schedule) {
+        return textResult("Cannot combine wait: true with schedule — scheduled jobs are separate future runs.");
+      }
+      if (wait && params.resume) {
+        return textResult("Cannot combine wait: true with resume — wait groups apply to fresh background spawns.");
+      }
 
       // ---- Schedule: register a job, don't spawn now ----
       if (params.schedule) {
@@ -1300,8 +1389,21 @@ Terse command-style prompts produce shallow, generic work.
         // Wrap onSessionCreated to wire output file streaming.
         // The callback reads the transcript paths installed synchronously by
         // onSpawned before the agent can queue or start.
-        let id: string;
-        const joinMode = resolveJoinMode(defaultJoinMode, true);
+        let id = "";
+        let effectiveWaitGroupId: string | undefined;
+        let implicitWaitGroupId: string | undefined;
+        if (wait) {
+          if (waitGroup) {
+            if (!waitGroups.hasGroup(waitGroup)) {
+              return textResult(`Wait group not found: "${waitGroup}". Create it with subagent_wait_group first.`);
+            }
+            effectiveWaitGroupId = waitGroup;
+          } else {
+            implicitWaitGroupId = waitGroups.create(params.description);
+            effectiveWaitGroupId = implicitWaitGroupId;
+          }
+        }
+        const joinMode = wait ? undefined : resolveJoinMode(defaultJoinMode, true);
         const origBgOnSession = bgCallbacks.onSessionCreated;
         bgCallbacks.onSessionCreated = (session: any) => {
           origBgOnSession(session);
@@ -1322,12 +1424,17 @@ Terse command-style prompts produce shallow, generic work.
             isBackground: true,
             isolation,
             invocation: agentInvocation,
+            waitGroupId: effectiveWaitGroupId,
             onSpawned: (spawnedId) => {
+              id = spawnedId;
               attachTranscript(manager.getRecord(spawnedId), spawnedId);
+              if (effectiveWaitGroupId) waitGroups.addAgent(effectiveWaitGroupId, spawnedId);
             },
             ...bgCallbacks,
           });
         } catch (err) {
+          if (effectiveWaitGroupId && id) waitGroups.removeAgent(effectiveWaitGroupId, id);
+          if (implicitWaitGroupId) waitGroups.discard(implicitWaitGroupId);
           return textResult(err instanceof Error ? err.message : String(err));
         }
 
@@ -1339,7 +1446,9 @@ Terse command-style prompts produce shallow, generic work.
           record.toolCallId = toolCallId;
         }
 
-        if (joinMode == null || joinMode === 'async') {
+        if (effectiveWaitGroupId) {
+          if (implicitWaitGroupId || waitGroupDone) waitGroups.seal(effectiveWaitGroupId);
+        } else if (joinMode == null || joinMode === 'async') {
           // Foreground/no join mode or explicit async — not part of any batch
         } else {
           // smart or group — add to current batch
@@ -1370,7 +1479,10 @@ Terse command-style prompts produce shallow, generic work.
           `Description: ${params.description}\n` +
           (record?.outputFile ? `Output file: ${record.outputFile}\n` : "") +
           (isQueued ? `Position: queued (max ${manager.getMaxConcurrent()} concurrent)\n` : "") +
-          `\nYou will be notified when this agent completes.\n` +
+          (effectiveWaitGroupId
+            ? `\nWait group: ${effectiveWaitGroupId}${implicitWaitGroupId || waitGroupDone ? " (sealed)" : " (open — seal it with subagent_wait_group)"}.\n` +
+              `You will receive one grouped notification when the sealed wait group completes.\n`
+            : `\nYou will be notified when this agent completes.\n`) +
           `Use get_subagent_result to retrieve full results, or steer_subagent to send it messages.\n` +
           `Do not duplicate this agent's work.`,
           { ...detailBase, toolUses: 0, tokens: "", durationMs: 0, status: "background" as const, agentId: id },
@@ -1491,6 +1603,75 @@ Terse command-style prompts produce shallow, generic work.
         (record.result?.trim() || "No output."),
         details,
       );
+    },
+  }));
+
+  // ---- subagent_wait_group tool ----
+
+  pi.registerTool(defineTool({
+    name: SUBAGENT_TOOL_NAMES.WAIT_GROUP,
+    label: "Subagent Wait Group",
+    description:
+      "Create, update, or seal a nonblocking wait group for background Agent calls. " +
+      "A sealed group sends one completion notification after all member agents finish.",
+    promptSnippet: "Create, update, or seal a grouped subagent completion notification",
+    parameters: Type.Object({
+      action: Type.String({
+        description: "Operation: create, update, or seal.",
+      }),
+      group_id: Type.Optional(Type.String({
+        minLength: 1,
+        description: "Wait group ID. Required for update and seal; optional custom ID for create.",
+      })),
+      summary: Type.Optional(Type.String({
+        minLength: 1,
+        description: "Human-readable group summary. Required for create and update; shown in the eventual notification.",
+      })),
+    }),
+    execute: async (_toolCallId, params) => {
+      const action = String(params.action).trim();
+      const groupId = typeof params.group_id === "string" ? params.group_id.trim() : undefined;
+      const summary = typeof params.summary === "string" ? params.summary.trim() : undefined;
+
+      try {
+        if (action === "create") {
+          if (!summary) return textResult("summary is required when creating a wait group.");
+          const createdId = waitGroups.create(summary, groupId);
+          return textResult(
+            `Created subagent wait group.\n` +
+            `Group ID: ${createdId}\n` +
+            `Summary: ${summary}\n\n` +
+            `Use Agent with run_in_background: true, wait: true, wait_group: "${createdId}". ` +
+            `Seal the group after adding members.`,
+          );
+        }
+        if (action === "update") {
+          if (!groupId) return textResult("group_id is required when updating a wait group.");
+          if (!summary) return textResult("summary is required when updating a wait group.");
+          waitGroups.update(groupId, summary);
+          return textResult(`Updated subagent wait group ${groupId}.\nSummary: ${summary}`);
+        }
+        if (action === "seal") {
+          if (!groupId) return textResult("group_id is required when sealing a wait group.");
+          const snapshot = waitGroups.getGroup(groupId);
+          const delivered = waitGroups.seal(groupId);
+          if (!snapshot) return textResult(`Wait group not found: "${groupId}".`);
+          if (snapshot.agentIds.length === 0) {
+            return textResult(`Sealed empty subagent wait group ${groupId}. No completion notification will be sent.`);
+          }
+          return textResult(
+            `Sealed subagent wait group ${groupId}.\n` +
+            `Summary: ${snapshot.summary}\n` +
+            `Members: ${snapshot.agentIds.length}\n` +
+            (delivered
+              ? "All members were already complete; notification has been queued."
+              : "You will receive one notification after all members finish."),
+          );
+        }
+        return textResult(`Unknown action "${action}". Use create, update, or seal.`);
+      } catch (err) {
+        return textResult(err instanceof Error ? err.message : String(err));
+      }
     },
   }));
 
