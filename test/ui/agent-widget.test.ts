@@ -277,6 +277,7 @@ describe("AgentWidget live records", () => {
 
     harness.input("\u001b[B");
     harness.input("\u001b[B");
+    expect(harness.render().join("\n")).toContain("├─ ●");
     expect(harness.input("\u001b[A")).toEqual({ consume: true });
     expect(harness.input("\r")).toEqual({ consume: true });
     expect(opened).toEqual([{ id: "running", mode: "live" }]);

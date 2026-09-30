@@ -122,6 +122,31 @@ function makeRecord(cwd: string, id: string, description: string, startedAt: num
 }
 
 describe("/agents history navigation", () => {
+  it("handles protocol arrow events and Ctrl-C in the history selector", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "pi-subagents-menu-test-"));
+    tempDirectories.push(cwd);
+    const first = makeRecord(cwd, "agent-1", "First history", 2);
+    const second = makeRecord(cwd, "agent-2", "Second history", 1);
+    let firstRender = "";
+    let secondRender = "";
+
+    const harness = makeHarness(async (factory) => new Promise(resolve => {
+      const component = factory({}, {}, {}, resolve);
+      firstRender = selectedRow(component);
+      component.handleInput?.("\x1b[1;1:3B");
+      expect(selectedRow(component)).toContain("First history");
+      component.handleInput?.("\x1b[B");
+      secondRender = selectedRow(component);
+      component.handleInput?.("\x03");
+    }));
+
+    await harness.handlers.get("session_start")?.({}, harness.context(cwd, [first, second]));
+    await harness.command.handler({}, harness.context(cwd, [first, second]));
+
+    expect(firstRender).toContain("First history");
+    expect(secondRender).toContain("Second history");
+  });
+
   it("returns to Agent history and restores the selected row", async () => {
     const cwd = mkdtempSync(join(tmpdir(), "pi-subagents-menu-test-"));
     tempDirectories.push(cwd);

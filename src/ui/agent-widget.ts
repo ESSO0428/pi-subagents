@@ -498,6 +498,12 @@ export class AgentWidget {
     return true;
   }
 
+  private selectionBullet(agentId: string, theme: Theme): string {
+    return this.navigationActive && this.selectedAgentId === agentId
+      ? theme.fg("accent", "●")
+      : theme.fg("dim", "○");
+  }
+
   /** Render a finished agent line. */
   private renderFinishedLine(a: { id: string; type: SubagentType; status: string; description: string; toolUses: number; startedAt: number; completedAt?: number; error?: string; lifetimeUsage?: LifetimeUsage }, theme: Theme): string {
     const modeLabel = getPromptModeLabel(a.type);
@@ -572,7 +578,7 @@ export class AgentWidget {
 
     const finishedLines: string[] = [];
     for (const a of finished) {
-      finishedLines.push(truncate(theme.fg("dim", "├─") + " " + this.renderFinishedLine(a, theme)));
+      finishedLines.push(truncate(theme.fg("dim", "├─") + ` ${this.selectionBullet(a.id, theme)} ` + this.renderFinishedLine(a, theme)));
     }
 
     const runningLines: string[][] = []; // each entry is [header, activity]
@@ -612,13 +618,14 @@ export class AgentWidget {
       const activity = (bg ? describeActivity(bg.activeTools, bg.responseText) : "thinking…").replace(/[\r\n]+/g, " ");
 
       runningLines.push([
-        truncate(theme.fg("dim", "├─") + ` ${theme.fg("accent", frame)} ${renderAgentName(a.type, theme, { bold: true })}${modeTag}  ${theme.fg("muted", a.description)} ${theme.fg("dim", "·")} ${fgPreservingNestedStyles(theme, "dim", statsText)}`),
+        truncate(theme.fg("dim", "├─") + ` ${this.selectionBullet(a.id, theme)} ${theme.fg("accent", frame)} ${renderAgentName(a.type, theme, { bold: true })}${modeTag}  ${theme.fg("muted", a.description)} ${theme.fg("dim", "·")} ${fgPreservingNestedStyles(theme, "dim", statsText)}`),
         truncate(theme.fg("dim", "│  ") + theme.fg("dim", `  ⎿  ${activity}`)),
       ]);
     }
 
+    const selectedQueued = this.navigationActive && this.selectedAgentId !== undefined && queued.some(agent => agent.id === this.selectedAgentId);
     const queuedLine = queued.length > 0
-      ? truncate(theme.fg("dim", "├─") + ` ${theme.fg("muted", "◦")} ${theme.fg("dim", `${queued.length} queued`)}`)
+      ? truncate(theme.fg("dim", "├─") + ` ${selectedQueued ? theme.fg("accent", "●") : theme.fg("dim", "○")} ${theme.fg("muted", "◦")} ${theme.fg("dim", `${queued.length} queued`)}`)
       : undefined;
 
     // Assemble with overflow cap (heading + overflow indicator = 2 reserved lines).
@@ -713,7 +720,7 @@ export class AgentWidget {
       const selected = roster[this.selectedRosterIndex];
       const hasSelected = selected ? lines.some(line => line.includes(selected.description.replace(/[\r\n]+/g, " "))) : true;
       if (selected && !hasSelected) {
-        const selectedLine = truncate(theme.fg("dim", "└─") + ` ${selected.status === "queued" ? "◦" : "⠋"} ${theme.fg("muted", selected.description.replace(/[\r\n]+/g, " "))}`);
+        const selectedLine = truncate(theme.fg("dim", "└─") + ` ${this.selectionBullet(selected.id, theme)} ${selected.status === "queued" ? "◦" : "⠋"} ${theme.fg("muted", selected.description.replace(/[\r\n]+/g, " "))}`);
         if (lines.length >= budget) lines[lines.length - 1] = selectedLine;
         else lines.push(selectedLine);
       }

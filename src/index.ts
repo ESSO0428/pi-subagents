@@ -13,7 +13,7 @@
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { defineTool, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, getAgentDir, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
-import { Container, Key, matchesKey, type SettingItem, SettingsList, Spacer, Text } from "@earendil-works/pi-tui";
+import { Container, isKeyRelease, Key, matchesKey, type SettingItem, SettingsList, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { abortable } from "./abortable.js";
 import { hasAgentBadge, renderAgentName } from "./agent-color.js";
@@ -3081,10 +3081,11 @@ Terse command-style prompts produce shallow, generic work.
         render: (width: number) => agents.map((agent, row) => `${row === index ? "→" : " "} ${agent.description}`.slice(0, width)),
         invalidate() {},
         handleInput(data: string) {
-          if (data === "\u001b[B") index = Math.min(agents.length - 1, index + 1);
-          else if (data === "\u001b[A") index = Math.max(0, index - 1);
-          else if (data === "\r" || data === "\n") { runningSelectionIndex = index; done(agents[index]); }
-          else if (data === "\u001b") { runningSelectionIndex = index; done(undefined); }
+          if (isKeyRelease(data)) return;
+          if (matchesKey(data, Key.down)) index = Math.min(agents.length - 1, index + 1);
+          else if (matchesKey(data, Key.up)) index = Math.max(0, index - 1);
+          else if (matchesKey(data, Key.enter)) { runningSelectionIndex = index; done(agents[index]); }
+          else if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) { runningSelectionIndex = index; done(undefined); }
         },
       };
     });
@@ -3102,10 +3103,11 @@ Terse command-style prompts produce shallow, generic work.
         render: (width: number) => history.map((record, row) => `${row === index ? "→" : " "} ${record.description}`.slice(0, width)),
         invalidate() {},
         handleInput(data: string) {
-          if (data === "\u001b[B") index = Math.min(history.length - 1, index + 1);
-          else if (data === "\u001b[A") index = Math.max(0, index - 1);
-          else if (data === "\r" || data === "\n") { historySelectionIndex = index; done(history[index]); }
-          else if (data === "\u001b") done(undefined);
+          if (isKeyRelease(data)) return;
+          if (matchesKey(data, Key.down)) index = Math.min(history.length - 1, index + 1);
+          else if (matchesKey(data, Key.up)) index = Math.max(0, index - 1);
+          else if (matchesKey(data, Key.enter)) { historySelectionIndex = index; done(history[index]); }
+          else if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) done(undefined);
         },
       };
     });

@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.10] - 2026-09-30
+
+### Fixed
+- **Agents and `/agents` history selection now use normalized keyboard events**, visibly mark the selected row, ignore key-release events, and close cleanly with `Esc` or `Ctrl-C`.
+
 ## [0.17.9] - 2026-09-30
 
 ### Fixed
