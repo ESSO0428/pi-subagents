@@ -2,7 +2,7 @@
 
 ## 目的與來源
 
-保存 `v0.17.6` 後 nested delegation 的行為，供 v0.17.17 之後選擇性恢復。基準是 `64bbbb0`；主要實作由 `8976c63`（#164）開始，後續由 `8d4d4a7` 與 background/workflow 整合延伸。
+保存 `v0.17.6` 後 nested delegation 的行為，供 v0.17.19 起選擇性恢復。基準是 `64bbbb0`；主要實作由 `8976c63`（#164）開始，後續由 `8d4d4a7` 與 background/workflow 整合延伸。
 
 ## 必須保留的行為
 

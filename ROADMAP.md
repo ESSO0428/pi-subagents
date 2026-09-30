@@ -1,6 +1,6 @@
-# v0.17.17 回退與 v0.17.18+ 恢復路線圖
+# v0.17.17 回退、v0.17.18 registry recovery 與 v0.17.19+ 恢復路線圖
 
-本文件是 v0.17.17 的回退邊界與後續恢復決策，不是 runtime 實作計畫，也不承諾任何日曆日期。主要規格索引是 [`docs/post-0.17.6-feature-specs.md`](docs/post-0.17.6-feature-specs.md)；各階段都必須以該索引及其保存的原始 implementation、測試與 commit 證據為準。
+本文件是 v0.17.17 的回退邊界與後續恢復決策，不是 runtime 實作計畫，也不承諾任何日曆日期。v0.17.18 只因 npm 保留但未公開 v0.17.17 而重發相同 rollback runtime；v0.17.17 仍是 Git／文件里程碑，第一個未來功能恢復版本從 v0.17.19 開始。主要規格索引是 [`docs/post-0.17.6-feature-specs.md`](docs/post-0.17.6-feature-specs.md)；各階段都必須以該索引及其保存的原始 implementation、測試與 commit 證據為準。
 
 ## 目標與不可變邊界
 
@@ -38,15 +38,15 @@
 - [ ] 若證據不足、行為與 archived spec 不一致，或人工操作出現可見卡頓，該功能停留在待恢復狀態，不與其他功能合併。
 - [ ] 本文件本身不執行 Vitest、E2E 或 build；恢復工作是否需要這些檢查，依當時授權與 `AGENTS.md` 的資源政策處理。
 
-## v0.17.18 的決策：只恢復 durable history 基礎層
+## v0.17.19 的決策：只恢復 durable history 基礎層
 
-- [ ] 將 v0.17.18 限定為第一個、可獨立驗證的 durable history/recovery data plane：先處理 transcript 格式、project-local path safety、checkpoint metadata 與 flush/attach seam。
+- [ ] 將 v0.17.19 限定為第一個、可獨立驗證的 durable history/recovery data plane：先處理 transcript 格式、project-local path safety、checkpoint metadata 與 flush/attach seam。
 - [ ] 以 [`docs/post-0.17.6-durable-history-spec.md`](docs/post-0.17.6-durable-history-spec.md) 和 [`docs/post-0.17.6-recovery-shutdown-spec.md`](docs/post-0.17.6-recovery-shutdown-spec.md) 為證據邊界；不得順便恢復 nested agents、Workflow/RPC、FleetView 或整套 Agents UI。
 - [ ] 確保 `output_transcript: false` 不會關閉 `.pi-subagents` durable history，且 GC/session cleanup 不會刪除仍可讀的 terminal record；壞 locator、壞 JSON 或 traversal input 必須 fail safely。
-- [ ] 在接受 v0.17.18 前，人工確認既有 v0.17.6 viewer interaction 沒有 layout/focus/scroll regression；若此基礎層不改 UI，也仍要記錄 baseline 操作結果。
-- [ ] v0.17.18 不承諾任何日曆日期；版本成立條件是上述單一功能的證據完整，而不是時間到期或功能數量達標。
+- [ ] 在接受 v0.17.19 前，人工確認既有 v0.17.6 viewer interaction 沒有 layout/focus/scroll regression；若此基礎層不改 UI，也仍要記錄 baseline 操作結果。
+- [ ] v0.17.19 不承諾任何日曆日期；版本成立條件是上述單一功能的證據完整，而不是時間到期或功能數量達標。
 
-## v0.17.18 之後的證據驅動順序
+## v0.17.19 之後的證據驅動順序
 
 每一列都是獨立候選恢復項；「後續版本」只代表通過前一項 acceptance 後再決定的版本，不預設版本號或日期。
 
@@ -71,9 +71,9 @@
 - [ ] **Render path**：人工觀察長歷史與頻繁事件時沒有隨歷史長度惡化的可見卡頓；同時以規格列出的 perf guards 驗證 render 不做 filesystem I/O，並記錄證據而非臆測數字門檻。
 - [ ] **失敗處理**：任何可見延遲、focus/layout 變化、重複 redraw、stale row 或 history 消失都代表該單一功能未接受；先隔離或回退該變更，不得進入組合 release。
 
-## 0.17.18 與後續 release 的組合決策
+## 0.17.19 與後續 release 的組合決策
 
-- [ ] **v0.17.18**：只接受 durable history/recovery 基礎層；不把 Agents UI、nested、RPC 或 Workflow 當作同一 release 的附帶恢復。
+- [ ] **v0.17.19**：只接受 durable history/recovery 基礎層；不把 Agents UI、nested、RPC 或 Workflow 當作同一 release 的附帶恢復。
 - [ ] **後續版本**：只有已在獨立變更中完成 spec、targeted evidence 與人工 UI latency acceptance 的功能，才可在後續 release 與另一個已接受功能組合。
 - [ ] 組合前要重新執行人工回歸矩陣，特別是 viewer baseline、selector input ownership、長 transcript render 與 resource-policy metadata；單項通過不等於組合後通過。
 - [ ] 若組合回歸失敗，拆回最後一個已接受的功能邊界；不得為了湊版本內容而放寬 acceptance 或重新引入 duplicate UI。

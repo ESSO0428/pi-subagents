@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.18] - 2026-09-30
+
+### Changed
+- **Republished the intentional v0.17.6 runtime/UI rollback** because npm reserved but did not expose the 0.17.17 version slot. v0.17.17 remains the Git and documentation milestone; v0.17.18 contains the same rollback runtime, with future feature restoration beginning at v0.17.19.
+
 ## [0.17.17] - 2026-09-30
 
 ### Changed

@@ -2,7 +2,7 @@
 
 ## 基準與目標
 
-本規格保存 `64bbbb0`（v0.17.6）後的 Agents UI 演進，供 v0.17.17 之後逐項恢復。v0.17.6 的 ConversationViewer scrollbar/preview 是不可回退的 interaction baseline；Agents panel 則以 v0.17.0 的 single navigator 為前提，不恢復已移除的 duplicate FleetView。
+本規格保存 `64bbbb0`（v0.17.6）後的 Agents UI 演進，供 v0.17.19 起逐項恢復。v0.17.6 的 ConversationViewer scrollbar/preview 是不可回退的 interaction baseline；Agents panel 則以 v0.17.0 的 single navigator 為前提，不恢復已移除的 duplicate FleetView。
 
 ## UI 契約
 
