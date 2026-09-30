@@ -6,11 +6,10 @@
  */
 
 import { Editor, isKeyRelease, Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { renderAgentName } from "../agent-color.js";
 import type { AgentManager } from "../agent-manager.js";
 import { getConfig } from "../agent-types.js";
 import type { AgentInvocation, AgentRecord, SubagentType, WidgetMode } from "../types.js";
-import { getLifetimeCost, getLifetimeTotal, getSessionContextPercent, type LifetimeUsage, type SessionLike } from "../usage.js";
+import { getLifetimeTotal, getSessionContextPercent, type LifetimeUsage, type SessionLike } from "../usage.js";
 
 // ---- Constants ----
 
@@ -55,11 +54,10 @@ export type Theme = {
 
 export type AgentWidgetOpenMode = "live" | "history";
 export type AgentWidgetOpenCallback = (record: AgentRecord, mode: AgentWidgetOpenMode) => void | Promise<void>;
-export interface AgentWidgetOptions {
-  canOpenHistory?: (record: AgentRecord) => boolean;
-  onOpen?: AgentWidgetOpenCallback;
-  showCost?: () => boolean;
-}
+export type AgentWidgetOptions = {
+  canOpenHistory: (record: AgentRecord) => boolean;
+  onOpen: AgentWidgetOpenCallback;
+};
 /** @deprecated Use AgentWidgetOpenMode. */
 export type AgentOpenMode = AgentWidgetOpenMode;
 /** @deprecated Use AgentWidgetOpenCallback. */
@@ -74,8 +72,8 @@ export type UICtx = {
     content: undefined | ((tui: any, theme: Theme) => { render(): string[]; invalidate(): void }),
     options?: { placement?: "aboveEditor" | "belowEditor" },
   ): void;
-  onTerminalInput?(handler: (data: string) => { consume?: boolean; data?: string } | undefined): () => void;
-  getEditorText?(): string;
+  onTerminalInput(handler: (data: string) => { consume?: boolean; data?: string } | undefined): () => void;
+  getEditorText(): string;
 };
 
 /** Per-agent live activity state. */
@@ -113,8 +111,6 @@ export interface AgentDetails {
   turnCount?: number;
   /** Effective max turns (undefined = unlimited). */
   maxTurns?: number;
-  /** Estimated cost in USD; 0 when the model has no pricing data. */
-  cost?: number;
   agentId?: string;
   error?: string;
 }
@@ -180,16 +176,6 @@ export function formatDuration(startedAt: number, completedAt?: number): string 
   return `${formatMs(Date.now() - startedAt)} (running)`;
 }
 
-/** Format an estimated model cost without implying billing precision. */
-export function formatCost(cost: number): string {
-  if (!(cost > 0)) return "";
-  if (cost < 0.0001) return "<$0.0001";
-  if (cost >= 1) return `~$${cost.toFixed(2)}`;
-  const rounded = Number(cost.toFixed(4));
-  const decimals = (String(rounded).split(".")[1] ?? "").length;
-  return `~$${rounded.toFixed(Math.max(2, decimals))}`;
-}
-
 /** Get display name for any agent type (built-in or custom). */
 export function getDisplayName(type: SubagentType): string {
   return getConfig(type).displayName;
@@ -204,23 +190,17 @@ export function getPromptModeLabel(type: SubagentType): string | undefined {
 /** Mode label is not included — callers add it where they want it. */
 export function buildInvocationTags(
   invocation: AgentInvocation | undefined,
-): { modelName?: string; modelId?: string; tags: string[] } {
+): { modelName?: string; tags: string[] } {
   const tags: string[] = [];
   if (!invocation) return { tags };
-  const asked = (value: string | undefined, requested: string | undefined): string | undefined =>
-    value && requested && requested !== value ? `${value} (asked ${requested})` : value;
-  const thinking = asked(invocation.thinking, invocation.requestedThinking);
+  const thinking = invocation.effectiveThinking ?? invocation.thinking;
   if (thinking) tags.push(`thinking: ${thinking}`);
   if (invocation.isolated) tags.push("isolated");
   if (invocation.isolation === "worktree") tags.push("worktree");
   if (invocation.inheritContext) tags.push("inherit context");
   if (invocation.runInBackground) tags.push("background");
   if (invocation.maxTurns != null) tags.push(`max turns: ${invocation.maxTurns}`);
-  return {
-    modelName: asked(invocation.modelName, invocation.requestedModel),
-    modelId: asked(invocation.modelId, invocation.requestedModel),
-    tags,
-  };
+  return { modelName: invocation.modelName, tags };
 }
 
 /** Normalize and truncate text so it can never add physical widget rows. */
@@ -274,14 +254,6 @@ export class AgentWidget {
   /** First logical row currently represented by the bounded viewport. */
   private viewportStart = 0;
 
-  /** Cached records and roster. Rebuilt by update(), never by an arrow press. */
-  private cachedAgents: AgentRecord[] = [];
-  private cachedRoster: AgentRecord[] = [];
-  private rosterCacheKey: string | undefined;
-  private rosterCacheInitialized = false;
-  /** Terminal history capability is a potentially filesystem-backed lookup. */
-  private historyOpenabilityCache = new Map<string, { key: string; value: boolean }>();
-
   /** Whether the widget callback is currently registered with the TUI. */
   private widgetRegistered = false;
   /** Cached TUI reference from widget factory callback, used for requestRender(). */
@@ -290,27 +262,17 @@ export class AgentWidget {
   private lastStatusText: string | undefined;
   /** Snapshot of the state used for the last widget registration/render request. */
   private lastRenderKey: string | undefined;
-  private readonly openOptions: AgentWidgetOptions;
-  private readonly showCost: () => boolean;
-  private readonly showModel: () => boolean;
 
   constructor(
     private manager: AgentManager,
     private agentActivity: Map<string, AgentActivity>,
     /** Read live at render time. Selects which agents the widget shows. */
     private mode: () => WidgetMode = () => "all",
-    showCostOrOptions: (() => boolean) | AgentWidgetOptions = () => false,
-    showModel: () => boolean = () => false,
-  ) {
-    if (typeof showCostOrOptions === "function") {
-      this.showCost = showCostOrOptions;
-      this.openOptions = {};
-    } else {
-      this.showCost = showCostOrOptions.showCost ?? (() => false);
-      this.openOptions = showCostOrOptions;
-    }
-    this.showModel = showModel;
-  }
+    private options: AgentWidgetOptions = {
+      canOpenHistory: (record) => record.session !== undefined || record.completedAt !== undefined,
+      onOpen: () => {},
+    },
+  ) {}
 
   /**
    * Agents eligible for the widget, per the current `WidgetMode`:
@@ -323,87 +285,13 @@ export class AgentWidget {
    *     only proven-foreground runs drop out — nothing else silently vanishes.
    *   - `all`: every agent.
    */
-  private widgetAgentsFromManager(): AgentRecord[] {
+  private widgetAgents() {
     const all = this.manager.listAgents();
     switch (this.mode()) {
       case "off": return [];
       case "background": return all.filter(a => a.isBackground !== false);
       default: return all;
     }
-  }
-
-  /** Records currently visible to the widget; safe for render and input paths. */
-  private widgetAgents(): AgentRecord[] {
-    return this.rosterCacheInitialized ? this.cachedAgents : this.widgetAgentsFromManager();
-  }
-
-  private canOpenHistory(record: AgentRecord): boolean {
-    return this.openOptions.canOpenHistory?.(record) ?? true;
-  }
-
-  private historyOpenabilityKey(record: AgentRecord): string {
-    return JSON.stringify([
-      record.status,
-      record.completedAt ?? null,
-      record.transcriptPath ?? null,
-      record.session !== undefined,
-    ]);
-  }
-
-  /**
-   * Cache terminal history capability by the record state that can affect it.
-   * The supplied predicate may call `existsSync`, so it must not run from a
-   * timer refresh, render-key calculation, or arrow-navigation path more than
-   * once for the same terminal record state.
-   */
-  private cachedCanOpenHistory(record: AgentRecord): boolean {
-    if (record.status === "running" || record.status === "queued") return true;
-
-    const key = this.historyOpenabilityKey(record);
-    const cached = this.historyOpenabilityCache.get(record.id);
-    if (cached?.key === key) return cached.value;
-
-    const value = this.canOpenHistory(record);
-    this.historyOpenabilityCache.set(record.id, { key, value });
-    return value;
-  }
-
-  /** Refresh the manager snapshot and openability cache at lifecycle/update time. */
-  private refreshRoster(): AgentRecord[] {
-    const agents = this.widgetAgentsFromManager();
-    const key = JSON.stringify({
-      mode: this.mode(),
-      agents: agents.map(record => [
-        record.id,
-        record.type,
-        record.description,
-        record.status,
-        record.completedAt ?? null,
-        record.startedAt,
-        record.toolUses,
-        record.error ?? null,
-        record.transcriptPath ?? null,
-        record.session !== undefined,
-        record.isBackground,
-        record.status !== "running" && record.status !== "queued"
-          ? this.cachedCanOpenHistory(record)
-          : undefined,
-      ]),
-    });
-    if (this.rosterCacheInitialized && key === this.rosterCacheKey) return this.cachedRoster;
-
-    const finished = agents.filter(record =>
-      record.status !== "running" && record.status !== "queued"
-      && record.completedAt !== undefined
-      && this.cachedCanOpenHistory(record),
-    );
-    const running = agents.filter(record => record.status === "running");
-    const queued = agents.filter(record => record.status === "queued");
-    this.cachedAgents = agents;
-    this.cachedRoster = [...running, ...queued, ...finished];
-    this.rosterCacheKey = key;
-    this.rosterCacheInitialized = true;
-    return this.cachedRoster;
   }
 
   /** Set the UI context (grabbed from first tool execution). */
@@ -423,11 +311,6 @@ export class AgentWidget {
     this.selectedAgentId = undefined;
     this.selectedRosterIndex = 0;
     this.viewportStart = 0;
-    this.cachedAgents = [];
-    this.cachedRoster = [];
-    this.rosterCacheKey = undefined;
-    this.rosterCacheInitialized = false;
-    this.historyOpenabilityCache.clear();
     // Print/RPC tests and lightweight embedders may provide only the widget
     // surface; real interactive contexts always implement this hook.
     if (typeof ctx.onTerminalInput === "function") {
@@ -437,8 +320,8 @@ export class AgentWidget {
   }
 
   /** Request a render on the currently registered TUI without touching input. */
-  requestUiRefresh(force = false): boolean {
-    if (!this.tui || typeof this.tui.requestRender !== "function") return false;
+  requestUiRefresh(force = true): boolean {
+    if (!this.tui) return false;
     this.tui.requestRender(force);
     return true;
   }
@@ -450,9 +333,7 @@ export class AgentWidget {
 
   /** Keep the spinner/elapsed-time timer alive only while a visible agent runs. */
   ensureTimer() {
-    if (!this.uiCtx) return;
-    const roster = this.rosterCacheInitialized ? this.cachedRoster : this.refreshRoster();
-    if (!roster.some(a => a.status === "running")) return;
+    if (!this.uiCtx || !this.widgetAgents().some(a => a.status === "running")) return;
     if (!this.widgetInterval) {
       this.widgetInterval = setInterval(() => this.update(true), 250);
     }
@@ -473,9 +354,6 @@ export class AgentWidget {
    */
   markFinished(_agentId: string) {}
 
-  /** Retained for lifecycle call sites; terminal rows are record-driven now. */
-  markRunning(_agentId: string) {}
-
   /**
    * Records represented by selectable rows in the above-editor widget.
    *
@@ -484,7 +362,15 @@ export class AgentWidget {
    * panel exposes currently useful work before terminal history.
    */
   private roster(): AgentRecord[] {
-    return this.rosterCacheInitialized ? this.cachedRoster : this.refreshRoster();
+    const agents = this.widgetAgents();
+    const finished = agents.filter(record =>
+      record.status !== "running" && record.status !== "queued"
+      && record.completedAt !== undefined
+      && this.options.canOpenHistory(record),
+    );
+    const running = agents.filter(record => record.status === "running");
+    const queued = agents.filter(record => record.status === "queued");
+    return [...running, ...queued, ...finished];
   }
 
   /** True when pi's prompt editor owns the keyboard. */
@@ -504,7 +390,7 @@ export class AgentWidget {
     // roster) clear this state explicitly instead of treating every exit as a
     // reset.
     this.navigationActive = false;
-    this.requestUiRefresh();
+    this.update();
   }
 
   /** Resume navigation from the retained row, or select the first row. */
@@ -522,7 +408,7 @@ export class AgentWidget {
       this.selectedRosterIndex = fallbackIndex;
       this.viewportStart = Math.min(this.viewportStart, Math.max(0, records.length - 1));
     }
-    this.requestUiRefresh();
+    this.update();
   }
 
   /** Move the selected row, activating only from an empty focused editor. */
@@ -545,7 +431,7 @@ export class AgentWidget {
     const nextIndex = Math.max(0, Math.min(records.length - 1, currentIndex + direction));
     this.selectedAgentId = records[nextIndex].id;
     this.selectedRosterIndex = nextIndex;
-    this.requestUiRefresh();
+    this.update();
     return true;
   }
 
@@ -554,7 +440,7 @@ export class AgentWidget {
     this.deactivate();
     if (!record) return;
     const mode: AgentWidgetOpenMode = record.status === "running" || record.status === "queued" ? "live" : "history";
-    void this.openOptions.onOpen?.(record, mode);
+    void this.options.onOpen(record, mode);
   }
 
   /** Handle terminal input before it reaches the focused prompt editor. */
@@ -592,7 +478,8 @@ export class AgentWidget {
   }
 
   /** Render a finished agent line. */
-  private renderFinishedLine(a: { id: string; type: SubagentType; status: string; description: string; toolUses: number; startedAt: number; completedAt?: number; error?: string; lifetimeUsage?: LifetimeUsage }, theme: Theme): string {
+  private renderFinishedLine(a: { id: string; type: SubagentType; status: string; description: string; toolUses: number; startedAt: number; completedAt?: number; error?: string }, theme: Theme): string {
+    const name = getDisplayName(a.type);
     const modeLabel = getPromptModeLabel(a.type);
     const duration = formatMs((a.completedAt ?? Date.now()) - a.startedAt);
 
@@ -621,13 +508,10 @@ export class AgentWidget {
     const activity = this.agentActivity.get(a.id);
     if (activity) parts.push(formatTurns(activity.turnCount, activity.maxTurns));
     if (a.toolUses > 0) parts.push(`${a.toolUses} tool use${a.toolUses === 1 ? "" : "s"}`);
-    const costText = this.showCost() && a.lifetimeUsage ? formatCost(getLifetimeCost(a.lifetimeUsage)) : "";
-    if (costText) parts.push(costText);
     parts.push(duration);
 
     const modeTag = modeLabel ? ` ${theme.fg("dim", `(${modeLabel})`)}` : "";
-    const description = truncateLine(a.description);
-    return `${icon} ${renderAgentName(a.type, theme, { fallbackColor: "dim" })}${modeTag}  ${theme.fg("dim", description)} ${theme.fg("dim", "·")} ${theme.fg("dim", parts.join(" · "))}${statusText}`;
+    return `${icon} ${theme.fg("dim", name)}${modeTag}  ${theme.fg("dim", truncateLine(a.description))} ${theme.fg("dim", "·")} ${theme.fg("dim", parts.join(" · "))}${statusText}`;
   }
 
   /**
@@ -635,10 +519,13 @@ export class AgentWidget {
    * reading live state each time instead of capturing it in a closure.
    */
   private renderWidget(tui: any, theme: Theme): string[] {
-    const roster = this.roster();
-    const running = roster.filter(a => a.status === "running");
-    const queued = roster.filter(a => a.status === "queued");
-    const finished = roster.filter(a => a.status !== "running" && a.status !== "queued");
+    const allAgents = this.widgetAgents();
+    const running = allAgents.filter(a => a.status === "running");
+    const queued = allAgents.filter(a => a.status === "queued");
+    const finished = allAgents.filter(a =>
+      a.status !== "running" && a.status !== "queued" && a.completedAt !== undefined
+      && this.options.canOpenHistory(a),
+    );
 
     const selectedId = this.navigationActive ? this.selectedAgentId : undefined;
     const hasActive = running.length > 0 || queued.length > 0;
@@ -658,9 +545,7 @@ export class AgentWidget {
     // Build sections separately for overflow-aware assembly.
     // Each running agent = 2 lines (header + activity), finished = 1 line, queued = 1 line.
 
-    type WidgetRow = { record: AgentRecord; lines: string[]; recordCount?: number };
-
-    const finishedLines: WidgetRow[] = [];
+    const finishedLines: { record: AgentRecord; lines: string[] }[] = [];
     for (const a of finished) {
       const marker = a.id === selectedId ? theme.fg("accent", "●") : theme.fg("dim", "○");
       finishedLines.push({
@@ -669,32 +554,23 @@ export class AgentWidget {
       });
     }
 
-    const runningLines: WidgetRow[] = []; // each entry is [header, activity]
+    const runningLines: { record: AgentRecord; lines: string[] }[] = []; // each entry is [header, activity]
     for (const a of running) {
+      const name = getDisplayName(a.type);
       const modeLabel = getPromptModeLabel(a.type);
       const modeTag = modeLabel ? ` ${theme.fg("dim", `(${modeLabel})`)}` : "";
       const elapsed = formatMs(Date.now() - a.startedAt);
 
       const bg = this.agentActivity.get(a.id);
       const toolUses = bg?.toolUses ?? a.toolUses;
-      // Spend comes from the record, never from the activity tracker: the record
-      // survives the agent finishing and includes nested-child usage.
-      const tokens = getLifetimeTotal(a.lifetimeUsage);
+      const tokens = getLifetimeTotal(bg?.lifetimeUsage);
       const contextPercent = getSessionContextPercent(bg?.session);
       const tokenText = tokens > 0 ? formatSessionTokens(tokens, contextPercent, theme, a.compactionCount) : "";
-      const costText = this.showCost() ? formatCost(getLifetimeCost(a.lifetimeUsage)) : "";
 
       const parts: string[] = [];
-      if (this.showModel()) {
-        const { modelName, tags } = buildInvocationTags(a.invocation);
-        if (modelName) parts.push(modelName);
-        const thinkingTag = tags.find(tag => tag.startsWith("thinking: "));
-        if (thinkingTag) parts.push(thinkingTag);
-      }
       if (bg) parts.push(formatTurns(bg.turnCount, bg.maxTurns));
       if (toolUses > 0) parts.push(`${toolUses} tool use${toolUses === 1 ? "" : "s"}`);
       if (tokenText) parts.push(tokenText);
-      if (costText) parts.push(costText);
       parts.push(elapsed);
       const statsText = parts.join(" · ");
 
@@ -704,13 +580,13 @@ export class AgentWidget {
       runningLines.push({
         record: a,
         lines: [
-          truncate(theme.fg("dim", "├─") + ` ${marker} ${theme.fg("accent", frame)} ${renderAgentName(a.type, theme, { bold: true })}${modeTag}  ${theme.fg("muted", truncateLine(a.description))} ${theme.fg("dim", "·")} ${fgPreservingNestedStyles(theme, "dim", statsText)}`),
-          truncate(theme.fg("dim", "│  ") + `   ${theme.fg("dim", `⎿  ${truncateLine(activity)}`)}`),
+          truncate(theme.fg("dim", "├─") + ` ${marker} ${theme.fg("accent", frame)} ${theme.bold(name)}${modeTag}  ${theme.fg("muted", truncateLine(a.description))} ${theme.fg("dim", "·")} ${fgPreservingNestedStyles(theme, "dim", statsText)}`),
+          truncate(theme.fg("dim", "│  ") + `   ${theme.fg("dim", `⎿  ${activity}`)}`),
         ],
       });
     }
 
-    const queuedLines: WidgetRow[] = queued.map(a => {
+    const queuedLines: { record: AgentRecord; lines: string[] }[] = queued.map(a => {
       const marker = a.id === selectedId ? theme.fg("accent", "●") : theme.fg("dim", "○");
       return {
         record: a,
@@ -718,25 +594,10 @@ export class AgentWidget {
       };
     });
 
-    // Keep the idle widget compact: a queue is one logical status line until
-    // navigation starts. While navigating, expand it back to the same per-agent
-    // roster used by key handling so every selected queued record can render.
-    const queuedSummary: WidgetRow[] = queued.length > 0 && !this.navigationActive
-      ? [{
-        record: queued[0],
-        recordCount: queued.length,
-        lines: [truncate(theme.fg("dim", "├─") + ` ${theme.fg("dim", "○")} ${theme.fg("muted", "◦")} ${theme.fg("dim", `${queued.length} queued`)}`)],
-      }]
-      : [];
-
     // Assemble with a responsive cap (heading + overflow indicator = 2
     // reserved lines when content exceeds the available body budget).
     const maxBody = maxLines - 1; // heading takes 1 line
-    const rows: WidgetRow[] = [
-      ...runningLines,
-      ...(this.navigationActive ? queuedLines : queuedSummary),
-      ...finishedLines,
-    ];
+    const rows = [...runningLines, ...queuedLines, ...finishedLines];
     const totalBody = rows.reduce((total, row) => total + row.lines.length, 0);
 
     const heading = "Agents  ↑↓ select · enter view · esc back";
@@ -753,79 +614,11 @@ export class AgentWidget {
       if (rows.length > 0) {
         const lastRow = rows[rows.length - 1];
         const lastStart = lines.length - lastRow.lines.length;
-        // Keep the selected row's bullet adjacent to the normal branch marker.
-        // This makes the active row unambiguous even when it is the last row.
-        const lastRowSelected = this.navigationActive && lastRow.record.id === selectedId;
-        if (!lastRowSelected) lines[lastStart] = lines[lastStart].replace("├─", "└─");
-        if (lastRow.lines.length === 2) {
-          lines[lastStart + 1] = lines[lastStart + 1].replace("│  ", "   ");
-        }
-      }
-    } else if (!this.navigationActive && queuedSummary.length > 0) {
-      // In the idle view the queue is deliberately one summary row. Preserve
-      // that row before spending space on terminal history, and account for
-      // the real number of queued records if the summary itself cannot fit.
-      // Navigation expands the queue into per-record rows and uses the full
-      // contiguous viewport below.
-      const visibleRows: WidgetRow[] = [];
-      const hiddenRows: WidgetRow[] = [];
-      let bodyBudget = Math.max(0, maxBody - 1); // reserve the footer
-      let runningBudget = Math.max(0, bodyBudget - 1); // reserve queued summary
-
-      for (const row of runningLines) {
-        const height = row.lines.length;
-        if (height <= runningBudget) {
-          visibleRows.push(row);
-          runningBudget -= height;
-          bodyBudget -= height;
-        } else {
-          hiddenRows.push(row);
-        }
-      }
-
-      const summaryRow = queuedSummary[0];
-      if (bodyBudget > 0) {
-        visibleRows.push(summaryRow);
-        bodyBudget -= summaryRow.lines.length;
-      } else {
-        hiddenRows.push(summaryRow);
-      }
-
-      for (const row of finishedLines) {
-        const height = row.lines.length;
-        if (height <= bodyBudget) {
-          visibleRows.push(row);
-          bodyBudget -= height;
-        } else {
-          hiddenRows.push(row);
-        }
-      }
-
-      for (const row of visibleRows) lines.push(...row.lines);
-      if (visibleRows.length > 0) {
-        const lastRow = visibleRows[visibleRows.length - 1];
-        const lastStart = lines.length - lastRow.lines.length;
         lines[lastStart] = lines[lastStart].replace("├─", "└─");
         if (lastRow.lines.length === 2) {
           lines[lastStart + 1] = lines[lastStart + 1].replace("│  ", "   ");
         }
       }
-
-      const hiddenCount = (rows: readonly WidgetRow[]): number =>
-        rows.reduce((total, row) => total + (row.recordCount ?? 1), 0);
-      const categoryCount = (status: string): number => hiddenRows
-        .filter(row => row.record.status === status)
-        .reduce((total, row) => total + (row.recordCount ?? 1), 0);
-      const finishedCount = hiddenRows
-        .filter(row => row.record.status !== "running" && row.record.status !== "queued")
-        .reduce((total, row) => total + (row.recordCount ?? 1), 0);
-      const categoryCounts: string[] = [
-        ["running", categoryCount("running")] as [string, number],
-        ["queued", categoryCount("queued")] as [string, number],
-        ["finished", finishedCount] as [string, number],
-      ].filter(([, count]) => count > 0).map(([label, count]) => `${count} ${label}`);
-      const hidden = hiddenCount(hiddenRows);
-      lines.push(truncate(theme.fg("dim", "└─") + ` ${theme.fg("dim", `+${hidden} more (${categoryCounts.join(", ")})`)}`));
     } else {
       // Reserve one line for a directional overflow summary. The viewport is
       // a contiguous slice in roster order, so the same slice is navigable and
@@ -877,21 +670,14 @@ export class AgentWidget {
         end = start + 1;
       }
 
-      const countRows = (selectedRows: readonly WidgetRow[]): number =>
-        selectedRows.reduce((total, row) => total + (row.recordCount ?? 1), 0);
-      const hiddenBefore = countRows(rows.slice(0, start));
-      const hiddenAfter = countRows(rows.slice(end));
+      const hiddenBefore = start;
+      const hiddenAfter = Math.max(0, rows.length - end);
       const hidden = hiddenBefore + hiddenAfter;
       const hiddenRows = rows.filter((_row, index) => index < start || index >= end);
-      const categoryCount = (status: string): number => hiddenRows
-        .filter(row => row.record.status === status)
-        .reduce((total, row) => total + (row.recordCount ?? 1), 0);
       const categoryCounts: string[] = [
-        ["running", categoryCount("running")] as [string, number],
-        ["queued", categoryCount("queued")] as [string, number],
-        ["finished", hiddenRows
-          .filter(row => row.record.status !== "running" && row.record.status !== "queued")
-          .reduce((total, row) => total + (row.recordCount ?? 1), 0)] as [string, number],
+        ["running", hiddenRows.filter(row => row.record.status === "running").length] as [string, number],
+        ["queued", hiddenRows.filter(row => row.record.status === "queued").length] as [string, number],
+        ["finished", hiddenRows.filter(row => row.record.status !== "running" && row.record.status !== "queued").length] as [string, number],
       ].filter(([, count]) => count > 0).map(([label, count]) => `${count} ${label}`);
       const direction = [
         ...(hiddenBefore > 0 ? [`↑ ${hiddenBefore} more`] : []),
@@ -972,7 +758,7 @@ export class AgentWidget {
         isBackground: a.isBackground,
         hasSession: a.session !== undefined,
         transcriptPath: a.transcriptPath,
-        openableHistory: this.cachedCanOpenHistory(a),
+        openableHistory: this.options.canOpenHistory(a),
       })),
       activities,
       navigationActive: this.navigationActive,
@@ -984,10 +770,8 @@ export class AgentWidget {
   /** Force an immediate widget update. `advanceSpinner` is reserved for the timer. */
   update(advanceSpinner = false) {
     if (!this.uiCtx) return;
-    // Refresh the manager snapshot once per lifecycle update. Arrow handling
-    // only changes selection and requests a render; it never scans the manager.
-    const roster = this.refreshRoster();
     const allAgents = this.widgetAgents();
+    const roster = this.roster();
 
     // Lightweight existence checks — full categorization happens in renderWidget()
     let runningCount = 0;
@@ -1101,11 +885,6 @@ export class AgentWidget {
     this.selectedAgentId = undefined;
     this.selectedRosterIndex = 0;
     this.viewportStart = 0;
-    this.cachedAgents = [];
-    this.cachedRoster = [];
-    this.rosterCacheKey = undefined;
-    this.rosterCacheInitialized = false;
-    this.historyOpenabilityCache.clear();
     this.uiCtx = undefined;
   }
 }

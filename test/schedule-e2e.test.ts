@@ -39,7 +39,6 @@ function makeFaithfulManager(initialStatus = "completed") {
       queueMicrotask(() => records.get(id)?.resolve());
       return id;
     }),
-    awaitStartup: vi.fn(async () => {}),
     getRecord: vi.fn(function (this: any, id: string) {
       return records.get(id);
     }),

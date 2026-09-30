@@ -1,15 +1,14 @@
 import * as CodingAgent from "@earendil-works/pi-coding-agent";
 import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
-import type { MarkdownOptions, MarkdownTheme } from "@earendil-works/pi-tui";
 import {
   type Component,
   Markdown,
+  Text,
   type TUI,
   type TuiMouseEvent,
   truncateToWidth,
-  wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
-import type { AgentRecord, ViewerMarkdownMode } from "../types.js";
+import type { AgentRecord } from "../types.js";
 import type { Theme } from "./agent-widget.js";
 import { showMoreHintText } from "./ccstyle/diff/render-utils.js";
 import {
@@ -74,7 +73,6 @@ export interface ConversationTimelineChange {
 export interface ConversationTimelineOptions {
   cwd?: string;
   record?: AgentRecord;
-  markdownMode?: () => ViewerMarkdownMode;
   onChange?: (change: ConversationTimelineChange) => void;
 }
 
@@ -82,58 +80,10 @@ function safeWidth(width: number): number {
   return Math.max(1, Math.floor(Number.isFinite(width) ? width : 1));
 }
 
-const MARKDOWN_OPTIONS: MarkdownOptions = {
-  preserveOrderedListMarkers: true,
-  preserveBackslashEscapes: true,
-};
-
-function fallbackMarkdownTheme(theme: Theme): MarkdownTheme {
-  const sgr = (on: number, off: number) => (text: string) => `\x1b[${on}m${text}\x1b[${off}m`;
-  return {
-    heading: text => theme.bold(theme.fg("accent", text)),
-    link: text => theme.fg("accent", text),
-    linkUrl: text => theme.fg("muted", text),
-    code: text => theme.fg("muted", text),
-    codeBlock: text => theme.fg("muted", text),
-    codeBlockBorder: text => theme.fg("dim", text),
-    quote: text => theme.fg("muted", text),
-    quoteBorder: text => theme.fg("dim", text),
-    hr: text => theme.fg("dim", text),
-    listBullet: text => theme.fg("accent", text),
-    bold: text => theme.bold(text),
-    italic: sgr(3, 23),
-    underline: sgr(4, 24),
-    strikethrough: sgr(9, 29),
-  };
-}
-
-function resolveMarkdownTheme(theme: Theme): MarkdownTheme {
-  try {
-    const markdownTheme = getMarkdownTheme();
-    markdownTheme.heading("probe");
-    return markdownTheme;
-  } catch {
-    return fallbackMarkdownTheme(theme);
-  }
-}
-
 function resultContent(result: ConversationToolResultSnapshot): Array<Record<string, unknown>> {
   if (Array.isArray(result.content)) return result.content as Array<Record<string, unknown>>;
   if (typeof result.content === "string") return [{ type: "text", text: result.content }];
   return [];
-}
-
-const RESULT_MAX_CHARS = 16_000;
-
-function humanCount(n: number): string {
-  if (n < 1_000) return `${n}`;
-  const thousands = n < 999_950;
-  const value = thousands ? n / 1_000 : n / 1_000_000;
-  return `${value.toFixed(1).replace(/\.0$/, "")}${thousands ? "k" : "M"}`;
-}
-
-function truncationNote(elided: number): string {
-  return `... (truncated, ${humanCount(elided)} more character${elided === 1 ? "" : "s"})`;
 }
 
 function fallbackToolLines(block: ConversationBlock, width: number, expanded = false, hovered = false, theme?: Theme): string[] {
@@ -223,8 +173,6 @@ export class ConversationTimeline implements Component {
   private lastClickedToolCallId: string | undefined;
   private lastClickedPoint: { x: number; y: number } | undefined;
   private toolComponents = new Map<string, Component & { handleMouse?: (event: TuiMouseEvent) => unknown }>();
-  private markdownCache = new WeakMap<object, { markdown: Markdown; text: string; failed?: boolean }>();
-  private lastWidth = 0;
   private snapshot: ConversationTimelineSnapshot = {
     lines: [],
     messageStarts: [],
@@ -233,6 +181,7 @@ export class ConversationTimeline implements Component {
     blockSpans: [],
     toolSpans: [],
   };
+  private lastWidth = 0;
 
   constructor(
     private readonly tui: TUI,
@@ -272,11 +221,6 @@ export class ConversationTimeline implements Component {
 
   getShowTools(): boolean {
     return this.showTools;
-  }
-
-  setMarkdownMode(mode: () => ViewerMarkdownMode): void {
-    this.options.markdownMode = mode;
-    this.invalidate();
   }
 
   setFocusedToolCallId(id: string | undefined): void {
@@ -323,6 +267,8 @@ export class ConversationTimeline implements Component {
 
   render(width: number): string[] {
     const requestedWidth = safeWidth(width);
+    if (this.lastWidth === requestedWidth) return this.snapshot.lines.map((line) => line.text);
+
     const lines: TimelineRenderLine[] = [];
     const messageStarts: number[] = [];
     const messageBlocks: ConversationBlock[] = [];
@@ -377,12 +323,26 @@ export class ConversationTimeline implements Component {
         continue;
       }
 
-      const mode = this.options.markdownMode?.() ?? "assistant";
-      const rendered = mode === "off"
-        ? this.renderLiteralText(block.markdown || "∅", requestedWidth)
-        : this.renderMarkdown(block, block.markdown || "∅", requestedWidth, false);
-      for (const line of rendered) {
-        lines.push({ text: truncateToWidth(line, requestedWidth), plain: stripAnsi(line), blockIndex, railable: true });
+      try {
+        const markdown = new Markdown(block.markdown || "∅", 2, 0, getMarkdownTheme(), {
+          color: (text) => this.theme.fg(
+            block.role === "user" ? "userMessageText" : block.role === "meta" ? "muted" : "text",
+            text,
+          ),
+        });
+        for (const line of markdown.render(requestedWidth)) {
+          lines.push({ text: truncateToWidth(line, requestedWidth), plain: stripAnsi(line), blockIndex, railable: true });
+        }
+      } catch {
+        try {
+          for (const line of new Text(block.markdown || "∅").render(requestedWidth)) {
+            lines.push({ text: truncateToWidth(line, requestedWidth), plain: stripAnsi(line), blockIndex, railable: true });
+          }
+        } catch {
+          for (const line of (block.markdown || "∅").split("\n")) {
+            lines.push({ text: truncateToWidth(line, requestedWidth), plain: line, blockIndex, railable: true });
+          }
+        }
       }
       blockSpans.push({ blockIndex: snapshotBlockIndex, startLine: blockStartLine, height: lines.length - blockStartLine });
     }
@@ -393,13 +353,6 @@ export class ConversationTimeline implements Component {
   }
 
   private renderToolLines(block: ConversationBlock, width: number): { rendered: string[]; hintLine: number } {
-    const mode = this.options.markdownMode?.() ?? "assistant";
-    if (block.toolResult && (mode === "all" || block.toolArguments === undefined)) {
-      return {
-        rendered: mode === "all" ? this.renderToolMarkdownLines(block, width) : this.renderToolRawLines(block, width),
-        hintLine: -1,
-      };
-    }
     const id = block.toolCallId;
     let component: (Component & { handleMouse?: (event: TuiMouseEvent) => unknown }) | undefined;
     if (id) {
@@ -444,73 +397,6 @@ export class ConversationTimeline implements Component {
         })
       : -1;
     return { rendered, hintLine };
-  }
-
-  private toolOutputText(block: ConversationBlock): string {
-    const output = block.toolResult ? resultContent(block.toolResult)
-      .filter(item => item.type === "text" && typeof item.text === "string")
-      .map(item => item.text as string)
-      .join("\n") : "";
-    return output || block.fullText || block.toolLine || "(no output)";
-  }
-
-  private renderToolRawLines(block: ConversationBlock, width: number): string[] {
-    const source = this.toolOutputText(block);
-    const capped = source.length > RESULT_MAX_CHARS
-      ? `${source.slice(0, RESULT_MAX_CHARS)}\n${truncationNote(source.length - RESULT_MAX_CHARS)}`
-      : source;
-    try {
-      return wrapTextWithAnsi(capped, width).map(line => this.theme.fg("dim", truncateToWidth(line, width)));
-    } catch {
-      return capped.split("\n").map(line => this.theme.fg("dim", truncateToWidth(line, width)));
-    }
-  }
-
-  private renderToolMarkdownLines(block: ConversationBlock, width: number): string[] {
-    const source = this.toolOutputText(block);
-    if (source.length <= RESULT_MAX_CHARS) return this.renderMarkdown(block, source, width, true);
-    const prefix = source.slice(0, RESULT_MAX_CHARS);
-    return [
-      ...this.renderMarkdown(block, prefix, width, true),
-      this.theme.fg("dim", truncationNote(source.length - RESULT_MAX_CHARS)),
-    ];
-  }
-
-  private renderMarkdown(block: ConversationBlock, text: string, width: number, dim: boolean): string[] {
-    let entry = this.markdownCache.get(block);
-    if (!entry) {
-      const defaultStyle = {
-        color: (value: string) => this.theme.fg(
-          dim ? "dim" : block.role === "user" ? "userMessageText" : block.role === "meta" ? "muted" : "text",
-          value,
-        ),
-      };
-      entry = {
-        markdown: new Markdown(text, 0, 0, resolveMarkdownTheme(this.theme), defaultStyle, MARKDOWN_OPTIONS),
-        text,
-      };
-      this.markdownCache.set(block, entry);
-    } else if (entry.text !== text) {
-      const shouldRetry = !text.startsWith(entry.text);
-      entry.markdown.setText(text);
-      entry.text = text;
-      if (shouldRetry) entry.failed = false;
-    }
-    if (entry.failed) return dim ? this.renderToolRawLines(block, width) : this.renderLiteralText(text, width);
-    try {
-      return entry.markdown.render(width).map(line => truncateToWidth(line, width));
-    } catch {
-      entry.failed = true;
-      return dim ? this.renderToolRawLines(block, width) : this.renderLiteralText(text, width);
-    }
-  }
-
-  private renderLiteralText(text: string, width: number): string[] {
-    try {
-      return wrapTextWithAnsi(text || "∅", width).map(line => truncateToWidth(line, width));
-    } catch {
-      return text.split("\n").map(line => truncateToWidth(line, width));
-    }
   }
 
   /**

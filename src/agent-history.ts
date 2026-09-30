@@ -1,8 +1,8 @@
 /** Durable, project-local transcript storage for subagents. */
 
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
-import type { AgentSession, AgentSessionEvent } from "@earendil-works/pi-coding-agent";
+import type { AgentSession } from "@earendil-works/pi-coding-agent";
 
 const SUBAGENTS_DIR = ".pi-subagents";
 const TRANSCRIPTS_DIR = "agent-transcripts";
@@ -44,58 +44,6 @@ export function createAgentHistoryPath(cwd: string, agentId: string): string {
 /** Return the project-relative path stored in the parent session record. */
 export function agentHistoryLocator(cwd: string, historyPath: string): string {
   return relative(cwd, historyPath).split(sep).join("/");
-}
-
-function historyEntry(agentId: string, message: AgentSession["messages"][number], cwd: string): string {
-  return JSON.stringify({
-    isSidechain: true,
-    agentId,
-    type: message.role === "assistant" ? "assistant" : message.role === "user" ? "user" : "toolResult",
-    message,
-    timestamp: new Date().toISOString(),
-    cwd,
-  }) + "\n";
-}
-
-/** Write the first user prompt without involving the optional `.output` file. */
-export function writeAgentHistoryInitialEntry(path: string, agentId: string, prompt: string, cwd: string): void {
-  if (existsSync(path)) return;
-  writeFileSync(path, historyEntry(agentId, { role: "user", content: prompt } as AgentSession["messages"][number], cwd), "utf8");
-}
-
-/** Stream every new session message to the mandatory durable history file. */
-export function streamAgentHistory(
-  session: AgentSession,
-  path: string,
-  agentId: string,
-  cwd: string,
-  startIndex = 1,
-): () => void {
-  let writtenCount = startIndex;
-  const messages = (): AgentSession["messages"] => Array.isArray(session.messages) ? session.messages : [];
-  const flush = () => {
-    const currentMessages = messages();
-    while (writtenCount < currentMessages.length) {
-      try {
-        appendFileSync(path, historyEntry(agentId, currentMessages[writtenCount]!, cwd), "utf8");
-      } catch {
-        // A read-only project must not turn a model event into a failed run.
-      }
-      writtenCount++;
-    }
-  };
-  const unsubscribe = typeof session.subscribe === "function"
-    ? session.subscribe((event: AgentSessionEvent) => {
-        if (event.type === "turn_end" || event.type === "compaction_start") flush();
-        if (event.type === "compaction_end" && !event.aborted && event.result) {
-          queueMicrotask(() => { writtenCount = messages().length; });
-        }
-      })
-    : () => {};
-  return () => {
-    flush();
-    unsubscribe();
-  };
 }
 
 /** Resolve only paths in this package's project-local transcript namespace. */

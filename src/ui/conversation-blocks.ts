@@ -251,10 +251,6 @@ function bashBlock(
   const body = command ? `$ ${command}${output ? `\n${output}` : ""}` : output;
   const toolLine = `· bash → ${command || "(no command)"}`;
   const fullText = bound(body, maxChars);
-  const result: ConversationToolResultSnapshot = {
-    toolName: "bash",
-    content: [{ type: "text", text: body }],
-  };
   return {
     id,
     kind: "tool",
@@ -265,8 +261,6 @@ function bashBlock(
     fullText,
     toolLine,
     toolName: "bash",
-    toolResult: result,
-    result,
   };
 }
 

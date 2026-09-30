@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.17] - 2026-09-30
+
+### Changed
+- **Intentionally rolled the runtime and UI back to the v0.17.6 baseline (`64bbbb0`)** to reset the shipped behavior instead of carrying forward the post-v0.17.6 runtime changes.
+- **Archived post-v0.17.6 work as documentation-only specifications**: `ROADMAP.md` and `docs/post-0.17.6-*.md` remain included as v0.17.17 deliverables for future implementation, but are not part of the runtime reset.
+
 ## [0.17.16] - 2026-09-30
 
 ### Changed
