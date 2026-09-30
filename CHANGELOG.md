@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.8] - 2026-09-30
+
+### Fixed
+- **The Agents panel now preserves the previous keyboard navigator and opens live or recovered agent history from Enter**, including terminal records that are still available in `.pi-subagents` history.
+
 ## [0.17.7] - 2026-09-30
 
 ### Added

@@ -1150,7 +1150,13 @@ export default function (pi: ExtensionAPI) {
   // everything else; "off" = hide the widget entirely. Read live at render time.
   let widgetMode: WidgetMode = "background";
   function getWidgetMode(): WidgetMode { return widgetMode; }
-  const widget = new AgentWidget(manager, agentActivity, getWidgetMode, isShowCostEnabled, isShowModelEnabled);
+  const widget = new AgentWidget(manager, agentActivity, getWidgetMode, {
+    canOpenHistory: (record) => canOpenAgentHistory(record, currentCtx?.cwd),
+    onOpen: (record) => {
+      if (currentCtx) void viewAgentConversation(currentCtx as unknown as ExtensionCommandContext, record);
+    },
+    showCost: isShowCostEnabled,
+  }, isShowModelEnabled);
   function setWidgetMode(m: WidgetMode): void { widgetMode = m; widget.update(); }
 
   // Claude Code-style FleetView: navigable list of main + subagents below the editor.

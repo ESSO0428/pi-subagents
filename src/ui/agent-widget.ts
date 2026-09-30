@@ -27,6 +27,7 @@ export type AgentWidgetOpenMode = "live" | "history";
 export interface AgentWidgetOptions {
   canOpenHistory?: (record: import("../types.js").AgentRecord) => boolean;
   onOpen?: (record: import("../types.js").AgentRecord, mode: AgentWidgetOpenMode) => void;
+  showCost?: () => boolean;
 }
 
 /** Braille spinner frames for animated running indicator. */
@@ -320,7 +321,7 @@ export class AgentWidget {
       this.showCost = showCostOrOptions;
       this.openOptions = {};
     } else {
-      this.showCost = () => false;
+      this.showCost = showCostOrOptions.showCost ?? (() => false);
       this.openOptions = showCostOrOptions;
     }
     this.showModel = showModel;
@@ -411,7 +412,9 @@ export class AgentWidget {
     const agents = this.widgetAgents().filter(agent =>
       agent.status === "running" || agent.status === "queued" || (agent.completedAt !== undefined && this.shouldShowFinished(agent.id, agent.status)),
     );
-    return agents.sort((a, b) => {
+    return agents.filter(agent =>
+      agent.status === "running" || agent.status === "queued" || (this.openOptions.canOpenHistory?.(agent) ?? true),
+    ).sort((a, b) => {
       const activeA = a.status === "running" || a.status === "queued" ? 0 : 1;
       const activeB = b.status === "running" || b.status === "queued" ? 0 : 1;
       return activeA - activeB;
@@ -605,7 +608,8 @@ export class AgentWidget {
     const maxBody = Math.max(1, budget - 1); // heading takes 1 line
     const totalBody = finishedLines.length + runningLines.length * 2 + (queuedLine ? 1 : 0);
 
-    const lines: string[] = [truncate(theme.fg(headingColor, headingIcon) + " " + theme.fg(headingColor, "Agents"))];
+    const hint = "↑↓ select · enter view · esc back";
+    const lines: string[] = [truncate(theme.fg(headingColor, headingIcon) + " " + theme.fg(headingColor, "Agents") + "  " + theme.fg("dim", hint))];
 
     if (totalBody <= maxBody) {
       // Everything fits — add all lines and fix up connectors for the last item.
