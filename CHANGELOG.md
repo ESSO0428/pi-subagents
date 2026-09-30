@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.9] - 2026-09-30
+
+### Fixed
+- **Restored v0.17.6 Agents-panel input behavior**: key-release events and non-editor focus no longer steal prompt/menu navigation, spinner updates remain animated, and very short terminals can hide the widget to preserve editor space.
+
 ## [0.17.8] - 2026-09-30
 
 ### Fixed

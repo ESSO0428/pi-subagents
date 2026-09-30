@@ -184,6 +184,7 @@ describe("AgentWidget live records", () => {
   });
 
   it("reserves editor space on short terminals while retaining the widget ceiling", () => {
+    expect(getWidgetLineBudget(3)).toBe(0);
     expect(getWidgetLineBudget(9)).toBe(5);
     expect(getWidgetLineBudget(100)).toBe(MAX_WIDGET_LINES);
   });
@@ -236,6 +237,33 @@ describe("AgentWidget live records", () => {
     expect(harness.input("\u001b[B")).toBeUndefined();
     expect(harness.input("\u001b[A")).toBeUndefined();
     harness.widget.dispose();
+  });
+
+  it("ignores key-release events and non-editor focus", () => {
+    const running = makeRecord({ id: "running", status: "running", completedAt: undefined });
+    const harness = createNavigableWidgetHarness([running]);
+
+    expect(harness.input("\u001b[1;1:3B")).toBeUndefined();
+    harness.tui.focusedComponent = {};
+    expect(harness.input("\u001b[B")).toBeUndefined();
+    expect((harness.widget as any).navigationActive).toBe(false);
+    harness.widget.dispose();
+  });
+
+  it("advances the spinner on timer refreshes even when the data snapshot is unchanged", () => {
+    vi.useFakeTimers();
+    try {
+      const running = makeRecord({ id: "running", status: "running", completedAt: undefined });
+      const harness = createNavigableWidgetHarness([running]);
+      const initialFrame = (harness.widget as any).widgetFrame;
+      harness.widget.ensureTimer();
+      vi.advanceTimersByTime(250);
+      expect((harness.widget as any).widgetFrame).toBeGreaterThan(initialFrame);
+      expect(harness.tui.requestRender).toHaveBeenCalled();
+      harness.widget.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("navigates with arrows and opens a selected running agent in live mode", () => {

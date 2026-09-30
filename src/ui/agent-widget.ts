@@ -5,7 +5,7 @@
  * Uses the callback form of setWidget for themed rendering.
  */
 
-import { truncateToWidth } from "@earendil-works/pi-tui";
+import { Editor, isKeyRelease, Key, matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
 import { renderAgentName } from "../agent-color.js";
 import { type AgentManager, isTopLevelAgent } from "../agent-manager.js";
 import { getConfig } from "../agent-types.js";
@@ -19,7 +19,8 @@ export const MAX_WIDGET_LINES = 12;
 
 /** Number of lines available above an editor, retaining room for the prompt. */
 export function getWidgetLineBudget(terminalRows: number): number {
-  return Math.max(1, Math.min(MAX_WIDGET_LINES, Math.floor(terminalRows) - 4));
+  if (!Number.isFinite(terminalRows)) return MAX_WIDGET_LINES;
+  return Math.min(MAX_WIDGET_LINES, Math.max(0, Math.floor(terminalRows) - 4));
 }
 
 export type AgentWidgetOpenMode = "live" | "history";
@@ -348,19 +349,19 @@ export class AgentWidget {
   }
 
   /** Set the UI context (grabbed from first tool execution). */
-  setUICtx(ctx: UICtx) {
-    if (ctx !== this.uiCtx) {
-      this.inputCleanup?.();
-      this.inputCleanup = undefined;
-      this.uiCtx = ctx;
-      this.widgetRegistered = false;
-      this.tui = undefined;
-      this.lastStatusText = undefined;
-      this.navigationActive = false;
-      this.selectedAgentId = undefined;
-      this.viewportStart = 0;
-      if (ctx.onTerminalInput) this.inputCleanup = ctx.onTerminalInput(data => this.handleInput(data));
-    }
+  setUICtx(ctx: UICtx): boolean {
+    if (ctx === this.uiCtx) return false;
+    this.inputCleanup?.();
+    this.inputCleanup = undefined;
+    this.uiCtx = ctx;
+    this.widgetRegistered = false;
+    this.tui = undefined;
+    this.lastStatusText = undefined;
+    this.navigationActive = false;
+    this.selectedAgentId = undefined;
+    this.viewportStart = 0;
+    if (ctx.onTerminalInput) this.inputCleanup = ctx.onTerminalInput(data => this.handleInput(data));
+    return true;
   }
 
   /**
@@ -379,7 +380,7 @@ export class AgentWidget {
   /** Ensure the widget update timer is running. */
   ensureTimer() {
     if (!this.widgetInterval) {
-      this.widgetInterval = setInterval(() => this.update(), 80);
+      this.widgetInterval = setInterval(() => this.update(true), 250);
     }
   }
 
@@ -429,13 +430,26 @@ export class AgentWidget {
     this.viewportStart = Math.max(0, Math.min(this.viewportStart, Math.max(0, roster.length - visibleRows)));
   }
 
+  private editorHasFocus(): boolean {
+    const focused = (this.tui as { focusedComponent?: unknown } | undefined)?.focusedComponent;
+    return focused == null || focused instanceof Editor;
+  }
+
+  private deactivate(): void {
+    this.navigationActive = false;
+    this.requestUiRefresh();
+  }
+
   private handleInput(data: string): { consume?: boolean; data?: string } | undefined {
-    const down = data === "\u001b[B";
-    const up = data === "\u001b[A";
+    if (!this.uiCtx || isKeyRelease(data)) return undefined;
+    if (!this.editorHasFocus()) {
+      if (this.navigationActive) this.deactivate();
+      return undefined;
+    }
+
     if (!this.navigationActive) {
-      if (!down || !this.tui || this.uiCtx?.getEditorText?.() !== "") return undefined;
       const roster = this.navigationAgents();
-      if (roster.length === 0) return undefined;
+      if (!matchesKey(data, "down") || (this.uiCtx.getEditorText?.() ?? "") !== "" || roster.length === 0) return undefined;
       this.navigationActive = true;
       const index = this.selectedAgentId ? roster.findIndex(agent => agent.id === this.selectedAgentId) : -1;
       this.selectedRosterIndex = index >= 0 ? index : 0;
@@ -444,25 +458,25 @@ export class AgentWidget {
       this.requestUiRefresh();
       return { consume: true };
     }
-    if (data === "\u001b") {
-      this.navigationActive = false;
-      this.requestUiRefresh();
+
+    if (matchesKey(data, "escape")) {
+      this.deactivate();
       return { consume: true };
     }
-    if (down || up) {
+    if (matchesKey(data, "up") || matchesKey(data, "down")) {
       const roster = this.navigationAgents();
       if (roster.length === 0) return { consume: true };
-      if (up && this.selectedRosterIndex === 0) {
-        this.navigationActive = false;
+      if (matchesKey(data, "up") && this.selectedRosterIndex === 0) {
+        this.deactivate();
       } else {
-        this.selectedRosterIndex = Math.max(0, Math.min(roster.length - 1, this.selectedRosterIndex + (down ? 1 : -1)));
+        this.selectedRosterIndex = Math.max(0, Math.min(roster.length - 1, this.selectedRosterIndex + (matchesKey(data, "down") ? 1 : -1)));
         this.selectedAgentId = roster[this.selectedRosterIndex]?.id;
         this.updateViewport(roster);
+        this.requestUiRefresh();
       }
-      this.requestUiRefresh();
       return { consume: true };
     }
-    if (data === "\r" || data === "\n") {
+    if (matchesKey(data, Key.enter)) {
       const record = this.navigationAgents()[this.selectedRosterIndex];
       if (record) {
         const terminal = record.status !== "running" && record.status !== "queued";
@@ -472,11 +486,13 @@ export class AgentWidget {
       }
       return { consume: true };
     }
-    this.navigationActive = false;
+
+    // Only arrow keys navigate. Other keys flow to the editor and leave navigation mode.
+    this.deactivate();
     return undefined;
   }
 
-  private requestUiRefresh(force = false): boolean {
+  private requestUiRefresh(force = true): boolean {
     if (!this.tui || typeof this.tui.requestRender !== "function") return false;
     this.tui.requestRender(force);
     return true;
@@ -545,6 +561,7 @@ export class AgentWidget {
 
     const w = tui.terminal.columns;
     const budget = getWidgetLineBudget(tui.terminal.rows ?? 24);
+    if (budget === 0) return [];
     const truncate = (line: string) => truncateToWidth(line.replace(/[\r\n]+/g, " "), w);
     const headingColor = hasActive ? "accent" : "dim";
     const headingIcon = hasActive ? "●" : "○";
@@ -715,7 +732,7 @@ export class AgentWidget {
   }
 
   /** Force an immediate widget update. */
-  update() {
+  update(advanceSpinner = false) {
     if (!this.uiCtx) return;
     const allAgents = this.widgetAgents();
     if (this.navigationActive || this.selectedAgentId) {
@@ -779,6 +796,8 @@ export class AgentWidget {
       this.lastStatusText = newStatusText;
     }
 
+    if (advanceSpinner && runningCount > 0) this.widgetFrame++;
+
     const snapshot = allAgents.map(agent => {
       const activity = this.agentActivity.get(agent.id);
       return [
@@ -794,9 +813,9 @@ export class AgentWidget {
         Math.floor((Date.now() - agent.startedAt) / 1000),
       ].join("\u0000");
     }).join("\u0001");
-    if (this.widgetRegistered && snapshot === this.lastSnapshot) return;
+    if (this.widgetRegistered && snapshot === this.lastSnapshot && !advanceSpinner) return;
     this.lastSnapshot = snapshot;
-    this.widgetFrame++;
+    if (!advanceSpinner) this.widgetFrame++;
 
     // Register widget callback once; subsequent updates use requestRender()
     // which re-invokes render() without replacing the component (avoids layout thrashing).
