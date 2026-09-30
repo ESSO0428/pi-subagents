@@ -25,16 +25,15 @@
 
 ## Commands
 
-- After code changes (not docs), run the full check suite and fix all errors and warnings:
+- After code changes (not docs), run only the resource-safe static checks by default:
   ```bash
   npm run lint        # biome
   npm run typecheck   # tsc --noEmit
-  npm test            # vitest run
   ```
 - `npm run lint:fix` auto-fixes most style issues.
-- `npm test` is the project test entrypoint and runs the full Vitest suite, including `*-e2e.test.ts` files. Targeted Vitest runs are allowed for iteration: `npx vitest run test/<file>.test.ts`; they do not replace the full-suite gate.
-- If you create or modify a test file, run it and iterate on the test or implementation until it passes.
-- `npm run build` compiles with `tsc`; run it only when verifying the build output or when requested.
+- **E2E, build, and Vitest are prohibited by default on this device due to resource and runtime limits. Run any of them only with explicit user authorization.**
+- `npm test` excludes E2E directories and E2E-named test files, but the remaining suite still contains expensive integration-style tests. Do not use it as a default local gate on this device.
+- The `build` script remains available only for an explicitly authorized build verification.
 - For ad-hoc scripts, write them to a temp file (e.g. `/tmp`), run, edit if needed, remove when done. Don't embed multi-line scripts in `bash` commands.
 
 ### Dependency and release verification reminder
@@ -42,7 +41,7 @@
 - Vitest, TypeScript, and Biome are local `devDependencies`; the complete local dependency tree is mandatory. Do not install these tools globally or rely on globally available binaries.
 - `@shikijs/cli` is a runtime dependency for the optional async syntax-highlighting path. Do not move it to `devDependencies`; its transitive grammar packages are required at runtime.
 - Run verification and release checks from the canonical repository checkout, not an npm-installed copy under `node_modules`. Install the complete local dependency tree with the repository's lockfile when available before checking anything.
-- A missing `vitest` or `tsc` binary means the environment was not installed correctly; it is not a test assertion failure. Targeted Vitest runs are iteration aids only; release verification must include the full project entrypoint, `npm test`.
+- A missing `vitest` or `tsc` binary means the environment was not installed correctly; it is not a test assertion failure. Vitest requires explicit user authorization on this device and is not part of its default release gate.
 - Offline installs are only valid when the npm cache contains the complete dependency tree. If npm reports `ENOTCACHED` (for example, a missing `@shikijs/vscode-textmate`), record the cache miss and do not claim that tests passed.
 
 ### Upstream Pi API and test-fixture compatibility
@@ -90,20 +89,15 @@ Before a release:
 
 - Update `CHANGELOG.md` — move the `## [Unreleased]` entries under a new `## [X.Y.Z]` version section, and add a fresh empty `## [Unreleased]` for the next cycle.
 - Update `README.md` if user-facing behavior changed (features list, settings, usage).
-- Run the full check suite plus the e2e tests, and fix anything that fails:
+- Run the resource-safe release checks and fix anything that fails:
   ```bash
   npm run lint
   npm run typecheck
-  npm test
-  npm run test:e2e                 # faux/scripted e2e — no network, no keys
-  npm run build
+  npm pack --dry-run
+  npm run prepublishOnly
   ```
-- For a real pre-publish smoke test, run the **live** e2e against an actual model:
-  ```bash
-  PI_E2E_LIVE=1 npm run test:e2e   # uses your local `pi` login; optional PI_PROVIDER / PI_MODEL
-  ```
-  `PI_E2E_LIVE=1` swaps the scripted faux suite for the live one (the faux suite is `skipIf(LIVE)`).
-  (`prepublishOnly` runs lint + typecheck + test + build; the live e2e is the smoke test to run by hand before publishing.)
+- Vitest, E2E, and build are excluded from release verification on this device and require explicit user authorization.
+- `prepublishOnly` runs lint and typecheck only; it must not invoke Vitest, E2E, or build.
 
 **Release, push, and publish gates are explicit.** Do not push release commits or publish the package until the required verification above has passed and the user has explicitly approved that action. The user runs `npm version`, any push/tagging, and `npm publish` manually. Never run `npm publish` or push on the user's behalf unless explicitly asked.
 

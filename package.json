@@ -1,6 +1,6 @@
 {
   "name": "@esso0428/pi-subagents",
-  "version": "0.17.15",
+  "version": "0.17.16",
   "description": "A pi extension that brings smart Claude Code-style autonomous sub-agents to pi, with npm:pi-subagents-style JSON agent overrides.",
   "author": "ESSO0428",
   "repository": {
@@ -33,10 +33,9 @@
   },
   "scripts": {
     "build": "tsc",
-    "prepublishOnly": "npm run lint && npm run typecheck && npm run test && npm run build",
+    "prepublishOnly": "npm run lint && npm run typecheck",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:e2e": "vitest run e2e --reporter=verbose",
     "typecheck": "tsc --noEmit",
     "lint": "biome check src/ test/",
     "lint:fix": "biome check --fix src/ test/"

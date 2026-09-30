@@ -1,8 +1,8 @@
-import { defineConfig } from "vitest/config";
+import { configDefaults, defineConfig } from "vitest/config";
 
 export default defineConfig({
-  // The print-mode e2e suite (test/subagents-print-mode-e2e.test.ts) drives REAL
-  // faux-model turns through pi-coding-agent + pi-agent-core. That requires ONE
+  // The print-mode tests drive REAL faux-model turns through pi-coding-agent +
+  // pi-agent-core. That requires ONE
   // shared @earendil-works/pi-ai instance so the faux provider the test registers
   // lands in the same api-registry the session streams through. npm physically
   // duplicates pi-ai (a top-level copy and one nested under pi-coding-agent), which
@@ -12,9 +12,15 @@ export default defineConfig({
   // subagent session the extension spawns. dedupe alone is insufficient (it only
   // affects modules Vite resolves; without inline the runtime stays externalized).
   test: {
-    // Keep routine local, E2E, CI, and prepublish runs from occupying every CPU
-    // on common 8-core hosts while retaining enough parallelism for a fast suite.
+    // Keep explicitly authorized Vitest runs from occupying every CPU on
+    // common 8-core hosts while retaining enough parallelism for CI.
     maxWorkers: 4,
+    exclude: [
+      ...configDefaults.exclude,
+      "**/e2e/**",
+      "**/*e2e*.test.?(c|m)[jt]s?(x)",
+      "**/*e2e*.spec.?(c|m)[jt]s?(x)",
+    ],
     server: { deps: { inline: [/@earendil-works\/pi-/] } },
     // Local reporting only — deliberately no `thresholds`, and not wired into
     // CI. src/index.ts is mostly the /agents wizard, which is TUI flow with

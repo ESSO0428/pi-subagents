@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.16] - 2026-09-30
+
+### Changed
+- **Made local verification resource-safe by default** by removing the E2E script, excluding E2E directories and E2E-named tests from Vitest, and removing Vitest and the build from prepublish checks. Vitest, E2E, and build now require explicit user authorization on this device.
+
 ## [0.17.15] - 2026-09-30
 
 ### Changed
