@@ -432,10 +432,10 @@ Check status and retrieve results from a background agent.
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `agent_id` | string | yes | Agent ID to check |
-| `wait` | boolean | no | Wait for completion |
+| `wait` | boolean | no | Deprecated compatibility flag; never blocks |
 | `verbose` | boolean | no | Include full conversation log |
 
-Cancelling a `wait: true` call (for example, with `Esc`) stops only the wait. The background agent keeps running, and its completion notification still arrives normally.
+`get_subagent_result` never blocks. If an agent is still running or queued, the tool returns the current status immediately; wait for the background or wait-group completion notification for the expandable final output.
 
 ### `steer_subagent`
 

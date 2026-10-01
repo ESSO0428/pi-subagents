@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.20] - 2026-10-01
+
+### Changed
+- **Removed blocking waits from `get_subagent_result`**: the legacy `wait` parameter is now a non-blocking compatibility flag. Running or queued agents return their current status immediately, while background and wait-group completion notifications remain the expandable output surface for finished results.
+
 ## [0.17.19] - 2026-09-30
 
 ### Added
