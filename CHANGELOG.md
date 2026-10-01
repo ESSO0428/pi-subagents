@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.22] - 2026-10-01
+
+### Changed
+- **Clarified the wait-group result retrieval flow**: background and wait-group completion notifications, the `Agent` tool description, prompt guidelines, and background spawn results now instruct the parent agent to call `get_subagent_result` once per completed task ID with `wait` omitted or `false`. This restores Pi's native expandable `Get Subagent Result` tool-result UI without reintroducing blocking waits, since custom `sendMessage` notifications cannot render native tool-result cards.
+
 ## [0.17.21] - 2026-10-01
 
 ### Fixed

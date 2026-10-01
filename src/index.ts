@@ -321,6 +321,10 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
+  const resultRetrievalInstruction =
+    "Next action: call get_subagent_result once for each <task-id> above, with wait omitted or false, " +
+    "to render native expandable Get Subagent Result tool output. Do not pass wait:true.";
+
   // ---- Individual nudge helper (async join mode) ----
   function emitIndividualNudge(record: AgentRecord) {
     if (record.resultConsumed) return;  // re-check at send time
@@ -330,7 +334,7 @@ export default function (pi: ExtensionAPI) {
 
     pi.sendMessage<NotificationDetails>({
       customType: "subagent-notification",
-      content: notification + footer,
+      content: `${notification + footer}\n\n${resultRetrievalInstruction}`,
       display: true,
       details: buildNotificationDetails(record, 500, agentActivity.get(record.id)),
     }, { deliverAs: "followUp", triggerTurn: true });
@@ -370,7 +374,7 @@ export default function (pi: ExtensionAPI) {
 
         pi.sendMessage<NotificationDetails>({
           customType: "subagent-notification",
-          content: `Background agent group completed: ${label}\n\n${notifications}\n\nUse get_subagent_result for full output.`,
+          content: `Background agent group completed: ${label}\n\n${notifications}\n\n${resultRetrievalInstruction}`,
           display: true,
           details,
         }, { deliverAs: "followUp", triggerTurn: true });
@@ -408,7 +412,7 @@ export default function (pi: ExtensionAPI) {
 
       pi.sendMessage<NotificationDetails>({
         customType: "subagent-notification",
-        content: `Background agent wait group completed: ${summary} (group ${groupId}).${consumedNote}\n\n${notifications}\n\nUse get_subagent_result for full output.`,
+        content: `Background agent wait group completed: ${summary} (group ${groupId}).${consumedNote}\n\n${notifications}\n\n${resultRetrievalInstruction}`,
         display: true,
         details,
       }, { deliverAs: "followUp", triggerTurn: true });
@@ -900,6 +904,7 @@ If the target is already known, use a direct tool — \`read\` for a known path,
 - Trust but verify: an agent's summary describes what it intended to do, not necessarily what it did. When an agent writes or edits code, check the actual changes before reporting work as done.
 - Use run_in_background for work you don't need immediately. You will be notified when it completes — do NOT poll or sleep waiting for it. Continue with other work or respond to the user instead.
 - For nonblocking grouped notification, set wait: true with run_in_background: true. Omit wait_group for a one-agent implicit group, or create an explicit group with subagent_wait_group and seal it (or set wait_group_done: true on the final Agent call).
+- When a background or wait-group completion notification arrives, call get_subagent_result once per completed task-id with wait omitted or false before summarizing if the user needs the outputs. This preserves native expandable Get Subagent Result UI without blocking.
 - Foreground vs background: use foreground (default) when you need the agent's results before you can proceed. Use background when you have genuinely independent work to do in parallel.
 - Use resume with an agent ID to continue a previous agent's work. A new (non-resume) Agent call starts a fresh agent with no memory of prior runs, so the prompt must be self-contained.
 - Use steer_subagent to send mid-run messages to a running background agent.
@@ -980,6 +985,7 @@ Terse command-style prompts produce shallow, generic work.
       "For broad codebase exploration or research, spawn Agent with an appropriate subagent_type (e.g. Explore). Otherwise use direct tools (read, grep, find) when the target is already known.",
       "When an agent runs in the background, you will be notified on completion — do not poll or sleep waiting for it. Continue with other work instead.",
       "For a nonblocking grouped notification, use wait: true with run_in_background: true; create/update/seal explicit groups with subagent_wait_group.",
+      "When a background or wait-group completion notification arrives, call get_subagent_result once per completed task-id with wait omitted or false before summarizing if the user needs the outputs; this preserves native expandable result UI without blocking.",
       "Trust but verify: an agent's summary describes intent, not outcome. When an agent writes or edits code, check the actual changes before reporting work as done.",
     ],
     parameters: Type.Object({
@@ -1447,7 +1453,7 @@ Terse command-style prompts produce shallow, generic work.
             ? `\nWait group: ${effectiveWaitGroupId}${implicitWaitGroupId || waitGroupDone ? " (sealed)" : " (open — seal it with subagent_wait_group)"}.\n` +
               `You will receive one grouped notification when the sealed wait group completes.\n`
             : `\nYou will be notified when this agent completes.\n`) +
-          `Use get_subagent_result to retrieve full results, or steer_subagent to send it messages.\n` +
+          `After the completion notification, call get_subagent_result with wait omitted or false to render native expandable results; use steer_subagent to send messages while it is running.\n` +
           `Do not duplicate this agent's work.`,
           { ...detailBase, toolUses: 0, tokens: "", durationMs: 0, status: "background" as const, agentId: id },
         );

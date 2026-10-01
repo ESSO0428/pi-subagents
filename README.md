@@ -91,7 +91,7 @@ Agent({
 })
 ```
 
-`subagent_wait_group` supports `create`, `update`, and `seal`. A sealed group sends one notification after every member reaches a terminal state (`completed`, `steered`, `error`, `stopped`, or `aborted`). If `wait: true` is used without `wait_group`, the extension creates and seals a one-agent implicit group.
+`subagent_wait_group` supports `create`, `update`, and `seal`. A sealed group sends one notification after every member reaches a terminal state (`completed`, `steered`, `error`, `stopped`, or `aborted`). If `wait: true` is used without `wait_group`, the extension creates and seals a one-agent implicit group. After a completion notification, call `get_subagent_result` once per completed task ID with `wait` omitted or `false` to render native expandable result cards without blocking.
 
 ### Scheduling
 
@@ -435,7 +435,7 @@ Check status and retrieve results from a background agent.
 | `wait` | boolean | no | Deprecated compatibility flag; never blocks |
 | `verbose` | boolean | no | Include full conversation log |
 
-`get_subagent_result` never blocks. If an agent is still running or queued, the tool returns the current status immediately; wait for the background or wait-group completion notification for the expandable final output.
+`get_subagent_result` never blocks. If an agent is still running or queued, the tool returns the current status immediately. After a background or wait-group completion notification, call it with `wait` omitted or `false` to retrieve the final output through Pi's native expandable tool-result UI.
 
 ### `steer_subagent`
 
