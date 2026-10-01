@@ -806,6 +806,10 @@ export async function runAgent(
     model,
     tools: sessionTools,
     resourceLoader: loader,
+    // Child subagent sessions run inside the parent Pi process; they are not a
+    // fresh interactive app startup. Mark their extension lifecycle as a fork so
+    // startup-only UI/theme extensions do not clear or rewrite the parent TUI.
+    sessionStartEvent: { type: "session_start", reason: "fork" },
     ...(trackedWriteTool && { customTools: [trackedWriteTool as any] }),
   };
   if (sessionExcludeTools) {

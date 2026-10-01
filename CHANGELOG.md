@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.21] - 2026-10-01
+
+### Fixed
+- **Marked child subagent sessions as forked extension lifecycles** so startup-only UI/theme extensions do not treat in-process child agents as a fresh interactive app launch and clear or rewrite the parent TUI.
+
 ## [0.17.20] - 2026-10-01
 
 ### Changed
