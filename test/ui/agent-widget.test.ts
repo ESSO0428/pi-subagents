@@ -439,6 +439,26 @@ describe("AgentWidget live records", () => {
     harness.widget.dispose();
   });
 
+  it("does not repeat the tree terminator at the end of a clipped roster", () => {
+    const running = makeRecord({ id: "running", status: "running", completedAt: undefined });
+    const queued = Array.from({ length: 8 }, (_, index) => makeRecord({
+      id: `queued-${index}`,
+      description: `queued target ${index}`,
+      status: "queued",
+      completedAt: undefined,
+    }));
+    const harness = createNavigableWidgetHarness([running, ...queued], { rows: 10 });
+
+    for (let index = 0; index < 20; index++) harness.input("\u001b[B");
+    const atEnd = harness.render();
+
+    // Reached the end with rows hidden above, so the footer only reserves height.
+    expect(atEnd.join("\n")).toContain("↑");
+    const terminators = atEnd.filter((line) => line.trimStart().startsWith("└─"));
+    expect(terminators.length).toBe(1);
+    harness.widget.dispose();
+  });
+
   it("resets retained navigation state for an empty roster, new context, and dispose", () => {
     const record = makeRecord({ id: "selected", status: "running", completedAt: undefined });
     const records = [record];

@@ -751,8 +751,10 @@ export class AgentWidget {
       } else if (!showTopMore) {
         lines.push(truncate(theme.fg("dim", "└─") + ` ${theme.fg("dim", summary)}`));
       } else {
-        // Keep a stable footer row when the selected viewport reaches the end.
-        lines.push(truncate(theme.fg("dim", "└─")));
+        // Scrolled to the end with rows hidden above. The final visible roster
+        // row already carries the tree terminator, so this row only reserves
+        // height for a stable footer — repeating `└─` would draw two of them.
+        lines.push("   ");
       }
     }
 

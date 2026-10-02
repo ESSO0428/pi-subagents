@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.27] - 2026-10-02
+
+### Fixed
+- **Stopped the agents widget from drawing two tree terminators at once**: v0.17.26 taught the clipped render path to mark the final visible row as `└─`, but the footer's stable-height placeholder for the "scrolled to the end with rows hidden above" case was itself a bare `└─`, so both appeared stacked. That placeholder now reserves the row with blank indentation instead.
+
 ## [0.17.26] - 2026-10-02
 
 ### Fixed
