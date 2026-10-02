@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.25] - 2026-10-02
+
+### Fixed
+- **Suspended the roster key listener for the remaining widget-owned dialogs**: v0.17.24 routed `ctx.ui.select`, `ctx.ui.editor`, and `ctx.ui.custom` through `withModal()` but left `ctx.ui.input` and `ctx.ui.confirm` outside it. Those dialogs are reached only after a wrapped modal has already cleared roster navigation, so the listener could still swallow a stray `↓`, and any future path that opens one directly would lose `escape`/`↑`/`↓`/`enter` entirely. Every remaining modal call now runs inside `withModal()` as well.
+
 ## [0.17.24] - 2026-10-02
 
 ### Fixed

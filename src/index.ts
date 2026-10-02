@@ -2158,7 +2158,7 @@ Terse command-style prompts produce shallow, generic work.
       }
     } else if (choice === "Delete") {
       if (file) {
-        const confirmed = await ctx.ui.confirm("Delete agent", `Delete ${name} from ${file.location} (${file.path})?`);
+        const confirmed = await withModal(() => ctx.ui.confirm("Delete agent", `Delete ${name} from ${file.location} (${file.path})?`));
         if (confirmed) {
           unlinkSync(file.path);
           reloadCustomAgents();
@@ -2166,7 +2166,7 @@ Terse command-style prompts produce shallow, generic work.
         }
       }
     } else if (choice === "Reset to default" && file) {
-      const confirmed = await ctx.ui.confirm("Reset to default", `Delete override ${file.path} and restore embedded default?`);
+      const confirmed = await withModal(() => ctx.ui.confirm("Reset to default", `Delete override ${file.path} and restore embedded default?`));
       if (confirmed) {
         unlinkSync(file.path);
         reloadCustomAgents();
@@ -2194,7 +2194,7 @@ Terse command-style prompts produce shallow, generic work.
 
     const targetPath = join(targetDir, `${name}.md`);
     if (existsSync(targetPath)) {
-      const overwrite = await ctx.ui.confirm("Overwrite", `${targetPath} already exists. Overwrite?`);
+      const overwrite = await withModal(() => ctx.ui.confirm("Overwrite", `${targetPath} already exists. Overwrite?`));
       if (!overwrite) return;
     }
 
@@ -2307,17 +2307,17 @@ Terse command-style prompts produce shallow, generic work.
   }
 
   async function showGenerateWizard(ctx: ExtensionCommandContext, targetDir: string) {
-    const description = await ctx.ui.input("Describe what this agent should do");
+    const description = await withModal(() => ctx.ui.input("Describe what this agent should do"));
     if (!description) return;
 
-    const name = await ctx.ui.input("Agent name (filename, no spaces)");
+    const name = await withModal(() => ctx.ui.input("Agent name (filename, no spaces)"));
     if (!name) return;
 
     mkdirSync(targetDir, { recursive: true });
 
     const targetPath = join(targetDir, `${name}.md`);
     if (existsSync(targetPath)) {
-      const overwrite = await ctx.ui.confirm("Overwrite", `${targetPath} already exists. Overwrite?`);
+      const overwrite = await withModal(() => ctx.ui.confirm("Overwrite", `${targetPath} already exists. Overwrite?`));
       if (!overwrite) return;
     }
 
@@ -2384,11 +2384,11 @@ Write the file using the write tool. Only write the file, nothing else.`;
 
   async function showManualWizard(ctx: ExtensionCommandContext, targetDir: string) {
     // 1. Name
-    const name = await ctx.ui.input("Agent name (filename, no spaces)");
+    const name = await withModal(() => ctx.ui.input("Agent name (filename, no spaces)"));
     if (!name) return;
 
     // 2. Description
-    const description = await ctx.ui.input("Description (one line)");
+    const description = await withModal(() => ctx.ui.input("Description (one line)"));
     if (!description) return;
 
     // 3. Tools
@@ -2403,7 +2403,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
     } else if (toolChoice.startsWith("read-only")) {
       tools = "read, bash, grep, find, ls";
     } else {
-      const customTools = await ctx.ui.input("Tools (comma-separated)", BUILTIN_TOOL_NAMES.join(", "));
+      const customTools = await withModal(() => ctx.ui.input("Tools (comma-separated)", BUILTIN_TOOL_NAMES.join(", ")));
       if (!customTools) return;
       tools = customTools;
     }
@@ -2423,7 +2423,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
     else if (modelChoice === "sonnet") modelLine = "\nmodel: anthropic/claude-sonnet-4-6";
     else if (modelChoice === "opus") modelLine = "\nmodel: anthropic/claude-opus-4-6";
     else if (modelChoice === "custom...") {
-      const customModel = await ctx.ui.input("Model (provider/modelId)");
+      const customModel = await withModal(() => ctx.ui.input("Model (provider/modelId)"));
       if (customModel) modelLine = `\nmodel: ${customModel}`;
     }
 
@@ -2453,7 +2453,7 @@ ${systemPrompt}
     const targetPath = join(targetDir, `${name}.md`);
 
     if (existsSync(targetPath)) {
-      const overwrite = await ctx.ui.confirm("Overwrite", `${targetPath} already exists. Overwrite?`);
+      const overwrite = await withModal(() => ctx.ui.confirm("Overwrite", `${targetPath} already exists. Overwrite?`));
       if (!overwrite) return;
     }
 
@@ -2680,7 +2680,7 @@ ${systemPrompt}
 
       // Loop until user enters a valid integer or cancels (Esc / null).
       // Silently trims whitespace; rejects non-numeric input by re-prompting.
-      let input: string | undefined = await ctx.ui.input(label, current);
+      let input: string | undefined = await withModal(() => ctx.ui.input(label, current));
       while (input != null) {
         const trimmed = input.trim();
         const n = Number(trimmed);
@@ -2690,7 +2690,7 @@ ${systemPrompt}
           return;
         }
         // Invalid — re-prompt with the user's last entry so they can edit it
-        input = await ctx.ui.input(label, trimmed);
+        input = await withModal(() => ctx.ui.input(label, trimmed));
       }
     }
   }
