@@ -429,4 +429,43 @@ describe("AgentWidget live records", () => {
     expect((harness.widget as any).selectedAgentId).toBeUndefined();
     expect((harness.widget as any).viewportStart).toBe(0);
   });
+
+  it("leaves navigation keys alone while a modal owns focus", () => {
+    const records = [
+      makeRecord({ id: "running-1", status: "running", completedAt: undefined }),
+      makeRecord({ id: "done-2", status: "completed" }),
+    ];
+    const harness = createNavigableWidgetHarness(records);
+
+    // ctx.ui.custom() focuses a plain component rather than pi's Editor. The
+    // widget's global terminal listener runs before the focused modal, so it
+    // must not consume ↑/↓/enter/escape here.
+    (harness.tui as any).focusedComponent = {
+      render: () => [],
+      invalidate: () => {},
+      handleInput: () => {},
+    };
+
+    expect(harness.input("\u001b[B")).toBeUndefined();
+    expect((harness.widget as any).navigationActive).toBe(false);
+
+    // Restoring the editor as the focus owner re-enables roster navigation.
+    (harness.tui as any).focusedComponent = Object.create(Editor.prototype) as Editor;
+    expect(harness.input("\u001b[B")).toEqual({ consume: true });
+    expect((harness.widget as any).navigationActive).toBe(true);
+
+    harness.widget.dispose();
+  });
+
+  it("does not claim the keyboard when focus is unknown", () => {
+    const records = [makeRecord({ id: "running-1", status: "running", completedAt: undefined })];
+    const harness = createNavigableWidgetHarness(records);
+
+    (harness.tui as any).focusedComponent = null;
+
+    expect(harness.input("\u001b[B")).toBeUndefined();
+    expect((harness.widget as any).navigationActive).toBe(false);
+
+    harness.widget.dispose();
+  });
 });

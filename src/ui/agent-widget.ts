@@ -5,7 +5,7 @@
  * Uses the callback form of setWidget for themed rendering.
  */
 
-import { Editor, isKeyRelease, Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { isKeyRelease, Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { AgentManager } from "../agent-manager.js";
 import { getConfig } from "../agent-types.js";
 import type { AgentInvocation, AgentRecord, SubagentType, WidgetMode } from "../types.js";
@@ -238,6 +238,24 @@ export function describeActivity(activeTools: Map<string, string>, responseText?
   return "thinking…";
 }
 
+/**
+ * Structural check for pi's prompt editor.
+ *
+ * `instanceof Editor` is unusable here: an extension can resolve its own copy
+ * of `@earendil-works/pi-tui` at a different version than the host's, and the
+ * two `Editor` class objects are then unrelated identities, so the check is
+ * always false. Modals opened with `ctx.ui.custom()` — including the `/agents`
+ * menus — focus a plain `{ render, invalidate, handleInput }` object instead,
+ * so the editor's text-buffer methods identify it across pi-tui copies.
+ */
+function isPromptEditor(component: unknown): boolean {
+  if (typeof component !== "object" || component === null) return false;
+  const candidate = component as { getText?: unknown; setText?: unknown; submitValue?: unknown };
+  return typeof candidate.getText === "function"
+    && typeof candidate.setText === "function"
+    && typeof candidate.submitValue === "function";
+}
+
 // ---- Widget manager ----
 
 export class AgentWidget {
@@ -373,10 +391,17 @@ export class AgentWidget {
     return [...running, ...queued, ...finished];
   }
 
-  /** True when pi's prompt editor owns the keyboard. */
+  /**
+   * True when pi's prompt editor owns the keyboard.
+   *
+   * Deliberately fails closed: an unknown or absent focus target means the
+   * widget does not own the keyboard, so its global terminal listener stays out
+   * of the way. The previous `focused == null` fallback claimed input during
+   * teardown and transient render states, which let roster navigation swallow
+   * ↑/↓/enter/escape from an open modal.
+   */
   private editorHasFocus(): boolean {
-    const focused = (this.tui as { focusedComponent?: unknown } | undefined)?.focusedComponent;
-    return focused == null || focused instanceof Editor;
+    return isPromptEditor((this.tui as { focusedComponent?: unknown } | undefined)?.focusedComponent);
   }
 
   private selectedIndexOf(records: readonly AgentRecord[]): number {

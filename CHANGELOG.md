@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.23] - 2026-10-02
+
+### Fixed
+- **Stopped the agents roster from stealing keys from open modals**: the widget's focus detection used `focused instanceof Editor`, which is always false when the extension resolves its own copy of `@earendil-works/pi-tui` at a different version than pi's host (for example a hoisted peer pinned to an older release). The check silently degraded to "focused is null", so the widget's global `onTerminalInput` listener claimed the keyboard during teardown and transient render states and consumed `↑`/`↓`/`enter`/`escape` from modals such as the `/agents` menus. Focus detection now identifies the prompt editor structurally and fails closed, so the listener only claims input while the editor provably owns it.
+
 ## [0.17.22] - 2026-10-01
 
 ### Changed
