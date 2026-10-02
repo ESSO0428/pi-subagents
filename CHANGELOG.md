@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.24] - 2026-10-02
+
+### Fixed
+- **Restored agents roster ↑/↓ selection and stopped it stealing keys from this extension's modals**: v0.17.23 replaced the widget's focus probe with a structural check for the prompt editor, which broke roster navigation outright. The probe is unworkable in general — pi can replace the focused editor through `ctx.ui.setEditorComponent()` (pi-tmux-cursor-focus wraps it whenever pi runs under tmux), and an extension may also resolve its own copy of `@earendil-works/pi-tui` at a different version than the host's, so neither `instanceof` nor a structural test can identify it. The widget now tracks the state it actually controls: every `ctx.ui.select`, `ctx.ui.editor`, and `ctx.ui.custom` call in this extension runs inside `withModal()`, which suspends the widget's global terminal listener for as long as the modal holds the keyboard. Roster selection works again, and open modals receive `↑`/`↓`/`enter`/`escape` unimpeded.
+
 ## [0.17.23] - 2026-10-02
 
 ### Fixed

@@ -238,24 +238,6 @@ export function describeActivity(activeTools: Map<string, string>, responseText?
   return "thinking…";
 }
 
-/**
- * Structural check for pi's prompt editor.
- *
- * `instanceof Editor` is unusable here: an extension can resolve its own copy
- * of `@earendil-works/pi-tui` at a different version than the host's, and the
- * two `Editor` class objects are then unrelated identities, so the check is
- * always false. Modals opened with `ctx.ui.custom()` — including the `/agents`
- * menus — focus a plain `{ render, invalidate, handleInput }` object instead,
- * so the editor's text-buffer methods identify it across pi-tui copies.
- */
-function isPromptEditor(component: unknown): boolean {
-  if (typeof component !== "object" || component === null) return false;
-  const candidate = component as { getText?: unknown; setText?: unknown; submitValue?: unknown };
-  return typeof candidate.getText === "function"
-    && typeof candidate.setText === "function"
-    && typeof candidate.submitValue === "function";
-}
-
 // ---- Widget manager ----
 
 export class AgentWidget {
@@ -265,6 +247,8 @@ export class AgentWidget {
   private inputUnsub: (() => void) | undefined;
   /** Whether arrow keys currently navigate the agent roster. */
   private navigationActive = false;
+  /** Depth of AgentWidget-owned modals currently holding the keyboard. */
+  private modalDepth = 0;
   /** Stable identity of the selected row, so roster changes do not jump selection. */
   private selectedAgentId: string | undefined;
   /** Last logical roster index of the selected row, used when it disappears. */
@@ -392,16 +376,25 @@ export class AgentWidget {
   }
 
   /**
-   * True when pi's prompt editor owns the keyboard.
+   * Track an AgentWidget-owned modal (the `/agents` menus and friends).
    *
-   * Deliberately fails closed: an unknown or absent focus target means the
-   * widget does not own the keyboard, so its global terminal listener stays out
-   * of the way. The previous `focused == null` fallback claimed input during
-   * teardown and transient render states, which let roster navigation swallow
-   * ↑/↓/enter/escape from an open modal.
+   * The widget's terminal listener runs before the focused component, so while
+   * a modal is open the listener must not claim ↑/↓/enter/escape. Whether pi's
+   * prompt editor currently owns the keyboard is deliberately not consulted:
+   * pi can replace it through `ctx.ui.setEditorComponent()` (for example
+   * pi-tmux-cursor-focus wraps it under tmux), and the extension may also
+   * resolve its own copy of `@earendil-works/pi-tui` at a different version
+   * than the host's. Neither `instanceof` nor a structural probe can identify
+   * the editor reliably in that environment, and a wrong answer silently
+   * disables roster navigation entirely.
    */
-  private editorHasFocus(): boolean {
-    return isPromptEditor((this.tui as { focusedComponent?: unknown } | undefined)?.focusedComponent);
+  setModalOpen(open: boolean): void {
+    this.modalDepth = open ? this.modalDepth + 1 : Math.max(0, this.modalDepth - 1);
+  }
+
+  /** True when no AgentWidget-owned modal is holding the keyboard. */
+  private keyboardAvailable(): boolean {
+    return this.modalDepth === 0;
   }
 
   private selectedIndexOf(records: readonly AgentRecord[]): number {
@@ -443,7 +436,7 @@ export class AgentWidget {
     if (records.length === 0 || !ui) return false;
 
     if (!this.navigationActive) {
-      if (direction !== 1 || !this.editorHasFocus() || (ui.getEditorText?.() ?? "") !== "") return false;
+      if (direction !== 1 || !this.keyboardAvailable() || (ui.getEditorText?.() ?? "") !== "") return false;
       this.activate(records);
       return true;
     }
@@ -471,7 +464,7 @@ export class AgentWidget {
   /** Handle terminal input before it reaches the focused prompt editor. */
   handleKey(data: string): { consume?: boolean; data?: string } | undefined {
     if (!this.uiCtx || isKeyRelease(data)) return undefined;
-    if (!this.editorHasFocus()) {
+    if (!this.keyboardAvailable()) {
       if (this.navigationActive) this.deactivate();
       return undefined;
     }

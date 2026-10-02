@@ -430,41 +430,42 @@ describe("AgentWidget live records", () => {
     expect((harness.widget as any).viewportStart).toBe(0);
   });
 
-  it("leaves navigation keys alone while a modal owns focus", () => {
-    const records = [
-      makeRecord({ id: "running-1", status: "running", completedAt: undefined }),
-      makeRecord({ id: "done-2", status: "completed" }),
-    ];
+  it("stands down while an AgentWidget-owned modal is open", () => {
+    const records = [makeRecord({ id: "running-1", status: "running", completedAt: undefined })];
     const harness = createNavigableWidgetHarness(records);
 
-    // ctx.ui.custom() focuses a plain component rather than pi's Editor. The
-    // widget's global terminal listener runs before the focused modal, so it
-    // must not consume ↑/↓/enter/escape here.
-    (harness.tui as any).focusedComponent = {
-      render: () => [],
-      invalidate: () => {},
-      handleInput: () => {},
-    };
+    expect(harness.input("\u001b[B")).toEqual({ consume: true });
+    expect((harness.widget as any).navigationActive).toBe(true);
 
+    // The global terminal listener runs before the focused component, so it must
+    // not claim ↑/↓/enter/escape once a modal of ours owns the keyboard.
+    harness.widget.setModalOpen(true);
     expect(harness.input("\u001b[B")).toBeUndefined();
+    expect(harness.input("\u001b[A")).toBeUndefined();
+    expect(harness.input("\u001b")).toBeUndefined();
+    expect(harness.input("\r")).toBeUndefined();
     expect((harness.widget as any).navigationActive).toBe(false);
 
-    // Restoring the editor as the focus owner re-enables roster navigation.
-    (harness.tui as any).focusedComponent = Object.create(Editor.prototype) as Editor;
+    harness.widget.setModalOpen(false);
     expect(harness.input("\u001b[B")).toEqual({ consume: true });
     expect((harness.widget as any).navigationActive).toBe(true);
 
     harness.widget.dispose();
   });
 
-  it("does not claim the keyboard when focus is unknown", () => {
+  it("keeps standing down until every nested modal closes", () => {
     const records = [makeRecord({ id: "running-1", status: "running", completedAt: undefined })];
     const harness = createNavigableWidgetHarness(records);
 
-    (harness.tui as any).focusedComponent = null;
-
+    harness.widget.setModalOpen(true);
+    harness.widget.setModalOpen(true);
+    harness.widget.setModalOpen(false);
     expect(harness.input("\u001b[B")).toBeUndefined();
     expect((harness.widget as any).navigationActive).toBe(false);
+
+    harness.widget.setModalOpen(false);
+    expect(harness.input("\u001b[B")).toEqual({ consume: true });
+    expect((harness.widget as any).navigationActive).toBe(true);
 
     harness.widget.dispose();
   });

@@ -674,6 +674,21 @@ export default function (pi: ExtensionAPI) {
       },
     },
   );
+
+  /**
+   * Run an AgentWidget-owned modal while the widget's global key listener
+   * stands down. The listener runs before the focused component, so without
+   * this it would consume ↑/↓/enter/escape from the modal itself.
+   */
+  async function withModal<T>(open: () => Promise<T>): Promise<T> {
+    widget.setModalOpen(true);
+    try {
+      return await open();
+    } finally {
+      widget.setModalOpen(false);
+    }
+  }
+
   function setWidgetMode(m: WidgetMode): void {
     widgetMode = m;
     widget.update();
@@ -1845,7 +1860,7 @@ Terse command-style prompts produce shallow, generic work.
       ctx.ui.notify(noAgentsMsg, "info");
     }
 
-    const choice = await ctx.ui.select("Agents", options);
+    const choice = await withModal(() => ctx.ui.select("Agents", options));
     if (!choice) return;
 
     if (choice.startsWith("Running agents (")) {
@@ -1909,7 +1924,7 @@ Terse command-style prompts produce shallow, generic work.
     if (hasCustom) legendParts.push("• = project  ◦ = global");
     if (hasDisabled) legendParts.push("✕ = disabled");
 
-    const selected = await ctx.ui.custom<string | undefined>((_tui, _theme, _kb, done) => {
+    const selected = await withModal(() => ctx.ui.custom<string | undefined>((_tui, _theme, _kb, done) => {
       const slTheme = getSettingsListTheme();
       const list = new SettingsList(
         items,
@@ -1928,7 +1943,7 @@ Terse command-style prompts produce shallow, generic work.
         invalidate: () => container.invalidate(),
         handleInput: (data: string) => list.handleInput?.(data),
       };
-    });
+    }));
 
     if (selected && getAgentConfig(selected)) {
       await showAgentDetail(ctx, selected);
@@ -1978,7 +1993,7 @@ Terse command-style prompts produce shallow, generic work.
       }
     };
 
-    const choice = await ctx.ui.custom<string | undefined>((_tui, _theme, _kb, done) => {
+    const choice = await withModal(() => ctx.ui.custom<string | undefined>((_tui, _theme, _kb, done) => {
       const list = new SelectList(
         options,
         Math.min(options.length, 10),
@@ -2003,7 +2018,7 @@ Terse command-style prompts produce shallow, generic work.
         invalidate: () => container.invalidate(),
         handleInput: (data: string) => list.handleInput(data),
       };
-    });
+    }));
 
     if (!choice) return undefined;
     return pairs.find(({ record }) => record.id === choice)?.record;
@@ -2082,7 +2097,7 @@ Terse command-style prompts produce shallow, generic work.
 
     const activity = agentActivity.get(record.id);
     const isLive = mode === "live";
-    await ctx.ui.custom<undefined>(
+    await withModal(() => ctx.ui.custom<undefined>(
       (tui, theme, keybindings, done) => {
         return new ConversationViewer(tui, session, record, activity, theme, done,
           isLive ? () => {
@@ -2098,7 +2113,7 @@ Terse command-style prompts produce shallow, generic work.
         overlay: true,
         overlayOptions: { anchor: "center", width: "90%", maxHeight: `${VIEWPORT_HEIGHT_PCT}%` },
       },
-    );
+    ));
   }
 
   async function showAgentDetail(ctx: ExtensionCommandContext, name: string) {
@@ -2129,12 +2144,12 @@ Terse command-style prompts produce shallow, generic work.
       menuOptions = ["Edit", "Disable", "Delete", "Back"];
     }
 
-    const choice = await ctx.ui.select(name, menuOptions);
+    const choice = await withModal(() => ctx.ui.select(name, menuOptions));
     if (!choice || choice === "Back") return;
 
     if (choice === "Edit" && file) {
       const content = readFileSync(file.path, "utf-8");
-      const edited = await ctx.ui.editor(`Edit ${name}`, content);
+      const edited = await withModal(() => ctx.ui.editor(`Edit ${name}`, content));
       if (edited !== undefined && edited !== content) {
         const { writeFileSync } = await import("node:fs");
         writeFileSync(file.path, edited, "utf-8");
@@ -2168,10 +2183,10 @@ Terse command-style prompts produce shallow, generic work.
 
   /** Eject a default agent: write its embedded config as a .md file. */
   async function ejectAgent(ctx: ExtensionCommandContext, name: string, cfg: AgentConfig) {
-    const location = await ctx.ui.select("Choose location", [
+    const location = await withModal(() => ctx.ui.select("Choose location", [
       "Project (.pi/agents/)",
       `Personal (${personalAgentsDir()})`,
-    ]);
+    ]));
     if (!location) return;
 
     const targetDir = location.startsWith("Project") ? projectAgentsDir() : personalAgentsDir();
@@ -2232,10 +2247,10 @@ Terse command-style prompts produce shallow, generic work.
     }
 
     // No file (built-in default) — create a stub
-    const location = await ctx.ui.select("Choose location", [
+    const location = await withModal(() => ctx.ui.select("Choose location", [
       "Project (.pi/agents/)",
       `Personal (${personalAgentsDir()})`,
-    ]);
+    ]));
     if (!location) return;
 
     const targetDir = location.startsWith("Project") ? projectAgentsDir() : personalAgentsDir();
@@ -2270,18 +2285,18 @@ Terse command-style prompts produce shallow, generic work.
   }
 
   async function showCreateWizard(ctx: ExtensionCommandContext) {
-    const location = await ctx.ui.select("Choose location", [
+    const location = await withModal(() => ctx.ui.select("Choose location", [
       "Project (.pi/agents/)",
       `Personal (${personalAgentsDir()})`,
-    ]);
+    ]));
     if (!location) return;
 
     const targetDir = location.startsWith("Project") ? projectAgentsDir() : personalAgentsDir();
 
-    const method = await ctx.ui.select("Creation method", [
+    const method = await withModal(() => ctx.ui.select("Creation method", [
       "Generate with Claude (recommended)",
       "Manual configuration",
-    ]);
+    ]));
     if (!method) return;
 
     if (method.startsWith("Generate")) {
@@ -2377,7 +2392,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
     if (!description) return;
 
     // 3. Tools
-    const toolChoice = await ctx.ui.select("Tools", ["all", "none", "read-only (read, bash, grep, find, ls)", "custom..."]);
+    const toolChoice = await withModal(() => ctx.ui.select("Tools", ["all", "none", "read-only (read, bash, grep, find, ls)", "custom..."]));
     if (!toolChoice) return;
 
     let tools: string;
@@ -2394,13 +2409,13 @@ Write the file using the write tool. Only write the file, nothing else.`;
     }
 
     // 4. Model
-    const modelChoice = await ctx.ui.select("Model", [
+    const modelChoice = await withModal(() => ctx.ui.select("Model", [
       "inherit (parent model)",
       "haiku",
       "sonnet",
       "opus",
       "custom...",
-    ]);
+    ]));
     if (!modelChoice) return;
 
     let modelLine = "";
@@ -2414,14 +2429,14 @@ Write the file using the write tool. Only write the file, nothing else.`;
 
     // 5. Thinking
     // "inherit" is a UI-only pseudo-choice (omit the field); the rest mirror pi.
-    const thinkingChoice = await ctx.ui.select("Thinking level", ["inherit", ...THINKING_LEVELS]);
+    const thinkingChoice = await withModal(() => ctx.ui.select("Thinking level", ["inherit", ...THINKING_LEVELS]));
     if (!thinkingChoice) return;
 
     let thinkingLine = "";
     if (thinkingChoice !== "inherit") thinkingLine = `\nthinking: ${thinkingChoice}`;
 
     // 6. System prompt
-    const systemPrompt = await ctx.ui.editor("System prompt", "");
+    const systemPrompt = await withModal(() => ctx.ui.editor("System prompt", ""));
     if (systemPrompt === undefined) return;
 
     // Build the file
@@ -2610,7 +2625,7 @@ ${systemPrompt}
     // Updated on arrow keys so Enter knows which field is selected immediately.
     let currentIndex = 0;
 
-    const result = await ctx.ui.custom<string | undefined>((_tui, _theme, _kb, done) => {
+    const result = await withModal(() => ctx.ui.custom<string | undefined>((_tui, _theme, _kb, done) => {
       const items = buildItems();
 
       list = new SettingsList(
@@ -2647,7 +2662,7 @@ ${systemPrompt}
           list.handleInput?.(data);
         },
       };
-    });
+    }));
 
     // If a numeric field ID was returned, prompt for typed input
     if (result && NUMERIC_IDS.has(result)) {
