@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.26] - 2026-10-02
+
+### Fixed
+- **Drew the last agents roster row as `└─` when the roster overflows**: the branch fixup only ran on the path where every row fits, so a clipped or scrolled roster kept `├─` on its final visible entry. The bounded viewport also pads the body with blank lines, so the row is not at the end of the rendered output; both render paths now share a `markLastBranch()` helper that resolves the final visible row explicitly and also blanks the `│` continuation under it.
+
 ## [0.17.25] - 2026-10-02
 
 ### Fixed

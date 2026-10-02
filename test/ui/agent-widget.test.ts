@@ -394,6 +394,51 @@ describe("AgentWidget live records", () => {
     harness.widget.dispose();
   });
 
+  it("marks the final visible row as the last branch when the roster is clipped", () => {
+    const running = makeRecord({ id: "running", status: "running", completedAt: undefined });
+    const queued = Array.from({ length: 8 }, (_, index) => makeRecord({
+      id: `queued-${index}`,
+      description: `queued target ${index}`,
+      status: "queued",
+      completedAt: undefined,
+    }));
+    const harness = createNavigableWidgetHarness([running, ...queued], { rows: 10 });
+
+    const initial = harness.render();
+    expect(initial.join("\n")).toContain("more");
+
+    // The bounded viewport pads the body with blank lines, so the last roster
+    // row is not simply the final rendered line.
+    const rosterLines = initial.filter((line) => line.includes("├─") || line.includes("└─"));
+    expect(rosterLines.length).toBeGreaterThan(1);
+    expect(rosterLines.at(-1)).toContain("└─");
+    expect(rosterLines.at(-1)).not.toContain("├─");
+
+    // Same invariant after scrolling into the middle of the roster.
+    harness.input("\u001b[B");
+    for (let index = 0; index < 4; index++) harness.input("\u001b[B");
+    const scrolledRosterLines = harness.render()
+      .filter((line) => line.includes("├─") || line.includes("└─"));
+    expect(scrolledRosterLines.at(-1)).toContain("└─");
+    expect(scrolledRosterLines.at(-1)).not.toContain("├─");
+
+    harness.widget.dispose();
+  });
+
+  it("marks the final row as the last branch when the roster fits", () => {
+    const records = [
+      makeRecord({ id: "running-1", status: "running", completedAt: undefined }),
+      makeRecord({ id: "done-2", status: "completed" }),
+    ];
+    const harness = createNavigableWidgetHarness(records, { rows: 24 });
+    const rosterLines = harness.render().filter((line) => line.includes("├─") || line.includes("└─"));
+
+    expect(rosterLines.length).toBe(2);
+    expect(rosterLines[0]).toContain("├─");
+    expect(rosterLines.at(-1)).toContain("└─");
+    harness.widget.dispose();
+  });
+
   it("resets retained navigation state for an empty roster, new context, and dispose", () => {
     const record = makeRecord({ id: "selected", status: "running", completedAt: undefined });
     const records = [record];

@@ -238,6 +238,21 @@ export function describeActivity(activeTools: Map<string, string>, responseText?
   return "thinking…";
 }
 
+/**
+ * Mark the final visible roster row as the tree's last branch.
+ *
+ * `bodyIndex` is the offset of that row's header line inside the assembled body,
+ * which is not simply `body.length - 1`: the bounded viewport pads the body
+ * with blank lines, and two-line rows carry a `│` continuation underneath.
+ */
+function markLastBranch(body: string[], bodyIndex: number): void {
+  const header = body[bodyIndex];
+  if (header === undefined) return;
+  body[bodyIndex] = header.replace("├─", "└─");
+  const continuation = body[bodyIndex + 1];
+  if (continuation?.includes("│  ")) body[bodyIndex + 1] = continuation.replace("│  ", "   ");
+}
+
 // ---- Widget manager ----
 
 export class AgentWidget {
@@ -631,11 +646,7 @@ export class AgentWidget {
       for (const row of rows) lines.push(...row.lines);
       if (rows.length > 0) {
         const lastRow = rows[rows.length - 1];
-        const lastStart = lines.length - lastRow.lines.length;
-        lines[lastStart] = lines[lastStart].replace("├─", "└─");
-        if (lastRow.lines.length === 2) {
-          lines[lastStart + 1] = lines[lastStart + 1].replace("│  ", "   ");
-        }
+        markLastBranch(lines, lines.length - lastRow.lines.length);
       }
     } else {
       // Reserve one line for a directional overflow summary. The viewport is
@@ -675,8 +686,10 @@ export class AgentWidget {
 
       let used = 0;
       let end = start;
+      let lastRowLine = -1;
       const visibleBody: string[] = [];
       while (end < rows.length && used + heightAt(end) <= contentBudget) {
+        lastRowLine = visibleBody.length;
         visibleBody.push(...rows[end].lines);
         used += heightAt(end);
         end++;
@@ -687,6 +700,7 @@ export class AgentWidget {
         visibleBody.push(rows[start].lines[0]);
         end = start + 1;
       }
+      markLastBranch(visibleBody, lastRowLine);
 
       const hiddenBefore = start;
       const hiddenAfter = Math.max(0, rows.length - end);
