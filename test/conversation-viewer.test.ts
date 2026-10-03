@@ -463,6 +463,35 @@ describe("ConversationViewer", () => {
       expect((viewer as any).composer.getText()).toBe("first queued\nsecond queued");
     });
 
+    it("opens the composer and recalls in one press when the composer is closed", () => {
+      const session = mockSession([], ["queued one", "queued two"]);
+      const viewer = new ConversationViewer(
+        mockTui(30, W), session, mockRecord(), undefined, ansiTheme(), vi.fn(),
+        undefined, undefined, vi.fn(),
+      );
+
+      expect((viewer as any).composer).toBeUndefined();
+
+      viewer.handleInput("a-up");
+
+      expect((viewer as any).composer).toBeDefined();
+      expect(session.clearQueue).toHaveBeenCalledTimes(1);
+      expect((viewer as any).composer.getText()).toBe("queued one\nqueued two");
+    });
+
+    it("leaves alt+up inert with no composer open and nothing queued", () => {
+      const session = mockSession([], []);
+      const viewer = new ConversationViewer(
+        mockTui(30, W), session, mockRecord(), undefined, ansiTheme(), vi.fn(),
+        undefined, undefined, vi.fn(),
+      );
+
+      viewer.handleInput("a-up");
+
+      expect((viewer as any).composer).toBeUndefined();
+      expect(session.clearQueue).not.toHaveBeenCalled();
+    });
+
     it("accepts Ctrl+J as a newline and renders an additional composer row", () => {
       const viewer = new ConversationViewer(
         mockTui(30, W), mockSession(), mockRecord(), undefined, ansiTheme(), vi.fn(),

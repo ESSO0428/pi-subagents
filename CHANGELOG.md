@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.30] - 2026-10-04
+
+### Changed
+- **Let `Alt+Up` open the steer composer and recall in one press**: recalling a queued steer previously required pressing `e` first, because the key was bound only on the composer branch. With the composer closed, `Alt+Up` now opens it and pulls the pending queue into it, matching how the key behaves in pi's own prompt. It stays inert when nothing is queued, so it cannot open an empty composer and shadow an unrelated binding.
+
 ## [0.17.29] - 2026-10-02
 
 > **Breaking: Agent calls are always detached.** `Agent` now returns an ID immediately for every call; retrieve results after completion notifications with `get_subagent_result`. `run_in_background` remains accepted but has no effect.

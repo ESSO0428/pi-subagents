@@ -313,6 +313,19 @@ export class ConversationViewer implements Component {
       this.handleSearchInput(data);
       return;
     }
+    // Without the composer open there is nowhere to put a recalled steer, so
+    // `alt+up` opens the composer first and then recalls into it — one keypress
+    // instead of "press e, then press alt+up". It stays inert when nothing is
+    // queued so it cannot shadow an unrelated binding by opening an empty
+    // composer, and it yields to the composer once that is open.
+    if (this.canSteer()
+      && this.pendingSteers.length > 0
+      && (matchesKey(data, Key.alt("up")) || data === "a-up" || data === "alt+up")) {
+      this.openComposer();
+      this.recallSteerDraft();
+      this.tui.requestRender();
+      return;
+    }
     if (matchesKey(data, "escape") || matchesKey(data, "q")) {
       this.closed = true;
       this.done(undefined);
