@@ -533,14 +533,15 @@ describe("ConversationViewer", () => {
       expect(out).not.toContain("e steer");
     });
 
-    it("typing then Enter sends the trimmed message and closes the composer", () => {
+    it("typing then Enter sends the trimmed message and keeps the composer open", () => {
       const { viewer, onSteer } = makeViewer();
       viewer.handleInput("e"); // open composer
       for (const ch of "  hello  ") viewer.handleInput(ch);
       viewer.handleInput("\r"); // send
 
       expect(onSteer).toHaveBeenCalledWith("hello");
-      expect(viewer.render(W).join("\n")).not.toContain("Enter send"); // composer closed
+      expect(viewer.render(W).join("\n")).toContain("Enter send"); // still open
+      expect((viewer as any).composer.getText()).toBe(""); // cleared for the next steer
     });
 
     it("Esc cancels the composer without sending", () => {
@@ -553,12 +554,30 @@ describe("ConversationViewer", () => {
       expect(viewer.render(W).join("\n")).not.toContain("Enter send");
     });
 
-    it("an empty submit just returns (like Esc), without calling onSteer", () => {
+    it("an empty submit sends nothing and keeps the composer open", () => {
       const { viewer, onSteer } = makeViewer();
       viewer.handleInput("e"); // open composer
       viewer.handleInput("\r"); // empty submit
       expect(onSteer).not.toHaveBeenCalled();
-      expect(viewer.render(W).join("\n")).not.toContain("Enter send"); // composer closed
+      expect(viewer.render(W).join("\n")).toContain("Enter send"); // still open
+    });
+
+    it("Esc is the only key that closes the composer", () => {
+      const { viewer, onSteer } = makeViewer();
+      viewer.handleInput("e");
+      for (const ch of "one") viewer.handleInput(ch);
+      viewer.handleInput("\r");
+      expect(onSteer).toHaveBeenCalledWith("one");
+      expect((viewer as any).composer).toBeDefined();
+
+      for (const ch of "two") viewer.handleInput(ch);
+      viewer.handleInput("\r");
+      expect(onSteer).toHaveBeenLastCalledWith("two");
+      expect((viewer as any).composer).toBeDefined();
+
+      viewer.handleInput("\x1b");
+      expect((viewer as any).composer).toBeUndefined();
+      expect(viewer.render(W).join("\n")).not.toContain("Enter send");
     });
 
     it("scroll keys are inert while composing (input owns them)", () => {

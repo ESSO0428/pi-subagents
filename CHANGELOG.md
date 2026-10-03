@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.31] - 2026-10-04
+
+### Changed
+- **Kept the steer composer open after sending**: `Enter` now sends the message and clears the input but leaves the composer in place, so consecutive steers need no reopen between them and `Alt+Up` recalls into the same composer. `Esc` is the only key that closes it; an empty submit sends nothing and likewise keeps it open.
+
 ## [0.17.30] - 2026-10-04
 
 ### Changed

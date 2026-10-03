@@ -1070,7 +1070,10 @@ export class ConversationViewer implements Component {
     this.steerHistoryDraft = "";
     input.onSubmit = (value: string) => {
       const message = value.trim();
-      this.composer = undefined;
+      // Submitting sends and clears but keeps the composer open, so consecutive
+      // steers do not need a reopen between them and `Alt+Up` can recall into
+      // the same composer. `Esc` is the only thing that closes it.
+      input.setText("");
       this.steerHistoryIndex = -1;
       this.steerHistoryDraft = "";
       if (message) {
