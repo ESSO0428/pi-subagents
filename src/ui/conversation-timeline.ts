@@ -326,7 +326,7 @@ export class ConversationTimeline implements Component {
       try {
         const markdown = new Markdown(block.markdown || "∅", 2, 0, getMarkdownTheme(), {
           color: (text) => this.theme.fg(
-            block.role === "user" ? "userMessageText" : block.role === "meta" ? "muted" : "text",
+            block.pending ? "dim" : block.role === "user" ? "userMessageText" : block.role === "meta" ? "muted" : "text",
             text,
           ),
         });

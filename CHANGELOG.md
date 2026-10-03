@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.29] - 2026-10-02
+
+> **Breaking: Agent calls are always detached.** `Agent` now returns an ID immediately for every call; retrieve results after completion notifications with `get_subagent_result`. `run_in_background` remains accepted but has no effect.
+
+### Changed
+- **Detached every Agent invocation and removed inline results**: fresh calls bypass the background queue and resumed calls run asynchronously; both return immediately and use completion notifications plus `get_subagent_result` for retrieval. `wait`, `wait_group`, and `wait_group_done` no longer depend on `run_in_background`, so a notification group can be used from any call rather than only a background one.
+- **Made the live conversation viewer show and restore queued steering messages**: pending steers now appear as dim timeline rows until delivery, `Alt+Up` recalls the full pending queue into the composer joined by newlines, and the multiline composer accepts `Ctrl+J` with one rendered row per line.
+
 ## [0.17.28] - 2026-10-02
 
 ### Fixed

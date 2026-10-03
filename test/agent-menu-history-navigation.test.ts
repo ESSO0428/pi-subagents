@@ -167,7 +167,7 @@ describe("/agents history navigation", () => {
     let customCalls = 0;
 
     vi.mocked(runAgent).mockImplementation(async (_ctx: any, _type: any, _prompt: any, options: any) => {
-      options.onSessionCreated?.({ messages: [], dispose: () => {} });
+      options.onSessionCreated?.({ messages: [], subscribe: () => () => {}, dispose: () => {} });
       return await new Promise<any>(() => {});
     });
 

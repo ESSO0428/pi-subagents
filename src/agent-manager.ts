@@ -639,32 +639,6 @@ export class AgentManager {
   }
 
   /**
-   * Spawn an agent and wait for completion (foreground use).
-   * Foreground agents bypass the concurrency queue.
-   * Returns { id, record } so callers can access the agent ID.
-   *
-   * @param onSpawned - Called synchronously after spawn(), before onSessionCreated fires.
-   *   Use this to set record.outputFile so streamToOutputFile can pick it up.
-   */
-  async spawnAndWait(
-    pi: ExtensionAPI,
-    ctx: ExtensionContext,
-    type: SubagentType,
-    prompt: string,
-    options: Omit<SpawnOptions, "isBackground">,
-    onSpawned?: (id: string) => void,
-  ): Promise<{ id: string; record: AgentRecord }> {
-    const id = this.spawn(pi, ctx, type, prompt, {
-      ...options,
-      isBackground: false,
-      onSpawned,
-    });
-    const record = this.agents.get(id)!;
-    await record.promise;
-    return { id, record };
-  }
-
-  /**
    * Resume an existing agent session with a new prompt.
    */
   async resume(
@@ -680,11 +654,15 @@ export class AgentManager {
     record.completedAt = undefined;
     record.result = undefined;
     record.error = undefined;
+    record.resultConsumed = false;
+    record.isBackground = true;
+    this.onStart?.(record);
     const resumedModel = record.session.model;
     record.invocation = {
       ...(record.invocation ?? {}),
       ...(resumedModel && { effectiveModelName: resumedModel.name ?? resumedModel.id }),
       effectiveThinking: record.session.thinkingLevel,
+      runInBackground: true,
     };
     this.checkpoint(record);
 
@@ -709,11 +687,13 @@ export class AgentManager {
       record.result = text;
       record.completedAt = Date.now();
       this.checkpoint(record);
+      try { this.onComplete?.(record); } catch { /* ignore completion side-effect errors */ }
     } catch (err) {
       record.status = "error";
       record.error = err instanceof Error ? err.message : String(err);
       record.completedAt = Date.now();
       this.checkpoint(record);
+      try { this.onComplete?.(record); } catch { /* ignore completion side-effect errors */ }
     }
 
     return record;

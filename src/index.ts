@@ -38,7 +38,6 @@ import {
   type AgentDetails,
   AgentWidget,
   buildInvocationTags,
-  describeActivity,
   fgPreservingNestedStyles,
   formatDuration,
   formatMs,
@@ -81,7 +80,7 @@ function formatLifetimeTokens(o: { lifetimeUsage: LifetimeUsage }): string {
 
 /**
  * Create an AgentActivity state and spawn callbacks for tracking tool usage.
- * Used by both foreground and background paths to avoid duplication.
+ * Used by the detached Agent path for activity and usage tracking.
  */
 function createActivityTracker(maxTurns?: number, onStreamUpdate?: () => void) {
   const state: AgentActivity = {
@@ -187,27 +186,6 @@ function formatTaskNotification(record: AgentRecord, resultMaxLen: number): stri
     `<usage><total_tokens>${totalTokens}</total_tokens><tool_uses>${record.toolUses}</tool_uses>${ctxXml}${compactXml}<duration_ms>${durationMs}</duration_ms></usage>`,
     `</task-notification>`,
   ].filter(Boolean).join('\n');
-}
-
-/** Build AgentDetails from a base + record-specific fields. */
-function buildDetails(
-  base: Pick<AgentDetails, "displayName" | "description" | "subagentType" | "modelName" | "tags">,
-  record: { toolUses: number; startedAt: number; completedAt?: number; status: string; error?: string; id?: string; session?: any; lifetimeUsage: LifetimeUsage },
-  activity?: AgentActivity,
-  overrides?: Partial<AgentDetails>,
-): AgentDetails {
-  return {
-    ...base,
-    toolUses: record.toolUses,
-    tokens: formatLifetimeTokens(record),
-    turnCount: activity?.turnCount,
-    maxTurns: activity?.maxTurns,
-    durationMs: (record.completedAt ?? Date.now()) - record.startedAt,
-    status: record.status as AgentDetails["status"],
-    agentId: record.id,
-    error: record.error,
-    ...overrides,
-  };
 }
 
 /** Build notification details for the custom message renderer. */
@@ -871,7 +849,7 @@ export default function (pi: ExtensionAPI) {
         description:
           'Opt-in only — fire later instead of now. Omit to run immediately (the default, almost always correct). ' +
           'Formats: 6-field cron ("0 0 9 * * 1" = 9am Mon), interval ("5m"/"1h"), one-shot ("+10m" or ISO). ' +
-          'Forces run_in_background; incompatible with inherit_context and resume. Returns job ID.',
+          'Scheduled agents run detached; run_in_background has no effect. Incompatible with inherit_context and resume. Returns job ID.',
       }),
     ),
   };
@@ -892,10 +870,10 @@ Custom agents: .pi/agents/<name>.md (project) or ${getAgentDir()}/agents/<name>.
 
 Notes:
 - description: 3-5 words (shown in UI). Prompts must be self-contained — the agent has not seen this conversation.
-- Parallel work: one message, multiple Agent calls, run_in_background: true on each. You are notified when background agents finish — never poll or sleep.
+- Every Agent call is detached and returns an agent ID immediately. run_in_background is accepted for compatibility but has no effect. You are notified when agents finish — never poll or sleep.
 - For nonblocking grouped notification, add wait: true. Use subagent_wait_group to create/update/seal explicit groups; wait_group_done seals after the final spawn.
-- The result is not shown to the user — summarize it for them. Verify an agent's claimed code changes before reporting work done.
-- resume continues a previous agent by ID; steer_subagent messages a running one.
+- Results arrive via the completion notification; then call get_subagent_result once per task ID with wait omitted or false to render the native expandable result. The result is not shown inline. Verify an agent's claimed code changes before reporting work done.
+- resume continues a previous agent by ID and is also detached; steer_subagent messages a running one.
 - isolation: "worktree" runs the agent in an isolated git worktree; changes land on a branch.`;
 
   const fullAgentToolDescription = `Launch a new agent to handle complex, multi-step tasks autonomously. Each agent type has specific capabilities and tools available to it.
@@ -914,15 +892,12 @@ If the target is already known, use a direct tool — \`read\` for a known path,
 ## Usage notes
 
 - Always include a short (3-5 word) description summarizing what the agent will do (shown in UI).
-- When you launch multiple agents for independent work, send them in a single message with multiple tool uses, with run_in_background: true on each, so they run concurrently. If the user specifies that they want agents run "in parallel", you MUST send a single message with multiple tool calls. Foreground calls run sequentially — only one executes at a time.
-- When the agent is done, it returns a single message back to you. The result is not visible to the user — to show the user, send a text message with a concise summary.
+- Every Agent call is detached and returns an agent ID immediately. run_in_background is accepted for compatibility but has no effect. When you launch multiple agents for independent work, send them in a single message with multiple tool uses so they run concurrently.
+- Results arrive via the completion notification; call get_subagent_result once per completed task ID with wait omitted or false to render the native expandable result. Agent results are not returned inline — never poll or sleep waiting for them.
+- For nonblocking grouped notification, set wait: true. Omit wait_group for a one-agent implicit group, or create an explicit group with subagent_wait_group and seal it (or set wait_group_done: true on the final Agent call).
 - Trust but verify: an agent's summary describes what it intended to do, not necessarily what it did. When an agent writes or edits code, check the actual changes before reporting work as done.
-- Use run_in_background for work you don't need immediately. You will be notified when it completes — do NOT poll or sleep waiting for it. Continue with other work or respond to the user instead.
-- For nonblocking grouped notification, set wait: true with run_in_background: true. Omit wait_group for a one-agent implicit group, or create an explicit group with subagent_wait_group and seal it (or set wait_group_done: true on the final Agent call).
-- When a background or wait-group completion notification arrives, call get_subagent_result once per completed task-id with wait omitted or false before summarizing if the user needs the outputs. This preserves native expandable Get Subagent Result UI without blocking.
-- Foreground vs background: use foreground (default) when you need the agent's results before you can proceed. Use background when you have genuinely independent work to do in parallel.
-- Use resume with an agent ID to continue a previous agent's work. A new (non-resume) Agent call starts a fresh agent with no memory of prior runs, so the prompt must be self-contained.
-- Use steer_subagent to send mid-run messages to a running background agent.
+- Use resume with an agent ID to continue a previous agent's work; resume is detached and also returns immediately.
+- Use steer_subagent to send mid-run messages to a running agent.
 - Clearly tell the agent whether you expect it to write code or just to do research (search, file reads, etc.), since it is not aware of the user's intent.
 - If an agent's description says it should be used proactively, try to use it without the user having to ask for it first.
 - Use model to specify a different model (as "provider/modelId", or fuzzy e.g. "haiku", "sonnet").
@@ -998,9 +973,9 @@ Terse command-style prompts produce shallow, generic work.
     promptGuidelines: [
       "Use Agent with specialized agents when the task matches an agent type's description. Subagents are valuable for parallelizing independent queries or for protecting the main context window from excessive results, but should not be used excessively when not needed. Importantly, avoid duplicating work that subagents are already doing — if you delegate research to a subagent, do not also perform the same searches yourself.",
       "For broad codebase exploration or research, spawn Agent with an appropriate subagent_type (e.g. Explore). Otherwise use direct tools (read, grep, find) when the target is already known.",
-      "When an agent runs in the background, you will be notified on completion — do not poll or sleep waiting for it. Continue with other work instead.",
-      "For a nonblocking grouped notification, use wait: true with run_in_background: true; create/update/seal explicit groups with subagent_wait_group.",
-      "When a background or wait-group completion notification arrives, call get_subagent_result once per completed task-id with wait omitted or false before summarizing if the user needs the outputs; this preserves native expandable result UI without blocking.",
+      "Every Agent call is detached and returns an agent ID immediately. run_in_background is accepted for compatibility but has no effect; continue with other work instead of waiting.",
+      "Use wait: true to receive one grouped completion notification; create/update/seal explicit groups with subagent_wait_group.",
+      "Results arrive via the completion notification. Then call get_subagent_result once per completed task ID with wait omitted or false before summarizing if the user needs the outputs; this preserves native expandable result UI without blocking.",
       "Trust but verify: an agent's summary describes intent, not outcome. When an agent writes or edits code, check the actual changes before reporting work as done.",
     ],
     parameters: Type.Object({
@@ -1032,12 +1007,12 @@ Terse command-style prompts produce shallow, generic work.
       ),
       run_in_background: Type.Optional(
         Type.Boolean({
-          description: "Set to true to run in background. Returns agent ID immediately. You will be notified on completion.",
+          description: "Accepted for compatibility; it has no effect. Agent calls always detach, return an agent ID immediately, and notify on completion.",
         }),
       ),
       wait: Type.Optional(
         Type.Boolean({
-          description: "With run_in_background: true, suppress individual completion notification and wait for a sealed group notification. This never blocks execution.",
+          description: "Suppress the individual completion notification and wait for a sealed group notification. This never blocks execution.",
         }),
       ),
       wait_group: Type.Optional(
@@ -1164,7 +1139,7 @@ Terse command-style prompts produce shallow, generic work.
 
     // ---- Execute ----
 
-    execute: async (toolCallId, params, signal, onUpdate, ctx) => {
+    execute: async (toolCallId, params, _signal, _onUpdate, ctx) => {
       // Ensure we have UI context for widget rendering
       widget.setUICtx(ctx.ui as UICtx);
 
@@ -1174,7 +1149,6 @@ Terse command-style prompts produce shallow, generic work.
       const rawType = params.subagent_type as SubagentType;
       const resolved = resolveType(rawType);
       const subagentType = resolved ?? "general-purpose";
-      const fellBack = resolved === undefined;
 
       const displayName = getDisplayName(subagentType);
 
@@ -1226,7 +1200,6 @@ Terse command-style prompts produce shallow, generic work.
 
       const thinking = resolvedConfig.thinking;
       const inheritContext = resolvedConfig.inheritContext;
-      const runInBackground = resolvedConfig.runInBackground;
       const wait = params.wait === true;
       const waitGroup = typeof params.wait_group === "string" ? params.wait_group.trim() : undefined;
       const waitGroupDone = params.wait_group_done === true;
@@ -1274,7 +1247,8 @@ Terse command-style prompts produce shallow, generic work.
         maxTurns: normalizeMaxTurns(resolvedConfig.maxTurns),
         isolated,
         inheritContext,
-        runInBackground,
+        // Agent calls are always detached; run_in_background is a compatibility no-op.
+        runInBackground: true,
         isolation,
       };
       // Tool-result render shows the mode label too; viewer's header already does.
@@ -1291,9 +1265,6 @@ Terse command-style prompts produce shallow, generic work.
 
       if ((waitGroup || waitGroupDone) && !wait) {
         return textResult("wait_group and wait_group_done require wait: true.");
-      }
-      if (wait && !runInBackground) {
-        return textResult("wait: true requires run_in_background: true; it controls nonblocking background notifications.");
       }
       if (wait && params.schedule) {
         return textResult("Cannot combine wait: true with schedule — scheduled jobs are separate future runs.");
@@ -1312,9 +1283,6 @@ Terse command-style prompts produce shallow, generic work.
         }
         if (params.inherit_context) {
           return textResult("Cannot combine `schedule` with `inherit_context` — there is no parent conversation at fire time.");
-        }
-        if (params.run_in_background === false) {
-          return textResult("Cannot combine `schedule` with `run_in_background: false` — scheduled jobs always run in background.");
         }
         if (!scheduler.isActive()) {
           return textResult("Scheduler is not active in this session yet. Try again after the session has fully started.");
@@ -1343,7 +1311,7 @@ Terse command-style prompts produce shallow, generic work.
         }
       }
 
-      // Resume existing agent
+      // Resume existing agent without blocking the parent tool call.
       if (params.resume) {
         const existing = manager.getRecord(params.resume);
         if (!existing) {
@@ -1352,241 +1320,133 @@ Terse command-style prompts produce shallow, generic work.
         if (!existing.session) {
           return textResult(`Agent "${params.resume}" has no active session to resume.`);
         }
-        const record = await manager.resume(params.resume, params.prompt, signal);
-        if (!record) {
-          return textResult(`Failed to resume agent "${params.resume}".`);
-        }
-        // A failed resume surfaces the error, plus any partial output THIS
-        // resume produced (never the previous turn's answer, #144).
-        if (record.status === "error") {
-          return textResult(`Agent failed: ${record.error}${partialOutputSuffix(record)}`, buildDetails(detailBase, record));
-        }
-        return textResult(
-          record.result?.trim() || "No output.",
-          buildDetails(detailBase, record),
-        );
-      }
 
-      // Background execution
-      if (runInBackground) {
-        const { state: bgState, callbacks: bgCallbacks } = createActivityTracker(effectiveMaxTurns);
-
-        // Wrap onSessionCreated to wire output file streaming.
-        // The callback reads the transcript paths installed synchronously by
-        // onSpawned before the agent can queue or start.
-        let id = "";
-        let effectiveWaitGroupId: string | undefined;
-        let implicitWaitGroupId: string | undefined;
-        if (wait) {
-          if (waitGroup) {
-            if (!waitGroups.hasGroup(waitGroup)) {
-              return textResult(`Wait group not found: "${waitGroup}". Create it with subagent_wait_group first.`);
-            }
-            effectiveWaitGroupId = waitGroup;
-          } else {
-            implicitWaitGroupId = waitGroups.create(params.description);
-            effectiveWaitGroupId = implicitWaitGroupId;
-          }
-        }
-        const joinMode = wait ? undefined : resolveJoinMode(defaultJoinMode, true);
-        const origBgOnSession = bgCallbacks.onSessionCreated;
-        bgCallbacks.onSessionCreated = (session: any) => {
-          origBgOnSession(session);
-          const rec = manager.getRecord(id);
-          if (rec?.outputFile) {
-            rec.outputCleanup = streamToOutputFile(session, rec.outputFile, id, ctx.cwd, rec.historyFile);
-          }
-        };
-
-        try {
-          id = manager.spawn(pi, ctx, subagentType, params.prompt, {
-            description: params.description,
-            model,
-            maxTurns: effectiveMaxTurns,
-            isolated,
-            inheritContext,
-            thinkingLevel: thinking,
-            isBackground: true,
-            isolation,
-            invocation: agentInvocation,
-            waitGroupId: effectiveWaitGroupId,
-            onSpawned: (spawnedId) => {
-              id = spawnedId;
-              attachTranscript(manager.getRecord(spawnedId), spawnedId);
-              if (effectiveWaitGroupId) waitGroups.addAgent(effectiveWaitGroupId, spawnedId);
-            },
-            ...bgCallbacks,
-          });
-        } catch (err) {
-          if (effectiveWaitGroupId && id) waitGroups.removeAgent(effectiveWaitGroupId, id);
-          if (implicitWaitGroupId) waitGroups.discard(implicitWaitGroupId);
-          return textResult(err instanceof Error ? err.message : String(err));
-        }
-
-        // Set join metadata after spawn. Transcript metadata was installed by
-        // the manager's synchronous onSpawned callback before this point.
-        const record = manager.getRecord(id);
-        if (record && joinMode) {
-          record.joinMode = joinMode;
-          record.toolCallId = toolCallId;
-        }
-
-        if (effectiveWaitGroupId) {
-          if (implicitWaitGroupId || waitGroupDone) waitGroups.seal(effectiveWaitGroupId);
-        } else if (joinMode == null || joinMode === 'async') {
-          // Foreground/no join mode or explicit async — not part of any batch
-        } else {
-          // smart or group — add to current batch
-          currentBatchAgents.push({ id, joinMode });
-          // Debounce: reset timer on each new agent so parallel tool calls
-          // dispatched across multiple event loop ticks are captured together
-          if (batchFinalizeTimer) clearTimeout(batchFinalizeTimer);
-          batchFinalizeTimer = setTimeout(finalizeBatch, 100);
-        }
-
-        agentActivity.set(id, bgState);
+        // A resumed turn has a new unread result and follows the same detached
+        // completion-notification flow as a fresh Agent call.
+        existing.resultConsumed = false;
+        existing.toolCallId = toolCallId;
+        void manager.resume(params.resume, params.prompt);
         widget.ensureTimer();
         widget.update();
 
-        // Emit created event
-        pi.events.emit("subagents:created", {
-          id,
-          type: subagentType,
-          description: params.description,
-          isBackground: true,
-        });
-
-        const isQueued = record?.status === "queued";
         return textResult(
-          `Agent ${isQueued ? "queued" : "started"} in background.\n` +
-          `Agent ID: ${id}\n` +
+          `Agent resumed in background.\n` +
+          `Agent ID: ${params.resume}\n` +
           `Type: ${displayName}\n` +
-          `Description: ${params.description}\n` +
-          (record?.outputFile ? `Output file: ${record.outputFile}\n` : "") +
-          (isQueued ? `Position: queued (max ${manager.getMaxConcurrent()} concurrent)\n` : "") +
-          (effectiveWaitGroupId
-            ? `\nWait group: ${effectiveWaitGroupId}${implicitWaitGroupId || waitGroupDone ? " (sealed)" : " (open — seal it with subagent_wait_group)"}.\n` +
-              `You will receive one grouped notification when the sealed wait group completes.\n`
-            : `\nYou will be notified when this agent completes.\n`) +
-          `After the completion notification, call get_subagent_result with wait omitted or false to render native expandable results; use steer_subagent to send messages while it is running.\n` +
+          `Description: ${params.description}\n\n` +
+          `You will receive a completion notification when this agent finishes.\n` +
+          `Results arrive via that notification; after it, call get_subagent_result with wait omitted or false to render native expandable results.\n` +
           `Do not duplicate this agent's work.`,
-          { ...detailBase, toolUses: 0, tokens: "", durationMs: 0, status: "background" as const, agentId: id },
+          { ...detailBase, toolUses: 0, tokens: "", durationMs: 0, status: "background" as const, agentId: params.resume },
         );
       }
 
-      // Foreground (synchronous) execution — stream progress via onUpdate
-      let spinnerFrame = 0;
-      const startedAt = Date.now();
-      let fgId: string | undefined;
+      // All fresh Agent calls use the detached path. `run_in_background` is
+      // intentionally ignored; bypassQueue preserves the historical behavior
+      // where foreground calls started immediately despite the background cap.
+      const { state: bgState, callbacks: bgCallbacks } = createActivityTracker(effectiveMaxTurns);
 
-      const streamUpdate = () => {
-        const details: AgentDetails = {
-          ...detailBase,
-          toolUses: fgState.toolUses,
-          tokens: formatLifetimeTokens(fgState),
-          turnCount: fgState.turnCount,
-          maxTurns: fgState.maxTurns,
-          durationMs: Date.now() - startedAt,
-          status: "running",
-          activity: describeActivity(fgState.activeTools, fgState.responseText),
-          spinnerFrame: spinnerFrame % SPINNER.length,
-        };
-        onUpdate?.({
-          content: [{ type: "text", text: `${fgState.toolUses} tool uses...` }],
-          details: details as any,
-        });
-      };
-
-      const { state: fgState, callbacks: fgCallbacks } = createActivityTracker(effectiveMaxTurns, streamUpdate);
-
-      // Wire session creation: register in widget + stream to output file.
-      // The output file path is set synchronously after spawn (below),
-      // before onSessionCreated fires — same pattern as background agents.
-      const origOnSession = fgCallbacks.onSessionCreated;
-      fgCallbacks.onSessionCreated = (session: any) => {
-        origOnSession(session);
-        for (const a of manager.listAgents()) {
-          if (a.session === session) {
-            fgId = a.id;
-            agentActivity.set(a.id, fgState);
-            widget.ensureTimer();
-            widget.update();
-            break;
+      // Wrap onSessionCreated to wire output file streaming.
+      // The callback reads the transcript paths installed synchronously by
+      // onSpawned before the agent can queue or start.
+      let id = "";
+      let effectiveWaitGroupId: string | undefined;
+      let implicitWaitGroupId: string | undefined;
+      if (wait) {
+        if (waitGroup) {
+          if (!waitGroups.hasGroup(waitGroup)) {
+            return textResult(`Wait group not found: "${waitGroup}". Create it with subagent_wait_group first.`);
           }
+          effectiveWaitGroupId = waitGroup;
+        } else {
+          implicitWaitGroupId = waitGroups.create(params.description);
+          effectiveWaitGroupId = implicitWaitGroupId;
         }
-        // Stream conversation to output file (foreground agent logging)
-        if (fgId) {
-          const rec = manager.getRecord(fgId);
-          if (rec?.outputFile) {
-            rec.outputCleanup = streamToOutputFile(session, rec.outputFile, fgId, ctx.cwd, rec.historyFile);
-          }
+      }
+      const joinMode = wait ? undefined : resolveJoinMode(defaultJoinMode, true);
+      const origBgOnSession = bgCallbacks.onSessionCreated;
+      bgCallbacks.onSessionCreated = (session: any) => {
+        origBgOnSession(session);
+        const rec = manager.getRecord(id);
+        if (rec?.outputFile) {
+          rec.outputCleanup = streamToOutputFile(session, rec.outputFile, id, ctx.cwd, rec.historyFile);
         }
       };
 
-      // Animate spinner at ~80ms (smooth rotation through 10 braille frames)
-      const spinnerInterval = setInterval(() => {
-        spinnerFrame++;
-        streamUpdate();
-      }, 80);
-
-      streamUpdate();
-
-      let record: AgentRecord;
       try {
-        const fgResult = await manager.spawnAndWait(pi, ctx, subagentType, params.prompt, {
+        id = manager.spawn(pi, ctx, subagentType, params.prompt, {
           description: params.description,
           model,
           maxTurns: effectiveMaxTurns,
           isolated,
           inheritContext,
           thinkingLevel: thinking,
+          isBackground: true,
+          bypassQueue: true,
           isolation,
           invocation: agentInvocation,
-          signal,
-          ...fgCallbacks,
-        }, (fgAgentId) => {
-          // onSpawned: called synchronously after spawn, before onSessionCreated fires.
-          // Set up the output file so streamToOutputFile can pick it up.
-          const fgRec = manager.getRecord(fgAgentId);
-          attachTranscript(fgRec, fgAgentId);
+          waitGroupId: effectiveWaitGroupId,
+          onSpawned: (spawnedId) => {
+            id = spawnedId;
+            attachTranscript(manager.getRecord(spawnedId), spawnedId);
+            if (effectiveWaitGroupId) waitGroups.addAgent(effectiveWaitGroupId, spawnedId);
+          },
+          ...bgCallbacks,
         });
-        record = fgResult.record;
       } catch (err) {
-        clearInterval(spinnerInterval);
+        if (effectiveWaitGroupId && id) waitGroups.removeAgent(effectiveWaitGroupId, id);
+        if (implicitWaitGroupId) waitGroups.discard(implicitWaitGroupId);
         return textResult(err instanceof Error ? err.message : String(err));
       }
 
-      clearInterval(spinnerInterval);
-
-      // Clean up foreground agent from widget
-      if (fgId) {
-        agentActivity.delete(fgId);
-        widget.markFinished(fgId);
+      // Set join metadata after spawn. Transcript metadata was installed by
+      // the manager's synchronous onSpawned callback before this point.
+      const record = manager.getRecord(id);
+      if (record && joinMode) {
+        record.joinMode = joinMode;
+        record.toolCallId = toolCallId;
       }
 
-      // Get final token count
-      const tokenText = formatLifetimeTokens(fgState);
-
-      const details = buildDetails(detailBase, record, fgState, { tokens: tokenText });
-
-      // "general-purpose" may itself be unregistered (defaults disabled, no
-      // user override) — getConfig then uses the hardcoded fallback config.
-      const fallbackNote = fellBack
-        ? `Note: Unknown agent type "${rawType}" — using ${resolveType("general-purpose") ? "general-purpose" : "the fallback agent config"}.\n\n`
-        : "";
-
-      if (record.status === "error") {
-        // Error headline + any partial output the run produced before failing.
-        return textResult(`${fallbackNote}Agent failed: ${record.error}${partialOutputSuffix(record)}`, details);
+      if (effectiveWaitGroupId) {
+        if (implicitWaitGroupId || waitGroupDone) waitGroups.seal(effectiveWaitGroupId);
+      } else if (joinMode == null || joinMode === 'async') {
+        // No join mode or explicit async — not part of any batch.
+      } else {
+        // Smart or group — add to current batch.
+        currentBatchAgents.push({ id, joinMode });
+        // Debounce: reset timer on each new agent so parallel tool calls
+        // dispatched across multiple event loop ticks are captured together.
+        if (batchFinalizeTimer) clearTimeout(batchFinalizeTimer);
+        batchFinalizeTimer = setTimeout(finalizeBatch, 100);
       }
 
-      const durationMs = (record.completedAt ?? Date.now()) - record.startedAt;
-      const statsParts = [`${record.toolUses} tool uses`];
-      if (tokenText) statsParts.push(tokenText);
+      agentActivity.set(id, bgState);
+      widget.ensureTimer();
+      widget.update();
+
+      // Emit created event.
+      pi.events.emit("subagents:created", {
+        id,
+        type: subagentType,
+        description: params.description,
+        isBackground: true,
+      });
+
+      const isQueued = record?.status === "queued";
       return textResult(
-        `${fallbackNote}Agent completed in ${formatMs(durationMs)} (${statsParts.join(", ")})${getStatusNote(record.status)}.\n\n` +
-        (record.result?.trim() || "No output."),
-        details,
+        `Agent ${isQueued ? "queued" : "started"} in background.\n` +
+        `Agent ID: ${id}\n` +
+        `Type: ${displayName}\n` +
+        `Description: ${params.description}\n` +
+        (record?.outputFile ? `Output file: ${record.outputFile}\n` : "") +
+        (isQueued ? `Position: queued (max ${manager.getMaxConcurrent()} concurrent)\n` : "") +
+        (effectiveWaitGroupId
+          ? `\nWait group: ${effectiveWaitGroupId}${implicitWaitGroupId || waitGroupDone ? " (sealed)" : " (open — seal it with subagent_wait_group)"}.\n` +
+            `You will receive one grouped completion notification when the sealed wait group completes.\n`
+          : `\nYou will receive a completion notification when this agent completes.\n`) +
+        `Results arrive via the completion notification; after it, call get_subagent_result with wait omitted or false to render native expandable results.\n` +
+        `Do not duplicate this agent's work.`,
+        { ...detailBase, toolUses: 0, tokens: "", durationMs: 0, status: "background" as const, agentId: id },
       );
     },
   }));
@@ -1597,7 +1457,7 @@ Terse command-style prompts produce shallow, generic work.
     name: SUBAGENT_TOOL_NAMES.WAIT_GROUP,
     label: "Subagent Wait Group",
     description:
-      "Create, update, or seal a nonblocking wait group for background Agent calls. " +
+      "Create, update, or seal a nonblocking wait group for detached Agent calls. " +
       "A sealed group sends one completion notification after all member agents finish.",
     promptSnippet: "Create, update, or seal a grouped subagent completion notification",
     parameters: Type.Object({
@@ -1626,8 +1486,8 @@ Terse command-style prompts produce shallow, generic work.
             `Created subagent wait group.\n` +
             `Group ID: ${createdId}\n` +
             `Summary: ${summary}\n\n` +
-            `Use Agent with run_in_background: true, wait: true, wait_group: "${createdId}". ` +
-            `Seal the group after adding members.`,
+            `Use Agent with wait: true, wait_group: "${createdId}". ` +
+            `Seal the group after adding members. Agent calls are detached automatically.`,
           );
         }
         if (action === "update") {
@@ -1666,7 +1526,7 @@ Terse command-style prompts produce shallow, generic work.
     name: SUBAGENT_TOOL_NAMES.GET_RESULT,
     label: "Get Agent Result",
     description:
-      "Check status and retrieve results from a background agent. Use the agent ID returned by Agent with run_in_background.",
+      "Check status and retrieve results from a detached agent. Use the agent ID returned by Agent.",
     promptSnippet: "Check status and retrieve results from a background agent",
     parameters: Type.Object({
       agent_id: Type.String({
@@ -2341,7 +2201,7 @@ extensions: <true (inherit all MCP/extension tools), false (none), or comma-sepa
 skills: <true (inherit all), false (none), or comma-separated skill names to preload into prompt. Default: true>
 disallowed_tools: <comma-separated tool names to block, even if otherwise available. Omit for none>
 inherit_context: <true to fork parent conversation into agent so it sees chat history. Default: false>
-run_in_background: <true to run in background by default. Default: false>
+run_in_background: <accepted for compatibility; has no effect>
 output_transcript: <false to write no transcript file or path for this agent. Independent of persist_session. Default: true>
 isolated: <true for no extension/MCP tools, only built-in tools. Default: false>
 memory: <"user" (global), "project" (per-project), or "local" (gitignored per-project) for persistent memory. Omit for none>
@@ -2363,23 +2223,33 @@ Guidelines for choosing settings:
 
 Write the file using the write tool. Only write the file, nothing else.`;
 
-    const { record } = await manager.spawnAndWait(pi, ctx, "general-purpose", generatePrompt, {
-      description: `Generate ${name} agent`,
-      maxTurns: 5,
-    });
-
-    if (record.status === "error") {
-      ctx.ui.notify(`Generation failed: ${record.error}`, "warning");
+    let id: string;
+    try {
+      id = manager.spawn(pi, ctx, "general-purpose", generatePrompt, {
+        description: `Generate ${name} agent`,
+        maxTurns: 5,
+        isBackground: true,
+        bypassQueue: true,
+      });
+    } catch (err) {
+      ctx.ui.notify(`Generation failed: ${err instanceof Error ? err.message : String(err)}`, "warning");
       return;
     }
 
-    reloadCustomAgents();
+    const record = manager.getRecord(id);
+    void record?.promise?.then(() => {
+      if (record.status === "error") {
+        ctx.ui.notify(`Generation failed: ${record.error}`, "warning");
+        return;
+      }
 
-    if (existsSync(targetPath)) {
-      ctx.ui.notify(`Created ${targetPath}`, "info");
-    } else {
-      ctx.ui.notify("Agent generation completed but file was not created. Check the agent output.", "warning");
-    }
+      reloadCustomAgents();
+      if (existsSync(targetPath)) {
+        ctx.ui.notify(`Created ${targetPath}`, "info");
+      } else {
+        ctx.ui.notify("Agent generation completed but file was not created. Check the agent output.", "warning");
+      }
+    });
   }
 
   async function showManualWizard(ctx: ExtensionCommandContext, targetDir: string) {
@@ -2548,7 +2418,7 @@ ${systemPrompt}
         {
           id: "widgetMode",
           label: "Widget",
-          description: "Above-editor agent widget: all = every agent; background = hide foreground (they already render inline); off = hide the widget.",
+          description: "Above-editor agent widget: all = every agent; background = hide explicitly foreground programmatic runs; off = hide the widget.",
           currentValue: getWidgetMode(),
           values: ["all", "background", "off"],
         },

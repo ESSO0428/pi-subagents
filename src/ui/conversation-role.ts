@@ -21,15 +21,17 @@ export function renderConversationRoleHeader(
   theme: ConversationRoleTheme,
 ): string {
   const label = conversationRoleLabel(block);
-  const color = block.kind === "tool"
-    ? "toolTitle"
-    : block.role === "user"
-      ? "userMessageText"
-      : block.role === "assistant"
-        ? "accent"
-        : block.role === "custom"
-          ? "customMessageLabel"
-          : "muted";
+  const color = block.pending
+    ? "dim"
+    : block.kind === "tool"
+      ? "toolTitle"
+      : block.role === "user"
+        ? "userMessageText"
+        : block.role === "assistant"
+          ? "accent"
+          : block.role === "custom"
+            ? "customMessageLabel"
+            : "muted";
   const detail = block.kind === "tool" && block.toolCallId
     ? theme.fg("dim", ` · ${block.toolCallId}`)
     : "";

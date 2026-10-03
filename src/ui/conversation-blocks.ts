@@ -33,6 +33,8 @@ export interface ConversationBlock {
   /** Compatibility-facing short alias used by the timeline renderer. */
   result?: ConversationToolResultSnapshot;
   toolStatus?: "pending" | "success" | "error";
+  /** Message is queued for delivery and has not yet entered the transcript. */
+  pending?: boolean;
 }
 
 export interface ConversationFormatOptions {

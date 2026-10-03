@@ -51,7 +51,7 @@ export interface AgentConfig {
   promptMode: "replace" | "append";
   /** Default for spawn: fork parent conversation. undefined = caller decides. */
   inheritContext?: boolean;
-  /** Default for spawn: run in background. undefined = caller decides. */
+  /** Compatibility field; Agent calls always run detached regardless of this value. */
   runInBackground?: boolean;
   /** Default for spawn: no extension tools. undefined = caller decides. */
   isolated?: boolean;
@@ -147,6 +147,7 @@ export interface AgentInvocation {
   maxTurns?: number;
   isolated?: boolean;
   inheritContext?: boolean;
+  /** Effective detached execution mode; retained for persisted UI compatibility. */
   runInBackground?: boolean;
   isolation?: IsolationMode;
 }

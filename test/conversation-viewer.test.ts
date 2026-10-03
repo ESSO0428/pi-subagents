@@ -34,13 +34,36 @@ function mockTui(rows = 40, columns = 80) {
   } as any;
 }
 
-function mockSession(messages: any[] = []) {
-  return {
+type QueueUpdateEvent = {
+  type: "queue_update";
+  steering: readonly string[];
+  followUp: readonly string[];
+};
+
+function mockSession(messages: any[] = [], pendingSteers: string[] = []) {
+  let queuedSteers = [...pendingSteers];
+  let listener: ((event: QueueUpdateEvent) => void) | undefined;
+  const session = {
     messages,
-    subscribe: vi.fn(() => vi.fn()),
+    subscribe: vi.fn((next: (event: QueueUpdateEvent) => void) => {
+      listener = next;
+      return vi.fn();
+    }),
+    getSteeringMessages: vi.fn(() => queuedSteers),
+    clearQueue: vi.fn(() => {
+      const steering = queuedSteers;
+      queuedSteers = [];
+      listener?.({ type: "queue_update", steering: [], followUp: [] });
+      return { steering, followUp: [] };
+    }),
+    emitQueueUpdate: (steering: string[]) => {
+      queuedSteers = [...steering];
+      listener?.({ type: "queue_update", steering: queuedSteers, followUp: [] });
+    },
     dispose: vi.fn(),
     getSessionStats: () => ({ tokens: { input: 0, output: 0, cacheWrite: 0 } }),
-  } as any;
+  };
+  return session as any;
 }
 
 function mockRecord(overrides: Partial<AgentRecord> = {}): AgentRecord {
@@ -405,6 +428,61 @@ describe("ConversationViewer", () => {
   describe("steer composer", () => {
     const W = 80;
 
+    it("renders pending steering messages dimly and removes them after delivery", async () => {
+      const session = mockSession([{ role: "user", content: "delivered" }], ["queued steer"]);
+      const viewer = new ConversationViewer(
+        mockTui(30, W), session, mockRecord(), undefined,
+        {
+          fg: (color, text) => `<${color}>${text}</${color}>`,
+          bold: (text) => `<bold>${text}</bold>`,
+        }, vi.fn(), undefined, undefined, vi.fn(),
+      );
+
+      expect(viewer.render(W).join("\n")).toContain("<dim>queued steer</dim>");
+      expect((viewer as any).blocks.at(-1)).toMatchObject({
+        markdown: "queued steer",
+        pending: true,
+      });
+
+      session.emitQueueUpdate([]);
+      await Promise.resolve();
+      expect(viewer.render(W).join("\n")).not.toContain("queued steer");
+    });
+
+    it("recalls all pending steers into one multiline composer", () => {
+      const session = mockSession([], ["first queued", "second queued"]);
+      const viewer = new ConversationViewer(
+        mockTui(30, W), session, mockRecord(), undefined, ansiTheme(), vi.fn(),
+        undefined, undefined, vi.fn(),
+      );
+
+      viewer.handleInput("e");
+      viewer.handleInput("a-up");
+
+      expect(session.clearQueue).toHaveBeenCalledTimes(1);
+      expect((viewer as any).composer.getText()).toBe("first queued\nsecond queued");
+    });
+
+    it("accepts Ctrl+J as a newline and renders an additional composer row", () => {
+      const viewer = new ConversationViewer(
+        mockTui(30, W), mockSession(), mockRecord(), undefined, ansiTheme(), vi.fn(),
+        undefined, undefined, vi.fn(),
+      );
+
+      viewer.handleInput("e");
+      for (const character of "first") viewer.handleInput(character);
+      const oneEditorRows = (viewer as any).composer.render(W - 4).length;
+      viewer.handleInput("\n");
+      for (const character of "second") viewer.handleInput(character);
+      const multiline = viewer.render(W);
+
+      expect((viewer as any).composer.getText()).toBe("first\nsecond");
+      const composerLines = (viewer as any).composer.render(W - 4) as string[];
+      expect(composerLines.filter((line) => line.includes("first") || line.includes("second"))).toHaveLength(2);
+      expect(composerLines.length).toBeGreaterThan(oneEditorRows);
+      expect(multiline.join("\n")).toContain("second");
+    });
+
     function makeViewer(opts: { status?: AgentRecord["status"]; onSteer?: (m: string) => void } = {}) {
       const onSteer = opts.onSteer ?? vi.fn();
       const tui = mockTui(30, W);
@@ -422,7 +500,7 @@ describe("ConversationViewer", () => {
       viewer.handleInput("e"); // e
       // Composer is shown (its prompt + send/cancel hint), idle footer is gone.
       const out = viewer.render(W).join("\n");
-      expect(out).toContain("Enter send · Esc cancel");
+      expect(out).toContain("Enter send · Ctrl+J newline · Esc cancel");
       expect(out).not.toContain("e steer");
     });
 
@@ -459,7 +537,7 @@ describe("ConversationViewer", () => {
       viewer.handleInput("e"); // open composer
       // 'j' would normally scroll, but here it types into the composer.
       viewer.handleInput("j");
-      expect(viewer.render(W).join("\n")).toContain("Enter send · Esc cancel");
+      expect(viewer.render(W).join("\n")).toContain("Enter send · Ctrl+J newline · Esc cancel");
     });
 
     it("no steer affordance once the agent is no longer running", () => {

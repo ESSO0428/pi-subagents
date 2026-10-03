@@ -1,8 +1,8 @@
 /**
  * wait-queued.test.ts — get_subagent_result(wait:true) is compatibility-only.
  *
- * Completion is delivered by background notifications / wait groups. The result
- * tool must never block the parent agent while a child is running or queued.
+ * Completion is delivered by detached-agent notifications / wait groups. The
+ * result tool must never block the parent agent while a child is running.
  */
 import { describe, expect, it, vi } from "vitest";
 
@@ -101,26 +101,16 @@ describe("get_subagent_result wait:true compatibility", () => {
     await lifecycle.get("session_shutdown")?.();
   });
 
-  it("returns immediately for a queued agent", async () => {
+  it("plain Agent calls bypass the concurrency queue", async () => {
     const { pi, tools, lifecycle } = makePi();
     subagentsExtension(pi);
 
     vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}) as any);
 
-    let queuedId: string | undefined;
-    for (let i = 0; i < 10 && !queuedId; i++) {
-      const { id, queued } = await spawnBackground(tools);
-      if (queued) queuedId = id;
-    }
-    expect(queuedId, "expected to hit the concurrency limit within 10 spawns").toBeDefined();
+    const results = [];
+    for (let i = 0; i < 10; i++) results.push(await spawnBackground(tools));
 
-    const result = await tools
-      .get("get_subagent_result")
-      .execute("tc-queued-nonblocking", { agent_id: queuedId, wait: true }, undefined, undefined, ctx());
-
-    expect(textOf(result)).toContain("Status: queued");
-    expect(textOf(result)).toContain("wait:true is deprecated and no longer blocks");
-
+    expect(results.every(({ queued }) => !queued)).toBe(true);
     await lifecycle.get("session_shutdown")?.();
   });
 });

@@ -7,7 +7,7 @@
 
 import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { copyToClipboard } from "@earendil-works/pi-coding-agent";
-import { type Component, Input, Key, matchesKey, type TUI, type TuiMouseEvent, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { type Component, Editor, Key, matchesKey, type TUI, type TuiMouseEvent, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { AgentRecord } from "../types.js";
 import { getLifetimeTotal, getSessionContextPercent } from "../usage.js";
 import type { Theme } from "./agent-widget.js";
@@ -68,7 +68,10 @@ function renderScrollMoreRule(
 }
 
 /** The live fields needed by the viewer; historical viewers use a static source. */
-export type ConversationSource = Pick<AgentSession, "messages" | "subscribe">;
+export type ConversationSource = Pick<AgentSession, "messages" | "subscribe"> & {
+  getSteeringMessages?: () => readonly string[];
+  clearQueue?: () => { steering: string[]; followUp: string[] };
+};
 
 export function createStaticConversationSource(
   messages: AgentSession["messages"],
@@ -79,6 +82,22 @@ export function createStaticConversationSource(
 type RenderLine = TimelineRenderLine;
 
 const FULL_TOOL_PREVIEW_MAX_CHARS = 500_000;
+
+function pendingSteerBlockId(text: string, occurrence: number, usedIds: Set<string>): string {
+  let hash = 0;
+  for (let index = 0; index < text.length; index++) {
+    hash = (hash * 31 + text.charCodeAt(index)) >>> 0;
+  }
+  const preferred = `pending-steer-${hash.toString(36)}-${occurrence}`;
+  let id = preferred;
+  let suffix = 2;
+  while (usedIds.has(id)) {
+    id = `${preferred}-${suffix}`;
+    suffix++;
+  }
+  usedIds.add(id);
+  return id;
+}
 
 class FullToolPreview implements Component {
   private scrollOffset = 0;
@@ -216,6 +235,7 @@ export class ConversationViewer implements Component {
   private scrollOffset = 0;
   private autoScroll = true;
   private unsubscribe: (() => void) | undefined;
+  private pendingSteers: string[] = [];
   private lastInnerW = 0;
   private closed = false;
   private stopArmed = false;
@@ -223,7 +243,7 @@ export class ConversationViewer implements Component {
   private hoveredPreview = false;
   private pressedHeaderAction: "preview" | "close" | undefined;
   private keys: ViewerKeys;
-  private composer: Input | undefined;
+  private composer: Editor | undefined;
   private searchMode = false;
   private searchQuery = "";
   private searchMatches: ConversationMatch[] = [];
@@ -252,14 +272,18 @@ export class ConversationViewer implements Component {
     private operations?: ConversationViewerOperations,
   ) {
     this.keys = createViewerKeys(keybindings);
-    this.blocks = formatConversationMessages(session.messages);
+    this.pendingSteers = this.readPendingSteers();
+    this.blocks = this.formatBlocks();
     this.timeline = new ConversationTimeline(tui, theme, {
       cwd: operations?.ctx.cwd,
       record,
       onChange: (change) => this.handleTimelineChange(change),
     });
     this.timeline.setBlocks(this.blocks);
-    this.unsubscribe = session.subscribe(() => this.scheduleSessionRefresh());
+    this.unsubscribe = session.subscribe((event) => {
+      if (event.type === "queue_update") this.pendingSteers = [...event.steering];
+      this.scheduleSessionRefresh();
+    });
   }
 
   handleInput(data: string): void {
@@ -270,10 +294,14 @@ export class ConversationViewer implements Component {
     if (this.composer) {
       if (matchesKey(data, Key.alt("up")) || data === "a-up" || data === "alt+up") {
         this.recallSteerDraft();
+      } else if (matchesKey(data, Key.escape)) {
+        this.composer = undefined;
+        this.steerHistoryIndex = -1;
+        this.steerHistoryDraft = "";
       } else {
-        const before = this.composer.getValue();
+        const before = this.composer.getText();
         this.composer.handleInput(data);
-        if (this.composer && before !== this.composer.getValue()) {
+        if (this.composer && before !== this.composer.getText()) {
           this.steerHistoryIndex = -1;
           this.steerHistoryDraft = "";
         }
@@ -562,8 +590,8 @@ export class ConversationViewer implements Component {
 
     lines.push(hrMid);
     if (this.composer) {
-      lines.push(row(this.composer.render(innerW)[0] ?? ""));
-      const hint = th.fg("dim", "Enter send · Esc cancel · Alt+Up recall");
+      for (const composerLine of this.composer.render(innerW)) lines.push(row(composerLine));
+      const hint = th.fg("dim", "Enter send · Ctrl+J newline · Esc cancel · Alt+Up recall");
       const label = th.fg("accent", "✎ steer");
       lines.push(row(label + " ".repeat(Math.max(1, innerW - visibleWidth(label) - visibleWidth(hint))) + hint));
     } else if (this.searchMode) {
@@ -615,6 +643,31 @@ export class ConversationViewer implements Component {
     this.cachedVersion = -1;
   }
 
+  private readPendingSteers(): string[] {
+    return this.session.getSteeringMessages ? [...this.session.getSteeringMessages()] : [];
+  }
+
+  private formatBlocks(): ConversationBlock[] {
+    const blocks = formatConversationMessages(this.session.messages);
+    const usedIds = new Set(blocks.map((block) => block.id));
+    const occurrences = new Map<string, number>();
+    for (const text of this.pendingSteers) {
+      const occurrence = occurrences.get(text) ?? 0;
+      occurrences.set(text, occurrence + 1);
+      blocks.push({
+        id: pendingSteerBlockId(text, occurrence, usedIds),
+        kind: "text",
+        role: "user",
+        header: "User",
+        markdown: text,
+        copyText: text,
+        fullText: text,
+        pending: true,
+      });
+    }
+    return blocks;
+  }
+
   private scheduleSessionRefresh(): void {
     if (this.closed || this.sessionRefreshQueued) return;
     this.sessionRefreshQueued = true;
@@ -622,7 +675,8 @@ export class ConversationViewer implements Component {
       this.sessionRefreshQueued = false;
       if (this.closed) return;
       if (this.hasFocusedBlock) this.selectedBlockId = this.currentBlock()?.id;
-      this.blocks = formatConversationMessages(this.session.messages);
+      this.pendingSteers = this.readPendingSteers();
+      this.blocks = this.formatBlocks();
       this.timeline.setBlocks(this.blocks);
       this.cacheVersion++;
       this.invalidate();
@@ -665,7 +719,8 @@ export class ConversationViewer implements Component {
   }
 
   private chromeLines(): number {
-    return CHROME_LINES_BASE + (this.invocationLine() ? 1 : 0) + (this.composer ? 1 : 0);
+    const composerLines = this.composer?.render(this.lastInnerW || 80).length ?? 0;
+    return CHROME_LINES_BASE + (this.invocationLine() ? 1 : 0) + composerLines;
   }
 
   private invocationLine(): string | undefined {
@@ -987,7 +1042,16 @@ export class ConversationViewer implements Component {
   }
 
   private openComposer(): void {
-    const input = new Input();
+    const input = new Editor(this.tui, {
+      borderColor: (text) => this.theme.fg("borderMuted", text),
+      selectList: {
+        selectedPrefix: (text) => this.theme.fg("accent", text),
+        selectedText: (text) => this.theme.fg("accent", text),
+        description: (text) => this.theme.fg("muted", text),
+        scrollInfo: (text) => this.theme.fg("muted", text),
+        noMatch: (text) => this.theme.fg("muted", text),
+      },
+    });
     input.focused = true;
     this.steerHistoryIndex = -1;
     this.steerHistoryDraft = "";
@@ -1003,25 +1067,31 @@ export class ConversationViewer implements Component {
       }
       this.tui.requestRender();
     };
-    input.onEscape = () => {
-      this.composer = undefined;
-      this.steerHistoryIndex = -1;
-      this.steerHistoryDraft = "";
-      this.tui.requestRender();
-    };
     this.composer = input;
     this.tui.requestRender();
   }
 
-  /** Recall the newest prior steer, preserving the draft for future editing. */
+  /** Recall queued messages before local history so an undelivered steer is never hidden. */
   private recallSteerDraft(): void {
-    if (!this.composer || this.steerHistory.length === 0) return;
+    if (!this.composer) return;
+    if (this.pendingSteers.length > 0) {
+      if (!this.session.clearQueue) return;
+      const { steering, followUp } = this.session.clearQueue();
+      const queuedText = [...steering, ...followUp].join("\n");
+      const currentText = this.composer.getText();
+      this.composer.setText([queuedText, currentText].filter((text) => text.trim()).join("\n"));
+      this.pendingSteers = [];
+      this.steerHistoryIndex = -1;
+      this.steerHistoryDraft = "";
+      return;
+    }
+    if (this.steerHistory.length === 0) return;
     if (this.steerHistoryIndex < 0) {
-      this.steerHistoryDraft = this.composer.getValue();
+      this.steerHistoryDraft = this.composer.getText();
       this.steerHistoryIndex = 0;
     } else if (this.steerHistoryIndex < this.steerHistory.length - 1) {
       this.steerHistoryIndex++;
     }
-    this.composer.setValue(this.steerHistory[this.steerHistoryIndex] ?? this.steerHistoryDraft);
+    this.composer.setText(this.steerHistory[this.steerHistoryIndex] ?? this.steerHistoryDraft);
   }
 }

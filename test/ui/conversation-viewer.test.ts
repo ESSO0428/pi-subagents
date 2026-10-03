@@ -511,9 +511,9 @@ describe("ConversationViewer", () => {
 
     viewer.handleInput("e");
     viewer.handleInput("\u001bp");
-    expect((viewer as unknown as { composer?: { getValue(): string } }).composer?.getValue()).toBe("check output");
+    expect((viewer as unknown as { composer?: { getText(): string } }).composer?.getText()).toBe("check output");
     viewer.handleInput("a-up");
-    expect((viewer as unknown as { composer?: { getValue(): string } }).composer?.getValue()).toBe("check output");
+    expect((viewer as unknown as { composer?: { getText(): string } }).composer?.getText()).toBe("check output");
   });
 
   it("keeps historical viewers read-only and closes on Escape", () => {

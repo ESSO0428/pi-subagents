@@ -29,14 +29,14 @@ const resolvedRun = () =>
     steered: false,
   });
 
-describe("AgentManager — Bug 1 race condition (resultConsumed vs onComplete)", () => {
+describe("AgentManager — result consumption and completion callbacks", () => {
   let manager: AgentManager;
 
   afterEach(() => {
     manager?.dispose();
   });
 
-  it("reproduces bug: onComplete fires with resultConsumed=false when set after await", async () => {
+  it("onComplete sees resultConsumed=true when pre-marked before await", async () => {
     let seenConsumed: boolean | undefined;
     manager = new AgentManager((r) => {
       seenConsumed = r.resultConsumed;
@@ -46,38 +46,17 @@ describe("AgentManager — Bug 1 race condition (resultConsumed vs onComplete)",
     const id = manager.spawn(mockPi, mockCtx, "general-purpose", "test", {
       description: "test",
       isBackground: true,
+      bypassQueue: true,
     });
     const record = manager.getRecord(id)!;
 
-    // Simulate the buggy get_subagent_result: await THEN mark consumed
-    await record.promise;
-    record.resultConsumed = true; // too late — onComplete already fired
-
-    // onComplete saw resultConsumed as falsy (undefined) — would queue a notification (the bug)
-    expect(seenConsumed).toBeFalsy();
-  });
-
-  it("fix: onComplete sees resultConsumed=true when pre-marked before await", async () => {
-    let seenConsumed: boolean | undefined;
-    manager = new AgentManager((r) => {
-      seenConsumed = r.resultConsumed;
-    });
-    resolvedRun();
-
-    const id = manager.spawn(mockPi, mockCtx, "general-purpose", "test", {
-      description: "test",
-      isBackground: true,
-    });
-    const record = manager.getRecord(id)!;
-
-    // The fix: pre-mark BEFORE awaiting
     record.resultConsumed = true;
     await record.promise;
 
     expect(seenConsumed).toBe(true);
   });
 
-  it("normal case: onComplete fires with resultConsumed falsy when no explicit polling", async () => {
+  it("onComplete fires with resultConsumed falsy when no explicit polling", async () => {
     let completedRecord: AgentRecord | undefined;
     manager = new AgentManager((r) => {
       completedRecord = r;
@@ -87,33 +66,16 @@ describe("AgentManager — Bug 1 race condition (resultConsumed vs onComplete)",
     const id = manager.spawn(mockPi, mockCtx, "general-purpose", "test", {
       description: "test",
       isBackground: true,
+      bypassQueue: true,
     });
     await manager.getRecord(id)!.promise;
 
     expect(completedRecord).toBeDefined();
     expect(completedRecord!.resultConsumed).toBeFalsy();
   });
-
-  it("onComplete IS called for foreground agents (lifecycle symmetry)", async () => {
-    let completedRecord: AgentRecord | undefined;
-    manager = new AgentManager((r) => {
-      completedRecord = r;
-    });
-    resolvedRun();
-
-    const { record } = await manager.spawnAndWait(mockPi, mockCtx, "general-purpose", "test", {
-      description: "test",
-    });
-
-    expect(completedRecord).toBeDefined();
-    expect(completedRecord!.status).toBe("completed");
-    // resultConsumed is set by spawnAndWait so onComplete skips notifications
-    expect(completedRecord!.resultConsumed).toBe(true);
-    expect(record).toBe(completedRecord);
-  });
 });
 
-describe("AgentManager — spawnAndWait onSpawned + foreground output file wiring (#105)", () => {
+describe("AgentManager — detached onSpawned + output file wiring (#105)", () => {
   let manager: AgentManager;
   afterEach(() => manager?.dispose());
 
@@ -139,24 +101,32 @@ describe("AgentManager — spawnAndWait onSpawned + foreground output file wirin
       return { responseText: "done", session, aborted: false, steered: false };
     });
 
-    await manager.spawnAndWait(mockPi, mockCtx, "general-purpose", "test", {
+    const id = manager.spawn(mockPi, mockCtx, "general-purpose", "test", {
       description: "test",
-    }, (fgId) => {
-      capturedId = fgId;
-      manager.getRecord(fgId)!.outputFile = "/fake/agent.jsonl";
+      isBackground: true,
+      bypassQueue: true,
+      onSpawned: (fgId) => {
+        capturedId = fgId;
+        manager.getRecord(fgId)!.outputFile = "/fake/agent.jsonl";
+      },
     });
+    await manager.getRecord(id)!.promise;
 
     expect(outputFileSeenAtSessionCreated).toBe("/fake/agent.jsonl");
   });
 
-  it("onSpawned id matches the id returned by spawnAndWait", async () => {
+  it("onSpawned id matches the id returned by spawn", async () => {
     manager = new AgentManager();
     let spawnedId: string | undefined;
     resolvedRun();
 
-    const { id } = await manager.spawnAndWait(mockPi, mockCtx, "general-purpose", "test", {
+    const id = manager.spawn(mockPi, mockCtx, "general-purpose", "test", {
       description: "test",
-    }, (fgId) => { spawnedId = fgId; });
+      isBackground: true,
+      bypassQueue: true,
+      onSpawned: (fgId) => { spawnedId = fgId; },
+    });
+    await manager.getRecord(id)!.promise;
 
     expect(spawnedId).toBe(id);
   });
@@ -168,13 +138,17 @@ describe("AgentManager — spawnAndWait onSpawned + foreground output file wirin
     manager = new AgentManager((r) => { completedRecord = r; });
     vi.mocked(runAgent).mockRejectedValue(new Error("agent failed"));
 
-    const { record } = await manager.spawnAndWait(mockPi, mockCtx, "general-purpose", "test", {
+    const id = manager.spawn(mockPi, mockCtx, "general-purpose", "test", {
       description: "test",
+      isBackground: true,
+      bypassQueue: true,
     });
+    await manager.getRecord(id)!.promise;
+    const record = manager.getRecord(id)!;
 
     expect(completedRecord).toBeDefined();
     expect(completedRecord!.status).toBe("error");
-    expect(completedRecord!.resultConsumed).toBe(true);
+    expect(completedRecord!.resultConsumed).toBeFalsy();
     expect(record).toBe(completedRecord);
   });
 });

@@ -58,30 +58,41 @@ function ctx() {
 }
 
 const textOf = (r: any): string => r.content[0].text;
+const flush = async () => {
+  await new Promise(resolve => setImmediate(resolve));
+  await new Promise(resolve => setImmediate(resolve));
+};
 
 describe("status note reaches the parent through the real handlers", () => {
   afterEach(() => vi.restoreAllMocks());
 
-  it("foreground turn-limit abort → the Agent result flags an incomplete outcome", async () => {
+  it("detached turn-limit abort → get_subagent_result flags an incomplete outcome", async () => {
     vi.mocked(runAgent).mockResolvedValue({
       responseText: "partial work so far",
       session: { dispose: vi.fn() } as any,
       aborted: true, // hard turn-limit abort
       steered: false,
     });
-    const { pi, tools } = makePi();
+    const { pi, tools, lifecycle } = makePi();
     subagentsExtension(pi);
 
-    const res = await tools.get("Agent").execute(
+    const spawn = await tools.get("Agent").execute(
       "tc1",
       { prompt: "go", description: "d", subagent_type: "general-purpose" },
       undefined, undefined, ctx(),
     );
+    const id = textOf(spawn).match(/Agent ID: (\S+)/)?.[1];
+    expect(id).toBeTruthy();
+    await flush();
 
+    const res = await tools.get("get_subagent_result").execute(
+      "tc1-result", { agent_id: id }, undefined, undefined, ctx(),
+    );
     const out = textOf(res);
     expect(out).toContain("hit the turn limit");      // getStatusNote("aborted") is wired in
     expect(out).toContain("partial work so far");     // partial result still delivered
     expect(out).not.toContain("STOPPED BY THE USER"); // not mislabelled as a user stop
+    await lifecycle.get("session_shutdown")?.({}, ctx());
   });
 
   it("background user-stop → get_subagent_result flags STOPPED BY THE USER (not completed)", async () => {
