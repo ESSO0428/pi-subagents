@@ -5,7 +5,7 @@
  * Uses the callback form of setWidget for themed rendering.
  */
 
-import { isKeyRelease, Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { Editor, isKeyRelease, Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { AgentManager } from "../agent-manager.js";
 import { getConfig } from "../agent-types.js";
 import type { AgentInvocation, AgentRecord, SubagentType, WidgetMode } from "../types.js";
@@ -394,22 +394,44 @@ export class AgentWidget {
    * Track an AgentWidget-owned modal (the `/agents` menus and friends).
    *
    * The widget's terminal listener runs before the focused component, so while
-   * a modal is open the listener must not claim ↑/↓/enter/escape. Whether pi's
-   * prompt editor currently owns the keyboard is deliberately not consulted:
-   * pi can replace it through `ctx.ui.setEditorComponent()` (for example
-   * pi-tmux-cursor-focus wraps it under tmux), and the extension may also
-   * resolve its own copy of `@earendil-works/pi-tui` at a different version
-   * than the host's. Neither `instanceof` nor a structural probe can identify
-   * the editor reliably in that environment, and a wrong answer silently
-   * disables roster navigation entirely.
+   * a modal is open the listener must not claim ↑/↓/enter/escape.
    */
   setModalOpen(open: boolean): void {
     this.modalDepth = open ? this.modalDepth + 1 : Math.max(0, this.modalDepth - 1);
   }
 
-  /** True when no AgentWidget-owned modal is holding the keyboard. */
-  private keyboardAvailable(): boolean {
-    return this.modalDepth === 0;
+  /**
+   * True when pi's prompt editor owns the keyboard.
+   *
+   * Both halves of this are load-bearing, and both were arrived at the hard way.
+   *
+   * A terminal-input listener runs BEFORE the focused component, and pi swaps
+   * the prompt editor out for every dialog while `getEditorText()` keeps
+   * reporting the detached — empty — editor. Without this guard the widget eats
+   * ↑/↓/enter/escape from `/settings`, from other extensions' pickers, and from
+   * pi's own menus (upstream issue #123). Only the prompt editor may claim keys.
+   *
+   * `focused == null` errs toward the editor so list activation keeps working.
+   * `focused instanceof Editor` is deliberately NOT replaced with a structural
+   * probe: pi's own `/settings` focuses `SettingsList`, a pi-tui class instance,
+   * so no shape test separates it from the editor, and another extension can
+   * wrap the editor through `setEditorComponent()` (pi-tmux-cursor-focus does
+   * exactly that whenever pi runs under tmux), so class identity is the only
+   * test that can.
+   *
+   * That leaves one known failure mode, which is why this is conservative
+   * rather than clever: if this extension resolves its own copy of
+   * `@earendil-works/pi-tui` at a different version than the host's, the two
+   * `Editor` classes are unrelated objects, the check is always false, and
+   * roster ↑/↓ stays inert. Inert is the safe failure — it breaks this one
+   * feature instead of every other menu in the host. Aligning the peer so the
+   * check works is a dependency-graph change in the host project, not something
+   * to paper over here.
+   */
+  private editorHasFocus(): boolean {
+    if (this.modalDepth > 0) return false;
+    const focused = (this.tui as { focusedComponent?: unknown } | undefined)?.focusedComponent;
+    return focused == null || focused instanceof Editor;
   }
 
   private selectedIndexOf(records: readonly AgentRecord[]): number {
@@ -451,7 +473,7 @@ export class AgentWidget {
     if (records.length === 0 || !ui) return false;
 
     if (!this.navigationActive) {
-      if (direction !== 1 || !this.keyboardAvailable() || (ui.getEditorText?.() ?? "") !== "") return false;
+      if (direction !== 1 || !this.editorHasFocus() || (ui.getEditorText?.() ?? "") !== "") return false;
       this.activate(records);
       return true;
     }
@@ -479,7 +501,7 @@ export class AgentWidget {
   /** Handle terminal input before it reaches the focused prompt editor. */
   handleKey(data: string): { consume?: boolean; data?: string } | undefined {
     if (!this.uiCtx || isKeyRelease(data)) return undefined;
-    if (!this.keyboardAvailable()) {
+    if (!this.editorHasFocus()) {
       if (this.navigationActive) this.deactivate();
       return undefined;
     }

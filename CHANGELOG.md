@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.28] - 2026-10-02
+
+### Fixed
+- **Stopped the agents widget from stealing arrow keys from `/settings` and other extensions' menus**: v0.17.24 replaced the widget's focus probe with "no modal of ours is open", which is strictly weaker than the check it removed. pi routes terminal input to extension listeners *before* the focused component, and it swaps the prompt editor out for every dialog while `getEditorText()` still reports the detached, empty editor — so the empty-prompt gate passed and the widget consumed `↑`/`↓`/`enter`/`escape` from pi's own `/settings`, from other extensions' selectors such as `qa-ask`, and from our `/agents` menus. Focus detection is restored to `focused == null || focused instanceof Editor`, kept alongside the `withModal()` tracking added in v0.17.25 so our own dialogs are additionally guaranteed priority.
+
+  Roster `↑`/`↓` navigation is consequently inert in installations where this extension resolves its own copy of `@earendil-works/pi-tui` at a different version than pi's host, because the two `Editor` classes are then unrelated objects. That is deliberate: `SettingsList` (what `/settings` focuses) is itself a pi-tui class instance, so no structural probe can tell it apart from the editor, and `setEditorComponent()` lets any extension wrap the editor (`pi-tmux-cursor-focus` subclasses it under tmux), so class identity is the only test that can. Inert is the safe failure — it disables this one feature instead of every other menu in the host.
+
 ## [0.17.27] - 2026-10-02
 
 ### Fixed

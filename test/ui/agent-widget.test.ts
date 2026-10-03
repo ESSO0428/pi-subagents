@@ -495,6 +495,35 @@ describe("AgentWidget live records", () => {
     expect((harness.widget as any).viewportStart).toBe(0);
   });
 
+  it("stands down for a foreign dialog that owns focus", () => {
+    const records = [makeRecord({ id: "running-1", status: "running", completedAt: undefined })];
+    const harness = createNavigableWidgetHarness(records);
+
+    expect(harness.input("\u001b[B")).toEqual({ consume: true });
+    expect((harness.widget as any).navigationActive).toBe(true);
+
+    // pi focuses a class instance for `/settings` (SettingsList) and for other
+    // extensions' selectors. A terminal-input listener runs before the focused
+    // component, so claiming ↑/↓/enter/escape here would break those menus.
+    class SettingsList {
+      handleInput() {}
+      render() { return []; }
+      invalidate() {}
+    }
+    (harness.tui as any).focusedComponent = new SettingsList();
+
+    expect(harness.input("\u001b[B")).toBeUndefined();
+    expect(harness.input("\u001b[A")).toBeUndefined();
+    expect(harness.input("\u001b")).toBeUndefined();
+    expect(harness.input("\r")).toBeUndefined();
+    expect((harness.widget as any).navigationActive).toBe(false);
+
+    (harness.tui as any).focusedComponent = Object.create(Editor.prototype) as Editor;
+    expect(harness.input("\u001b[B")).toEqual({ consume: true });
+
+    harness.widget.dispose();
+  });
+
   it("stands down while an AgentWidget-owned modal is open", () => {
     const records = [makeRecord({ id: "running-1", status: "running", completedAt: undefined })];
     const harness = createNavigableWidgetHarness(records);
