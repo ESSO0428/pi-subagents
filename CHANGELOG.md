@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.33] - 2026-10-05
+
+### Fixed
+- **Nested children now honour `subagents.agentOverrides`**: the overrides were applied only to the global registry at load time, so a nested dispatch resolved the stock definition for a type whose top-level counterpart is overridden — most visibly, `Explore` kept its `anthropic/claude-haiku-4-5` pin and failed with `model_not_supported` no matter what `settings.json` said. The same overrides are now re-applied to the config-derived registry nested resolves against, which also lets an override introduce a type that did not exist as an agent file.
+
 ## [0.17.32] - 2026-10-04
 
 ### Added

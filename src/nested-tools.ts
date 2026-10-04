@@ -22,6 +22,7 @@ import { loadCustomAgents } from "./custom-agents.js";
 import { resolveAgentInvocationConfig } from "./invocation-config.js";
 import { resolveModel } from "./model-resolver.js";
 import { checkModelScope } from "./model-scope.js";
+import { applyNicoOverridesToMap, readNicoAgentOverrides } from "./nico-overrides.js";
 import { createOutputFilePath, streamToOutputFile, writeInitialEntry } from "./output-file.js";
 import { getStatusNote } from "./status-note.js";
 import type { AgentConfig, AgentInvocation, AgentRecord, IsolationMode, ThinkingLevel } from "./types.js";
@@ -119,6 +120,12 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       const config = getAgentConfig(name);
       if (config) registry.set(name, config);
     }
+    // `applyNicoOverrides()` runs against the global registry at load, so
+    // `subagents.agentOverrides` in settings.json is not visible here. Apply the
+    // same overrides to this map or a nested child would ignore configuration
+    // that governs the very same agent type one level up.
+    const { overrides, defaultModel } = readNicoAgentOverrides(context.configCwd);
+    applyNicoOverridesToMap(registry, overrides, defaultModel);
     return registry;
   };
   const allowedTypesIn = (registry: Map<string, AgentConfig>): Set<string> | undefined =>

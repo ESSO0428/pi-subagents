@@ -165,5 +165,72 @@ describe("nested delegation policy", () => {
     // is the parent agent's choice. The child therefore keeps running.
     expect(manager.getRecord(childId)?.status).toBe("running");
   });
-});
 
+  /**
+   * `subagents.agentOverrides` is applied against the global registry at load
+   * time. Without re-applying it to the config-derived map a nested child would
+   * run the stock definition for a type whose top-level counterpart is
+   * overridden — e.g. the model pinned for `Explore`.
+   */
+  it("applies subagents.agentOverrides to the nested registry", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "nested-overrides-"));
+    try {
+      mkdirSync(join(cwd, ".pi"), { recursive: true });
+      writeFileSync(
+        join(cwd, ".pi", "settings.json"),
+        JSON.stringify({
+          subagents: {
+            agentOverrides: {
+              Explore: { model: "test-provider/overridden-model" },
+            },
+          },
+        }),
+        "utf-8",
+      );
+
+      const spawned: { type: string; options: Record<string, unknown> }[] = [];
+      const manager = {
+        getRecord: () => undefined,
+        reportNestedIssue: () => {},
+        spawn: (_pi: unknown, _ctx: unknown, type: string, _prompt: string, options: Record<string, unknown>) => {
+          spawned.push({ type, options });
+          return "child-1";
+        },
+      } as never;
+
+      const tools = createNestedSubagentTools({
+        manager,
+        pi: {} as never,
+        parentAgentId: "parent",
+        depth: 1,
+        maxSubagentDepth: 2,
+        allowedSubagents: "all",
+        configCwd: cwd,
+      });
+
+      const agentTool = tools.find((t) => t.name === "Agent")!;
+      await agentTool.execute(
+        "call-override",
+        { prompt: "look around", description: "child", subagent_type: "Explore", run_in_background: true },
+        undefined, undefined, {
+          cwd,
+          model: undefined,
+          modelRegistry: {
+            getAvailable: () => [{ provider: "test-provider", id: "overridden-model" }],
+            getAll: () => [{ provider: "test-provider", id: "overridden-model" }],
+            find: (_p: string, id: string) => ({ provider: "test-provider", id }),
+          },
+        } as never,
+      );
+
+      expect(spawned.length).toBe(1);
+      // The stock definition pins anthropic/claude-haiku-4-5; the override must win.
+      // resolveModel turns an exact registry hit into the entry itself.
+      const resolved = spawned[0].options.model as { provider?: string; id?: string } | string;
+      expect(typeof resolved === "string" ? resolved : `${resolved.provider}/${resolved.id}`)
+        .toBe("test-provider/overridden-model");
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+});
