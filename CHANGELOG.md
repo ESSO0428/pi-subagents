@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.32] - 2026-10-04
+
+### Added
+- **Nested subagents with a navigable agents roster**: an agent whose frontmatter sets `allowed_subagents` gets an ownership-scoped `Agent`, an always-blocking `wait_for_nested_agent`, and a scoped `steer_subagent`. The allowlist is a hard boundary — unknown, disabled, and out-of-list types are rejected rather than fallen back to — and `maxSubagentDepth` fails closed, so an agent at the cap receives no nested tools at all. Result, resume, and steer are ownership-checked. Nested children consume no concurrency slot, because their parent already holds one. Unlike upstream, which hides nested children from every surface, the agents roster renders them as an indented subtree: `↑`/`↓` move across all levels and `Enter` opens any level's conversation viewer.
+
+### Fixed
+- **Nested tools are no longer dropped from the active tool set**: the scoped nested `Agent` and `steer_subagent` deliberately share names with `EXCLUDED_TOOL_NAMES`, so the scope gate deleted them and `renarrow()` then dropped them from the active session while `beforeToolCall` rejected them. They are now re-admitted after the gate.
+- **A nested child's durable transcript holds its whole conversation**: streaming never received the transcript path, and the child id was captured after `onSessionCreated` had already fired, so nothing was wired on the detached path. The conversation now persists, and attaching is idempotent so the opening entry is not rewritten over it.
+- **A nested child survives cleanup, and the roster keeps its subtree after a reload**: the child had no `transcriptPath`, so `cleanup()` removed it outright; and checkpoints omitted `parentAgentId`/`depth`, so a reload rebuilt every agent as a root and flattened the tree. Both are now recorded, and an orphaned child keeps its indent and says its parent is gone.
+- **Nested dispatch no longer hard-rejects types the caller can already spawn top-level**: the nested registry is built from config files alone, so types registered at runtime were missing from it. Config-derived entries still win; the global registry only fills genuine gaps.
+
 ## [0.17.31] - 2026-10-04
 
 ### Changed

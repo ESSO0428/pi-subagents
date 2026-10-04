@@ -107,6 +107,41 @@ describe("durable interrupted recovery", () => {
     expect(checkpoints.every((checkpoint) => checkpoint.transcriptPath)).toBe(true);
   });
 
+  it("round-trips a nested child's parentAgentId and depth through a reload", () => {
+    const cwd = makeProject();
+    const manager = new AgentManager(undefined, 1);
+    managers.push(manager);
+
+    const parentId = manager.spawn(mockPi, makeContext(cwd), "Explore", "fan out", {
+      description: "parent task",
+      isBackground: true,
+    });
+    const parentFile = addTranscript(cwd, parentId, "parent done");
+    manager.setTranscript(parentId, parentFile, agentHistoryLocator(cwd, parentFile), cwd);
+
+    const childId = manager.spawn(mockPi, makeContext(cwd), "Explore", "nested task", {
+      description: "nested task",
+      isBackground: true,
+      parentAgentId: parentId,
+      depth: 2,
+    });
+    const childFile = addTranscript(cwd, childId, "child done");
+    manager.setTranscript(childId, childFile, agentHistoryLocator(cwd, childFile), cwd);
+
+    const written = readAgentRecoveryCheckpoints(cwd).find((c) => c.id === childId);
+    expect(written?.parentAgentId).toBe(parentId);
+    expect(written?.depth).toBe(2);
+
+    // A fresh manager rebuilding from disk must keep the edge, or the roster
+    // renders the child as a root and the tree flattens after a reload.
+    const restored = new AgentManager(undefined, 1);
+    managers.push(restored);
+    restored.restoreRecovered(cwd);
+    const child = restored.getRecord(childId);
+    expect(child?.parentAgentId).toBe(parentId);
+    expect(child?.depth).toBe(2);
+  });
+
   it("checkpoints a stopped record when a session switches", () => {
     const cwd = makeProject();
     const { manager, id, locator } = startCheckpointedAgent(cwd);

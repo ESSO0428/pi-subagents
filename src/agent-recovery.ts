@@ -32,6 +32,10 @@ export interface AgentRecoveryCheckpoint {
   compactionCount: number;
   transcriptPath?: string;
   invocation?: AgentInvocation;
+  /** Owning agent for a nested child. Survives reload so the roster keeps its tree. */
+  parentAgentId?: string;
+  /** Nesting depth of a nested child; absent on top-level agents. */
+  depth?: number;
 }
 
 function isSafeString(value: unknown, maxLength: number): value is string {
@@ -98,6 +102,9 @@ export function isAgentRecoveryCheckpoint(value: unknown): value is AgentRecover
     || !isUsage(checkpoint.lifetimeUsage)
     || !Number.isInteger(checkpoint.compactionCount)
     || (checkpoint.compactionCount as number) < 0) return false;
+
+  if (checkpoint.parentAgentId !== undefined && !isSafeString(checkpoint.parentAgentId, 256)) return false;
+  if (checkpoint.depth !== undefined && (!Number.isInteger(checkpoint.depth) || (checkpoint.depth as number) < 0)) return false;
 
   const status = checkpoint.status as AgentRecoveryStatus;
   if (!isActiveStatus(status) && !isTerminalStatus(status)) return false;

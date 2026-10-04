@@ -425,6 +425,49 @@ describe("AgentWidget live records", () => {
     harness.widget.dispose();
   });
 
+  it("renders nested rows with exact three-column branch and detail prefixes", () => {
+    const records = [
+      makeRecord({ id: "build", description: "Build", status: "running", lifetimeUsage: { input: 60, output: 30, cacheWrite: 10 }, liveActivity: { activeTools: new Map([["a", "bash"]]), responseText: "", turnCount: 1 } }),
+      makeRecord({ id: "explore", description: "nested lookup", status: "running", parentAgentId: "build", parentDescription: "Build", depth: 2, lifetimeUsage: { input: 20, output: 10, cacheWrite: 0 }, liveActivity: { activeTools: new Map([["b", "grep"]]), responseText: "", turnCount: 1 } }),
+      makeRecord({ id: "reviewer", description: "nested review", status: "queued", parentAgentId: "build", parentDescription: "Build", depth: 2 }),
+      makeRecord({ id: "fixer", description: "top-level task", status: "queued" }),
+    ];
+    const harness = createNavigableWidgetHarness(records);
+    const lines = harness.render();
+
+    expect(lines[1]).toMatch(/^├─/);
+    expect(lines[2]).toMatch(/^│ {4}⎿/);
+    expect(lines[3]).toMatch(/^│ {2}├─/);
+    expect(lines[4]).toMatch(/^│ {2}│ {4}⎿/);
+    expect(lines[5]).toMatch(/^│ {2}└─/);
+    expect(lines[6]).toMatch(/^└─/);
+    expect(lines.filter(line => line.includes("40 token")).length).toBe(0);
+    expect(lines.join("\n")).toContain("100 token");
+    expect(lines.join("\n")).toContain("30 token (in parent)");
+    harness.widget.dispose();
+  });
+
+  it("navigates flat across levels and opens the selected child viewer", () => {
+    const opened: string[] = [];
+    const records = [
+      makeRecord({ id: "parent", description: "parent", status: "running" }),
+      makeRecord({ id: "child", description: "child", status: "running", parentAgentId: "parent", depth: 2 }),
+    ];
+    const harness = createNavigableWidgetHarness(records, {
+      canOpenHistory: () => true,
+      onOpen: record => { opened.push(record.id); },
+    });
+
+    harness.input("\u001b[B");
+    harness.input("\u001b[B");
+    expect((harness.widget as unknown as { selectedAgentId?: string }).selectedAgentId).toBe("child");
+    const selectedChild = harness.render().find(line => line.includes("child"));
+    expect(selectedChild).toMatch(/^ {3}└─/);
+    harness.input("\r");
+    expect(opened).toEqual(["child"]);
+    harness.widget.dispose();
+  });
+
   it("marks the final row as the last branch when the roster fits", () => {
     const records = [
       makeRecord({ id: "running-1", status: "running", completedAt: undefined }),

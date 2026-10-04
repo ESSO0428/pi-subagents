@@ -91,6 +91,15 @@ export interface AgentActivity {
 }
 
 /** Metadata attached to Agent tool results for custom rendering. */
+type WidgetRow = {
+  record: AgentRecord;
+  depth: number;
+  ancestorContinues: boolean[];
+  isLast: boolean;
+  /** True when the row's parent is gone, so it keeps its original indent. */
+  orphaned: boolean;
+};
+
 export interface AgentDetails {
   displayName: string;
   description: string;
@@ -245,12 +254,22 @@ export function describeActivity(activeTools: Map<string, string>, responseText?
  * which is not simply `body.length - 1`: the bounded viewport pads the body
  * with blank lines, and two-line rows carry a `│` continuation underneath.
  */
-function markLastBranch(body: string[], bodyIndex: number): void {
+function markLastBranch(body: string[], bodyIndex: number, depth = 0): void {
   const header = body[bodyIndex];
   if (header === undefined) return;
   body[bodyIndex] = header.replace("├─", "└─");
   const continuation = body[bodyIndex + 1];
-  if (continuation?.includes("│  ")) body[bodyIndex + 1] = continuation.replace("│  ", "   ");
+  if (!continuation) return;
+  let from = 0;
+  for (let level = 0; level <= depth; level++) {
+    const index = continuation.indexOf("│  ", from);
+    if (index < 0) return;
+    if (level === depth) {
+      body[bodyIndex + 1] = continuation.slice(0, index) + "   " + continuation.slice(index + 3);
+      return;
+    }
+    from = index + 3;
+  }
 }
 
 // ---- Widget manager ----
@@ -306,7 +325,7 @@ export class AgentWidget {
     const all = this.manager.listAgents();
     switch (this.mode()) {
       case "off": return [];
-      case "background": return all.filter(a => a.isBackground !== false);
+      case "background": return all.filter(a => a.parentAgentId !== undefined || a.isBackground !== false);
       default: return all;
     }
   }
@@ -378,16 +397,65 @@ export class AgentWidget {
    * navigation. `listAgents()` is newest-first; active rows come first so the
    * panel exposes currently useful work before terminal history.
    */
-  private roster(): AgentRecord[] {
+  private rosterRows(): WidgetRow[] {
     const agents = this.widgetAgents();
-    const finished = agents.filter(record =>
-      record.status !== "running" && record.status !== "queued"
-      && record.completedAt !== undefined
-      && this.options.canOpenHistory(record),
+    const visible = agents.filter(record =>
+      record.status === "running" || record.status === "queued"
+      || (record.completedAt !== undefined && this.options.canOpenHistory(record)),
     );
-    const running = agents.filter(record => record.status === "running");
-    const queued = agents.filter(record => record.status === "queued");
-    return [...running, ...queued, ...finished];
+    const rank = (record: AgentRecord): number =>
+      record.status === "running" ? 0 : record.status === "queued" ? 1 : 2;
+    const order = new Map(agents.map((record, index) => [record.id, index]));
+    const compare = (a: AgentRecord, b: AgentRecord) => rank(a) - rank(b)
+      || (order.get(a.id) ?? 0) - (order.get(b.id) ?? 0);
+    const visibleIds = new Set(visible.map(record => record.id));
+    const children = new Map<string, AgentRecord[]>();
+    const roots: AgentRecord[] = [];
+    const orphans: AgentRecord[] = [];
+    for (const record of visible) {
+      const parent = record.parentAgentId;
+      if (parent && visibleIds.has(parent)) {
+        const siblings = children.get(parent) ?? [];
+        siblings.push(record);
+        children.set(parent, siblings);
+      } else if (parent) {
+        // The parent record is gone. Keep the row at its original depth so the
+        // subtree does not silently flatten into a top-level agent, and mark it
+        // so the render can say why it sits there alone.
+        orphans.push(record);
+      } else {
+        roots.push(record);
+      }
+    }
+    roots.sort(compare);
+    for (const siblings of children.values()) siblings.sort(compare);
+
+    const rows: WidgetRow[] = [];
+    const visit = (
+      record: AgentRecord,
+      depth: number,
+      ancestorContinues: boolean[],
+      isLast: boolean,
+      orphaned = false,
+    ) => {
+      rows.push({ record, depth, ancestorContinues, isLast, orphaned });
+      const nested = children.get(record.id) ?? [];
+      nested.forEach((child, index) => {
+        visit(child, depth + 1, [...ancestorContinues, !isLast], index === nested.length - 1);
+      });
+    };
+    roots.forEach((record, index) => {
+      visit(record, 0, [], index === roots.length - 1);
+    });
+    orphans.sort(compare);
+    orphans.forEach((record, index) => {
+      visit(record, Math.max(1, record.depth ?? 1), new Array(Math.max(0, (record.depth ?? 1) - 1)).fill(true), index === orphans.length - 1, true);
+    });
+    return rows;
+  }
+
+  private roster(): AgentRecord[] {
+    return this.rosterRows().map(row => row.record);
   }
 
   /**
@@ -533,7 +601,7 @@ export class AgentWidget {
   }
 
   /** Render a finished agent line. */
-  private renderFinishedLine(a: { id: string; type: SubagentType; status: string; description: string; toolUses: number; startedAt: number; completedAt?: number; error?: string }, theme: Theme): string {
+  private renderFinishedLine(a: AgentRecord, theme: Theme): string {
     const name = getDisplayName(a.type);
     const modeLabel = getPromptModeLabel(a.type);
     const duration = formatMs((a.completedAt ?? Date.now()) - a.startedAt);
@@ -561,12 +629,19 @@ export class AgentWidget {
 
     const parts: string[] = [];
     const activity = this.agentActivity.get(a.id);
-    if (activity) parts.push(formatTurns(activity.turnCount, activity.maxTurns));
+    const live = activity ?? a.liveActivity;
+    if (live) parts.push(formatTurns(live.turnCount, live.maxTurns));
     if (a.toolUses > 0) parts.push(`${a.toolUses} tool use${a.toolUses === 1 ? "" : "s"}`);
+    const tokens = getLifetimeTotal(a.lifetimeUsage);
+    if (tokens > 0) {
+      parts.push(formatSessionTokens(tokens, getSessionContextPercent(activity?.session ?? a.liveActivity?.session ?? a.session), theme, a.compactionCount));
+      if (a.parentAgentId) parts.push(theme.fg("dim", "already counted in parent"));
+    }
     parts.push(duration);
 
     const modeTag = modeLabel ? ` ${theme.fg("dim", `(${modeLabel})`)}` : "";
-    return `${icon} ${theme.fg("dim", name)}${modeTag}  ${theme.fg("dim", truncateLine(a.description))} ${theme.fg("dim", "·")} ${theme.fg("dim", parts.join(" · "))}${statusText}`;
+    const issue = a.nestedIssue ? theme.fg("warning", ` · nested blocked: ${truncateLine(a.nestedIssue)}`) : "";
+    return `${icon} ${theme.fg("dim", name)}${modeTag}  ${theme.fg("dim", truncateLine(a.description))} ${theme.fg("dim", "·")} ${theme.fg("dim", parts.join(" · "))}${statusText}${issue}`;
   }
 
   /**
@@ -600,59 +675,69 @@ export class AgentWidget {
     // Build sections separately for overflow-aware assembly.
     // Each running agent = 2 lines (header + activity), finished = 1 line, queued = 1 line.
 
-    const finishedLines: { record: AgentRecord; lines: string[] }[] = [];
-    for (const a of finished) {
+    const rosterRows = this.rosterRows();
+    const ancestorPrefix = (row: WidgetRow): string => row.ancestorContinues
+      .map(continues => continues ? "│  " : "   ")
+      .join("");
+    const orphanNote = (row: WidgetRow): string =>
+      row.orphaned ? theme.fg("dim", ` · parent ${row.record.parentDescription ?? row.record.parentAgentId} is gone`) : "";
+    const rowPrefix = (row: WidgetRow): string => ancestorPrefix(row) + (row.isLast ? "└─ " : "├─ ");
+    const detailPrefix = (row: WidgetRow): string => ancestorPrefix(row) + "│    ";
+    const renderedRows: { record: AgentRecord; lines: string[]; depth: number }[] = [];
+
+    for (const row of rosterRows) {
+      const a = row.record;
+      const note = orphanNote(row);
       const marker = a.id === selectedId ? theme.fg("accent", "●") : theme.fg("dim", "○");
-      finishedLines.push({
-        record: a,
-        lines: [truncate(theme.fg("dim", "├─") + ` ${marker} ` + this.renderFinishedLine(a, theme))],
-      });
+      const prefix = theme.fg("dim", rowPrefix(row));
+      if (a.status === "running") {
+        const name = getDisplayName(a.type);
+        const modeLabel = getPromptModeLabel(a.type);
+        const modeTag = modeLabel ? ` ${theme.fg("dim", `(${modeLabel})`)}` : "";
+        const elapsed = formatMs(Date.now() - a.startedAt);
+        const activityState = this.agentActivity.get(a.id);
+        const live = activityState ?? a.liveActivity;
+        const toolUses = activityState?.toolUses ?? a.toolUses;
+        const tokens = getLifetimeTotal(a.lifetimeUsage);
+        const contextPercent = getSessionContextPercent(activityState?.session ?? a.liveActivity?.session ?? a.session);
+        const tokenText = tokens > 0 ? formatSessionTokens(tokens, contextPercent, theme, a.compactionCount)
+          + (a.parentAgentId ? theme.fg("dim", " (in parent)") : "") : "";
+        const parts: string[] = [];
+        if (live) parts.push(formatTurns(live.turnCount, live.maxTurns));
+        if (toolUses > 0) parts.push(`${toolUses} tool use${toolUses === 1 ? "" : "s"}`);
+        if (tokenText) parts.push(tokenText);
+        parts.push(elapsed);
+        const statsText = parts.join(" · ");
+        const activity = a.nestedIssue
+          ? `nested blocked: ${a.nestedIssue}`
+          : live ? describeActivity(live.activeTools, live.responseText) : "thinking…";
+        renderedRows.push({
+          record: a,
+          depth: row.depth,
+          lines: [
+            truncate(prefix + `${marker} ${theme.fg("accent", frame)} ${theme.bold(name)}${modeTag}  ${theme.fg("muted", truncateLine(a.description))} ${theme.fg("dim", "·")} ${fgPreservingNestedStyles(theme, "dim", statsText)}${note}`),
+            truncate(theme.fg("dim", detailPrefix(row)) + theme.fg("dim", `⎿  ${activity}`)),
+          ],
+        });
+      } else if (a.status === "queued") {
+        renderedRows.push({
+          record: a,
+          depth: row.depth,
+          lines: [truncate(prefix + `${marker} ${theme.fg("muted", "◦")} ${theme.fg("dim", `${getDisplayName(a.type)}  ${truncateLine(a.description)} · queued`)}${note}`)],
+        });
+      } else {
+        renderedRows.push({
+          record: a,
+          depth: row.depth,
+          lines: [truncate(prefix + `${marker} ` + this.renderFinishedLine(a, theme) + note)],
+        });
+      }
     }
-
-    const runningLines: { record: AgentRecord; lines: string[] }[] = []; // each entry is [header, activity]
-    for (const a of running) {
-      const name = getDisplayName(a.type);
-      const modeLabel = getPromptModeLabel(a.type);
-      const modeTag = modeLabel ? ` ${theme.fg("dim", `(${modeLabel})`)}` : "";
-      const elapsed = formatMs(Date.now() - a.startedAt);
-
-      const bg = this.agentActivity.get(a.id);
-      const toolUses = bg?.toolUses ?? a.toolUses;
-      const tokens = getLifetimeTotal(bg?.lifetimeUsage);
-      const contextPercent = getSessionContextPercent(bg?.session);
-      const tokenText = tokens > 0 ? formatSessionTokens(tokens, contextPercent, theme, a.compactionCount) : "";
-
-      const parts: string[] = [];
-      if (bg) parts.push(formatTurns(bg.turnCount, bg.maxTurns));
-      if (toolUses > 0) parts.push(`${toolUses} tool use${toolUses === 1 ? "" : "s"}`);
-      if (tokenText) parts.push(tokenText);
-      parts.push(elapsed);
-      const statsText = parts.join(" · ");
-
-      const activity = bg ? describeActivity(bg.activeTools, bg.responseText) : "thinking…";
-
-      const marker = a.id === selectedId ? theme.fg("accent", "●") : theme.fg("dim", "○");
-      runningLines.push({
-        record: a,
-        lines: [
-          truncate(theme.fg("dim", "├─") + ` ${marker} ${theme.fg("accent", frame)} ${theme.bold(name)}${modeTag}  ${theme.fg("muted", truncateLine(a.description))} ${theme.fg("dim", "·")} ${fgPreservingNestedStyles(theme, "dim", statsText)}`),
-          truncate(theme.fg("dim", "│  ") + `   ${theme.fg("dim", `⎿  ${activity}`)}`),
-        ],
-      });
-    }
-
-    const queuedLines: { record: AgentRecord; lines: string[] }[] = queued.map(a => {
-      const marker = a.id === selectedId ? theme.fg("accent", "●") : theme.fg("dim", "○");
-      return {
-        record: a,
-        lines: [truncate(theme.fg("dim", "├─") + ` ${marker} ${theme.fg("muted", "◦")} ${theme.fg("dim", `${getDisplayName(a.type)}  ${truncateLine(a.description)} · queued`)}`)],
-      };
-    });
 
     // Assemble with a responsive cap (heading + overflow indicator = 2
     // reserved lines when content exceeds the available body budget).
     const maxBody = maxLines - 1; // heading takes 1 line
-    const rows = [...runningLines, ...queuedLines, ...finishedLines];
+    const rows = renderedRows;
     const totalBody = rows.reduce((total, row) => total + row.lines.length, 0);
 
     const heading = "Agents  ↑↓ select · enter view · esc back";
@@ -668,7 +753,7 @@ export class AgentWidget {
       for (const row of rows) lines.push(...row.lines);
       if (rows.length > 0) {
         const lastRow = rows[rows.length - 1];
-        markLastBranch(lines, lines.length - lastRow.lines.length);
+        markLastBranch(lines, lines.length - lastRow.lines.length, lastRow.depth);
       }
     } else {
       // Reserve one line for a directional overflow summary. The viewport is
@@ -722,7 +807,7 @@ export class AgentWidget {
         visibleBody.push(rows[start].lines[0]);
         end = start + 1;
       }
-      markLastBranch(visibleBody, lastRowLine);
+      markLastBranch(visibleBody, lastRowLine, rows[Math.max(start, end - 1)]?.depth ?? 0);
 
       const hiddenBefore = start;
       const hiddenAfter = Math.max(0, rows.length - end);

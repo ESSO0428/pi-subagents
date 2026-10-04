@@ -20,6 +20,7 @@ import {
   writeAgentRecoveryCheckpoint,
 } from "./agent-recovery.js";
 import { resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
+import type { NestedSpawnOptions } from "./nested-tools.js";
 import type { AgentInvocation, AgentRecord, IsolationMode, SubagentType, ThinkingLevel } from "./types.js";
 import { addUsage } from "./usage.js";
 import { cleanupWorktree, createWorktree, pruneWorktrees, } from "./worktree.js";
@@ -157,7 +158,7 @@ interface SpawnArgs {
   options: SpawnOptions;
 }
 
-interface SpawnOptions {
+export interface SpawnOptions extends Partial<Omit<NestedSpawnOptions, "description" | "signal" | "onAssistantUsage" | "onSessionCreated">> {
   description: string;
   model?: Model<any>;
   maxTurns?: number;
@@ -198,6 +199,8 @@ interface SpawnOptions {
   onTurnEnd?: (turnCount: number) => void;
   /** Called once per assistant message_end with that message's usage delta. */
   onAssistantUsage?: (usage: { input: number; output: number; cacheWrite: number }) => void;
+  /** Called when nested delegation is refused, for observability. */
+  onNestedIssue?: (issue: string) => void;
   /** Called when the session successfully compacts. */
   onCompaction?: (info: CompactionInfo) => void;
   /** Called synchronously after the record exists, before it is queued or started. */
@@ -277,6 +280,10 @@ export class AgentManager {
       ...(record.error !== undefined && { error: record.error }),
       ...(record.transcriptPath !== undefined && { transcriptPath: record.transcriptPath }),
       ...(record.invocation !== undefined && { invocation: cloneInvocation(record.invocation) }),
+      // Without these a reload rebuilds every agent as a root and the roster
+      // flattens, because nothing on disk records the nesting.
+      ...(record.parentAgentId !== undefined && { parentAgentId: record.parentAgentId }),
+      ...(record.depth !== undefined && { depth: record.depth }),
     };
     return checkpoint;
   }
@@ -379,6 +386,18 @@ export class AgentManager {
       isBackground: options.isBackground,
       invocation: options.invocation,
       waitGroupId: options.waitGroupId,
+      depth: options.depth ?? 1,
+      parentAgentId: options.parentAgentId,
+      parentDescription: options.parentAgentId ? this.agents.get(options.parentAgentId)?.description : undefined,
+      maxSubagentDepth: options.maxSubagentDepth,
+      rootSessionId: options.rootSessionId ?? ctx.sessionManager?.getSessionId?.(),
+      liveActivity: {
+        activeTools: new Map(),
+        responseText: "",
+        turnCount: 0,
+        maxTurns: options.maxTurns,
+        session: undefined,
+      },
     };
     this.agents.set(id, record);
     this.recoveryCwds.set(id, ctx.cwd);
@@ -397,7 +416,9 @@ export class AgentManager {
 
     const args: SpawnArgs = { pi, ctx, type, prompt, options };
 
-    if (options.isBackground && !options.bypassQueue && this.runningBackground >= this.maxConcurrent) {
+    // Nested children never consume or wait for a top-level concurrency slot;
+    // queueing behind the parent would deadlock an inline nested spawn.
+    if (options.isBackground && !options.parentAgentId && !options.bypassQueue && this.runningBackground >= this.maxConcurrent) {
       // Queue it — will be started when a running agent completes
       this.queue.push({ id, args });
       return id;
@@ -453,7 +474,7 @@ export class AgentManager {
     record.status = "running";
     record.startedAt = Date.now();
     this.checkpoint(record);
-    if (options.isBackground) {
+    if (options.isBackground && !options.parentAgentId) {
       this.runningBackground++;
       this.runningBackgroundIds.add(id);
     }
@@ -485,11 +506,27 @@ export class AgentManager {
       configCwd: customCwd !== undefined ? ctx.cwd : undefined,
       signal: record.abortController!.signal,
       onToolActivity: (activity) => {
+        const live = record.liveActivity;
+        if (live) {
+          if (activity.type === "start") {
+            live.activeTools.set(`${activity.toolName}:${Date.now()}:${live.activeTools.size}`, activity.toolName);
+          } else {
+            for (const [key, name] of live.activeTools) {
+              if (name === activity.toolName) { live.activeTools.delete(key); break; }
+            }
+          }
+        }
         if (activity.type === "end") record.toolUses++;
         options.onToolActivity?.(activity);
       },
-      onTurnEnd: options.onTurnEnd,
-      onTextDelta: options.onTextDelta,
+      onTurnEnd: (turnCount) => {
+        if (record.liveActivity) record.liveActivity.turnCount = turnCount;
+        options.onTurnEnd?.(turnCount);
+      },
+      onTextDelta: (delta, fullText) => {
+        if (record.liveActivity) record.liveActivity.responseText = fullText;
+        options.onTextDelta?.(delta, fullText);
+      },
       onAssistantUsage: (usage) => {
         addUsage(record.lifetimeUsage, usage);
         options.onAssistantUsage?.(usage);
@@ -499,8 +536,20 @@ export class AgentManager {
         this.onCompact?.(record, info);
         options.onCompaction?.(info);
       },
+      onNestedIssue: (issue) => {
+        record.nestedIssue = issue;
+        options.onNestedIssue?.(issue);
+      },
+      nestedRuntime: {
+        manager: this,
+        parentAgentId: id,
+        depth: record.depth ?? 1,
+        maxSubagentDepth: options.maxSubagentDepth,
+      },
+      nestedSession: options.parentAgentId !== undefined,
       onSessionCreated: (session) => {
         record.session = session;
+        if (record.liveActivity) record.liveActivity.session = session;
         const model = session.model;
         record.invocation = {
           ...(record.invocation ?? {}),
@@ -760,6 +809,8 @@ export class AgentManager {
     transcriptPath?: string;
     invocation?: AgentInvocation;
     compactionCount?: number;
+    parentAgentId?: string;
+    depth?: number;
   }): AgentRecord {
     return {
       id: record.id,
@@ -777,8 +828,35 @@ export class AgentManager {
         ? { ...record.lifetimeUsage }
         : { input: 0, output: 0, cacheWrite: 0 },
       compactionCount: record.compactionCount ?? 0,
+      parentAgentId: record.parentAgentId,
+      depth: record.depth,
     };
   }
+
+  /** Record a nested refusal so the widget and viewer retain the explanation. */
+  reportNestedIssue(parentAgentId: string, issue: string): void {
+    const record = this.agents.get(parentAgentId);
+    if (record) record.nestedIssue = issue;
+  }
+
+  /** Run one nested child inline without charging either concurrency pool. */
+  async spawnAndWait(
+    pi: ExtensionAPI,
+    ctx: ExtensionContext,
+    type: string,
+    prompt: string,
+    options: Omit<SpawnOptions, "isBackground">,
+    onSpawned?: (id: string) => void,
+  ): Promise<{ id: string; record: AgentRecord }> {
+    const id = this.spawn(pi, ctx, type, prompt, { ...options, isBackground: false, onSpawned });
+    const record = this.agents.get(id);
+    if (!record) throw new Error(`Nested agent "${id}" disappeared during startup.`);
+    if (record.promise) await record.promise;
+    return { id, record };
+  }
+
+  /** Current manager starts synchronously; retained for the nested tool contract. */
+  async awaitStartup(_id: string): Promise<void> {}
 
   abort(id: string): boolean {
     const record = this.agents.get(id);

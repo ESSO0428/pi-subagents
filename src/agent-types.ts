@@ -28,6 +28,11 @@ const agents = new Map<string, AgentConfig>();
 
 /** When true, DEFAULT_AGENTS are skipped during registration. */
 let disableDefaults = false;
+/** Optional top-level fallback; nested resolution never consults this value. */
+let fallbackSubagent: string | undefined;
+export const NO_FALLBACK = "none";
+export function getFallbackSubagent(): string | undefined { return fallbackSubagent; }
+export function setFallbackSubagent(value: string | undefined): void { fallbackSubagent = value; }
 
 /** Check whether default agents are disabled. */
 export function isDefaultsDisabled(): boolean { return disableDefaults; }
@@ -40,20 +45,18 @@ export function setDefaultsDisabled(b: boolean): void { disableDefaults = b; }
  * Starts with DEFAULT_AGENTS, then overlays user agents (overrides defaults with same name).
  * Disabled agents (enabled === false) are kept in the registry but excluded from spawning.
  */
+export function buildAgentRegistry(userAgents: Map<string, AgentConfig>): Map<string, AgentConfig> {
+  const registry = new Map<string, AgentConfig>();
+  if (!disableDefaults) {
+    for (const [name, config] of DEFAULT_AGENTS) registry.set(name, config);
+  }
+  for (const [name, config] of userAgents) registry.set(name, config);
+  return registry;
+}
+
 export function registerAgents(userAgents: Map<string, AgentConfig>): void {
   agents.clear();
-
-  // Start with defaults (unless disabled via settings)
-  if (!disableDefaults) {
-    for (const [name, config] of DEFAULT_AGENTS) {
-      agents.set(name, config);
-    }
-  }
-
-  // Overlay user agents (overrides defaults with same name)
-  for (const [name, config] of userAgents) {
-    agents.set(name, config);
-  }
+  for (const [name, config] of buildAgentRegistry(userAgents)) agents.set(name, config);
 }
 
 /**
@@ -67,14 +70,84 @@ export function applyNicoOverrides(): void {
   applyNicoOverridesToMap(agents, overrides, defaultModel);
 }
 
-/** Case-insensitive key resolution. */
-function resolveKey(name: string): string | undefined {
-  if (agents.has(name)) return name;
+/** Case-insensitive key resolution within a registry. */
+function resolveKeyIn(registry: Map<string, AgentConfig>, name: string): string | undefined {
+  if (registry.has(name)) return name;
   const lower = name.toLowerCase();
-  for (const key of agents.keys()) {
+  for (const key of registry.keys()) {
     if (key.toLowerCase() === lower) return key;
   }
   return undefined;
+}
+
+/** Case-insensitive key resolution. */
+function resolveKey(name: string): string | undefined {
+  return resolveKeyIn(agents, name);
+}
+
+/** Resolve a type name case-insensitively within a private registry. */
+export function resolveTypeIn(registry: Map<string, AgentConfig>, name: string): string | undefined {
+  return resolveKeyIn(registry, name);
+}
+
+/** Get an agent config from a private registry. */
+export function getAgentConfigIn(registry: Map<string, AgentConfig>, name: string): AgentConfig | undefined {
+  const key = resolveKeyIn(registry, name);
+  return key ? registry.get(key) : undefined;
+}
+
+/** Get all enabled agent types from a private registry. */
+export function getAvailableTypesIn(registry: Map<string, AgentConfig>): string[] {
+  return [...registry.entries()]
+    .filter(([_, config]) => config.enabled !== false)
+    .map(([name]) => name);
+}
+
+/** Check whether a type resolves to one enabled registry entry. */
+export function isValidTypeIn(registry: Map<string, AgentConfig>, type: string): boolean {
+  return resolveEnabledTypeIn(registry, type) !== undefined;
+}
+
+/** Resolve exactly one enabled type without applying the top-level fallback policy. */
+export function resolveEnabledTypeIn(
+  registry: Map<string, AgentConfig>,
+  requested: unknown,
+): string | undefined {
+  const raw = typeof requested === "string" ? requested.trim() : "";
+  if (!raw) return undefined;
+  const exact = registry.has(raw) ? raw : undefined;
+  if (exact !== undefined) return registry.get(exact)?.enabled === false ? undefined : exact;
+  const matches = [...registry.keys()].filter(key => key.toLowerCase() === raw.toLowerCase());
+  return matches.length === 1 && registry.get(matches[0])?.enabled !== false ? matches[0] : undefined;
+}
+
+export type SpawnTypeResolution =
+  | { ok: true; type: string; fellBackFrom?: string }
+  | { ok: false; message: string };
+
+/** Resolve a top-level caller type, retaining the historical general-purpose fallback. */
+export function resolveSpawnTypeIn(registry: Map<string, AgentConfig>, requested: unknown): SpawnTypeResolution {
+  const raw = typeof requested === "string" ? requested.trim() : "";
+  const available = () => getAvailableTypesIn(registry).join(", ") || "(none)";
+  const key = resolveEnabledTypeIn(registry, raw);
+  if (key !== undefined) return { ok: true, type: key };
+  const reason = raw ? `Unknown or disabled agent type: "${raw}".` : "No agent type given.";
+  const configured = fallbackSubagent?.trim();
+  if (configured?.toLowerCase() === NO_FALLBACK) {
+    return { ok: false, message: `${reason} Available: ${available()}.` };
+  }
+  if (configured) {
+    const fallback = resolveEnabledTypeIn(registry, configured);
+    if (fallback === undefined) {
+      return { ok: false, message: `${reason} The configured fallbackSubagent "${configured}" is itself unknown or disabled. Available: ${available()}.` };
+    }
+    return { ok: true, type: fallback, fellBackFrom: raw };
+  }
+  return { ok: true, type: "general-purpose", fellBackFrom: raw };
+}
+
+export function resolveSpawnType(requested: unknown): SpawnTypeResolution {
+  return resolveSpawnTypeIn(agents, requested);
 }
 
 /** Resolve a type name case-insensitively. Returns the canonical key or undefined. */

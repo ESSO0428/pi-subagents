@@ -18,10 +18,12 @@ import {
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getConfig, getMemoryToolNames, getReadOnlyMemoryToolNames, getToolNamesForType } from "./agent-types.js";
+import { runInChildSessionContext } from "./child-context.js";
 import { buildParentContext, extractText } from "./context.js";
 import { DEFAULT_AGENTS } from "./default-agents.js";
 import { detectEnv } from "./env.js";
 import { buildMemoryBlock, buildReadOnlyMemoryBlock } from "./memory.js";
+import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager } from "./nested-tools.js";
 import { buildAgentPrompt, type PromptExtras } from "./prompts.js";
 import { preloadSkills } from "./skill-loader.js";
 import type { SubagentType, ThinkingLevel } from "./types.js";
@@ -232,9 +234,18 @@ export function installExtensionToolScope(
     disallowedSet: Set<string> | undefined;
     extNames: Set<string>;
     narrowing: Map<string, Set<string>>;
+    /**
+     * Injected `customTools` that must survive the scope gate. They are deleted
+     * below along with `EXCLUDED_TOOL_NAMES` — the scoped nested `Agent` and
+     * `steer_subagent` deliberately share those names — so they have to be
+     * re-admitted or `renarrow` drops them from the active set and
+     * `beforeToolCall` rejects them. Already filtered against `disallowed_tools`
+     * by the caller, which is the only place that knows what may be taken back.
+     */
+    readmitToolNames: Set<string>;
   },
 ): void {
-  const { loader, toolNames, disallowedSet, extNames, narrowing } = ctx;
+  const { loader, toolNames, disallowedSet, extNames, narrowing, readmitToolNames } = ctx;
 
   // The names allowed right now. Mirrors the `ext:` opt-in flip: when any `ext:`
   // selector is present, extension tools become an explicit allowlist — a loaded
@@ -256,6 +267,7 @@ export function installExtensionToolScope(
       }
     }
     for (const name of EXCLUDED_TOOL_NAMES) keep.delete(name);
+    for (const name of readmitToolNames) keep.add(name);
     return keep;
   };
 
@@ -394,6 +406,17 @@ export interface RunOptions {
    * pre-compaction context size estimate. Aborted compactions don't fire.
    */
   onCompaction?: (info: { reason: "manual" | "threshold" | "overflow"; tokensBefore: number }) => void;
+  /** Called when nested delegation is unavailable or refused. */
+  onNestedIssue?: (issue: string) => void;
+  /** Runtime bridge for ownership-scoped nested delegation. */
+  nestedRuntime?: {
+    manager: NestedAgentManager;
+    parentAgentId: string;
+    depth: number;
+    maxSubagentDepth?: number;
+  };
+  /** True only for an agent spawned by another agent, not a top-level owner. */
+  nestedSession?: boolean;
 }
 
 export interface RunResult {
@@ -647,7 +670,7 @@ export async function runAgent(
     systemPromptOverride: () => systemPrompt,
     appendSystemPromptOverride: () => [],
   });
-  await loader.reload();
+  await runInChildSessionContext(() => loader.reload());
 
   // Plain entries in `tools:` are expected to be built-in names (extension tools
   // go through `ext:`), so an unknown name there is unambiguously a typo. Previously
@@ -730,6 +753,29 @@ export async function runAgent(
     ? new Set(agentConfig.disallowedTools)
     : undefined;
 
+  // Nested tools are built for this session and injected directly. Nested child
+  // sessions deliberately do not bind the pi-subagents extension again: doing
+  // so would register a second global manager and expose unscoped tools.
+  const effectiveMaxDepth = options.nestedRuntime?.maxSubagentDepth ?? getMaxSubagentDepth();
+  const nestedRuntime = options.nestedRuntime && options.nestedRuntime.depth < effectiveMaxDepth
+    ? options.nestedRuntime
+    : undefined;
+  if (options.nestedRuntime && options.nestedRuntime.depth >= effectiveMaxDepth && agentConfig?.allowedSubagents) {
+    options.onNestedIssue?.(`depth cap: nested delegation unavailable at depth ${options.nestedRuntime.depth} (max ${effectiveMaxDepth})`);
+  }
+  const nestedTools = agentConfig?.allowedSubagents && nestedRuntime && !options.isolated
+    ? createNestedSubagentTools({
+        manager: nestedRuntime.manager,
+        pi: options.pi,
+        parentAgentId: nestedRuntime.parentAgentId,
+        depth: nestedRuntime.depth,
+        maxSubagentDepth: effectiveMaxDepth,
+        allowedSubagents: agentConfig.allowedSubagents,
+        configCwd,
+      })
+    : [];
+  const nestedToolNames = new Set(nestedTools.map(tool => tool.name));
+
   // ─── Tool scoping ───────────────────────────────────────────────────────
   //
   // Some extensions register their tools ASYNCHRONOUSLY, long after the
@@ -762,11 +808,12 @@ export async function runAgent(
   let sessionTools: string[] | undefined;
   let sessionExcludeTools: string[] | undefined;
   if (noExtensions) {
-    sessionTools = toolNames.filter(
-      (t) => !EXCLUDED_TOOL_NAMES.includes(t) && !disallowedSet?.has(t),
-    );
+    sessionTools = [
+      ...toolNames.filter((t) => !EXCLUDED_TOOL_NAMES.includes(t) && !disallowedSet?.has(t)),
+      ...[...nestedToolNames].filter(t => !disallowedSet?.has(t)),
+    ];
   } else {
-    const denyTools = new Set<string>(EXCLUDED_TOOL_NAMES);
+    const denyTools = new Set<string>(EXCLUDED_TOOL_NAMES.filter(name => !nestedToolNames.has(name)));
     // Keep only the built-ins the agent asked for — deny the rest.
     for (const name of BUILTIN_TOOL_NAMES) {
       if (!builtinToolNameSet.has(name)) denyTools.add(name);
@@ -793,6 +840,7 @@ export async function runAgent(
   // modelRuntime, but ExtensionContext still exposes only the registry facade.
   // Pass both so the full supported Pi range retains the parent's providers.
   const parentModelRuntime = (ctx.modelRegistry as unknown as { runtime?: ModelRuntime | null }).runtime ?? undefined;
+  const customTools = [...nestedTools, ...(trackedWriteTool ? [trackedWriteTool as any] : [])];
   const sessionOpts: Parameters<typeof createAgentSession>[0] & {
     modelRegistry: ExtensionContext["modelRegistry"];
     modelRuntime?: ModelRuntime;
@@ -810,7 +858,7 @@ export async function runAgent(
     // fresh interactive app startup. Mark their extension lifecycle as a fork so
     // startup-only UI/theme extensions do not clear or rewrite the parent TUI.
     sessionStartEvent: { type: "session_start", reason: "fork" },
-    ...(trackedWriteTool && { customTools: [trackedWriteTool as any] }),
+    ...(customTools.length > 0 && { customTools }),
   };
   if (sessionExcludeTools) {
     sessionOpts.excludeTools = sessionExcludeTools;
@@ -819,7 +867,8 @@ export async function runAgent(
     sessionOpts.thinkingLevel = thinkingLevel;
   }
 
-  const { session } = await createAgentSession(sessionOpts);
+  const { session } = await runInChildSessionContext(() => createAgentSession(sessionOpts));
+
 
   const baseSessionName = agentConfig?.name ?? type;
   session.setSessionName(
@@ -830,14 +879,16 @@ export async function runAgent(
   // (e.g. loading credentials, setting up state). Tool gating already happened
   // at session construction via the `tools:` allowlist above — no separate
   // post-bind filter is needed. All ExtensionBindings fields are optional.
-  await session.bindExtensions({
-    onError: (err) => {
-      options.onToolActivity?.({
-        type: "end",
-        toolName: `extension-error:${err.extensionPath}`,
-      });
-    },
-  });
+  if (!options.nestedSession) {
+    await session.bindExtensions({
+      onError: (err) => {
+        options.onToolActivity?.({
+          type: "end",
+          toolName: `extension-error:${err.extensionPath}`,
+        });
+      },
+    });
+  }
 
   // With `allowedToolNames` unset, the registry is scoped by `excludeTools` but
   // the ACTIVE set still needs managing: pi activates only its four default
@@ -845,13 +896,14 @@ export async function runAgent(
   // (we can't deny the name of a tool that hasn't registered yet). Both are
   // handled below by re-deriving scope from the loader's live extension maps —
   // `registerTool` writes into those same maps, so late arrivals are judged too.
-  if (!noExtensions) {
+  if (!noExtensions && !options.nestedSession) {
     installExtensionToolScope(session, {
       loader,
       toolNames,
       disallowedSet,
       extNames,
       narrowing,
+      readmitToolNames: new Set([...nestedToolNames].filter((name) => !disallowedSet?.has(name))),
     });
   }
 

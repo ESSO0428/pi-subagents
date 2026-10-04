@@ -20,13 +20,15 @@ import { agentHistoryLocator, createAgentHistoryPath, readAgentHistory, readAgen
 import { buildAgentStatusMenuEntries, canOpenActiveAgent, canOpenAgentHistory, formatAgentHistoryOption, splitAgentRecords } from "./agent-history-list.js";
 import { AgentManager } from "./agent-manager.js";
 import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, normalizeMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, steerAgent } from "./agent-runner.js";
-import { applyNicoOverrides, BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, isDefaultsDisabled, registerAgents, resolveType, setDefaultsDisabled } from "./agent-types.js";
+import { applyNicoOverrides, BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, isDefaultsDisabled, registerAgents, resolveSpawnType, setDefaultsDisabled, setFallbackSubagent } from "./agent-types.js";
 import { type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
 import { loadCustomAgents } from "./custom-agents.js";
 import { isModelInScope, readEnabledModels, resolveEnabledModels } from "./enabled-models.js";
 import { GroupJoinManager } from "./group-join.js";
 import { resolveAgentInvocationConfig, resolveJoinMode } from "./invocation-config.js";
 import { type ModelRegistry, resolveModel } from "./model-resolver.js";
+import { isScopeModelsEnabled, setScopeModelsEnabled } from "./model-scope.js";
+import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
 import { createOutputFilePath, streamToOutputFile, writeInitialEntry } from "./output-file.js";
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
@@ -425,6 +427,13 @@ export default function (pi: ExtensionAPI) {
 
   // Background completion: route through group join or send individual nudge
   const manager = new AgentManager((record) => {
+    // Nested children report through their owner: they remain visible in the
+    // widget but never emit a second top-level event, history entry, or nudge.
+    if (record.parentAgentId) {
+      widget.markFinished(record.id);
+      widget.update();
+      return;
+    }
     // Emit lifecycle event based on terminal status
     const isError = record.status === "error" || record.status === "stopped" || record.status === "aborted";
     const eventData = buildEventData(record);
@@ -484,6 +493,12 @@ export default function (pi: ExtensionAPI) {
     // 'delivered' → group callback already fired
     widget.update();
   }, undefined, (record) => {
+    // Nested children are already represented under their owner in the widget.
+    if (record.parentAgentId) {
+      widget.ensureTimer();
+      widget.update();
+      return;
+    }
     // Emit started event when agent transitions to running (including from queue)
     pi.events.emit("subagents:started", {
       id: record.id,
@@ -493,6 +508,7 @@ export default function (pi: ExtensionAPI) {
     widget.ensureTimer();
     widget.update();
   }, (record, info) => {
+    if (record.parentAgentId) return;
     // Emit compacted event when agent's session compacts (preserves count on record).
     pi.events.emit("subagents:compacted", {
       id: record.id,
@@ -701,9 +717,6 @@ export default function (pi: ExtensionAPI) {
   // Off by default; opt-in via `/agents → Settings`. See docstring on
   // SubagentsSettings.scopeModels for the hard-error vs warn-and-proceed
   // policy and its rationale.
-  let scopeModelsEnabled = false;
-  function isScopeModelsEnabled(): boolean { return scopeModelsEnabled; }
-  function setScopeModelsEnabled(enabled: boolean): void { scopeModelsEnabled = enabled; }
 
   // ---- Disable default agents configuration ----
   // When enabled, the three hardcoded default agents (general-purpose, Explore,
@@ -823,6 +836,8 @@ export default function (pi: ExtensionAPI) {
   applyAndEmitLoaded(
     {
       setMaxConcurrent: (n) => manager.setMaxConcurrent(n),
+      setMaxSubagentDepth,
+      setFallbackSubagent,
       setDefaultMaxTurns,
       setGraceTurns,
       setDefaultJoinMode,
@@ -1147,8 +1162,9 @@ Terse command-style prompts produce shallow, generic work.
       reloadCustomAgents();
 
       const rawType = params.subagent_type as SubagentType;
-      const resolved = resolveType(rawType);
-      const subagentType = resolved ?? "general-purpose";
+      const resolution = resolveSpawnType(rawType);
+      if (!resolution.ok) return textResult(resolution.message);
+      const subagentType = resolution.type;
 
       const displayName = getDisplayName(subagentType);
 
@@ -2336,6 +2352,7 @@ ${systemPrompt}
   function snapshotSettings(): SubagentsSettings {
     return {
       maxConcurrent: manager.getMaxConcurrent(),
+      maxSubagentDepth: getMaxSubagentDepth(),
       // 0 = unlimited — per SubagentsSettings.defaultMaxTurns docstring and
       // normalizeMaxTurns() in agent-runner.ts (which maps 0 → undefined).
       defaultMaxTurns: getDefaultMaxTurns() ?? 0,
@@ -2350,11 +2367,12 @@ ${systemPrompt}
     };
   }
 
-  const NUMERIC_IDS = new Set(["maxConcurrent", "defaultMaxTurns", "graceTurns"]);
+  const NUMERIC_IDS = new Set(["maxConcurrent", "maxSubagentDepth", "defaultMaxTurns", "graceTurns"]);
 
   async function showSettings(ctx: ExtensionCommandContext) {
     function buildItems(): SettingItem[] {
       const mc = manager.getMaxConcurrent();
+      const depth = getMaxSubagentDepth();
       const dmt = getDefaultMaxTurns() ?? 0;
       const gt = getGraceTurns();
 
@@ -2365,6 +2383,13 @@ ${systemPrompt}
           description: "Max concurrent background agents (Enter to type)",
           currentValue: String(mc),
           values: [String(mc)],
+        },
+        {
+          id: "maxSubagentDepth",
+          label: "Max nested depth",
+          description: "Maximum nested delegation depth (0 = disabled, Enter to type)",
+          currentValue: String(depth),
+          values: [String(depth)],
         },
         {
           id: "defaultMaxTurns",
@@ -2438,6 +2463,12 @@ ${systemPrompt}
         if (n >= 1) {
           manager.setMaxConcurrent(n);
           notifyApplied(ctx, `Max concurrency set to ${n}`);
+        }
+      } else if (id === "maxSubagentDepth") {
+        const n = parseInt(value, 10);
+        if (n >= 0) {
+          setMaxSubagentDepth(n);
+          notifyApplied(ctx, `Max nested depth set to ${n}`);
         }
       } else if (id === "defaultMaxTurns") {
         const n = parseInt(value, 10);

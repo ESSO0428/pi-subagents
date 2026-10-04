@@ -73,6 +73,7 @@ function loadFromDir(dir: string, agents: Map<string, AgentConfig>, source: "pro
       persistSession: fm.persist_session != null ? fm.persist_session === true : undefined,
       outputTranscript: fm.output_transcript != null ? fm.output_transcript !== false : undefined,
       sessionDir: str(fm.session_dir),
+      allowedSubagents: parseAllowedSubagents(fm.allowed_subagents),
       systemPrompt: body.trim(),
       promptMode: fm.prompt_mode === "append" ? "append" : "replace",
       inheritContext: fm.inherit_context != null ? fm.inherit_context === true : undefined,
@@ -144,6 +145,17 @@ function parseToolsField(val: unknown): { builtinToolNames: string[]; extSelecto
  */
 function csvListOptional(val: unknown): string[] | undefined {
   return parseCsvField(val);
+}
+
+/**
+ * Parse the nested-delegation allowlist. Omitted/empty/"none"/false disables
+ * nested tools; true, "all", and "*" allow every enabled agent type.
+ */
+function parseAllowedSubagents(val: unknown): "all" | string[] | undefined {
+  if (typeof val === "boolean") return val ? "all" : undefined;
+  const items = parseCsvField(val);
+  if (!items) return undefined;
+  return items.some(item => item === "*" || item.toLowerCase() === "all") ? "all" : items;
 }
 
 /**

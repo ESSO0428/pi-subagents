@@ -47,6 +47,8 @@ export interface AgentConfig {
   outputTranscript?: boolean;
   /** Optional session directory used when persistSession is true. Omitted = pi's normal session location. */
   sessionDir?: string;
+  /** Nested delegation, off by default: "all" or an explicit type allowlist. */
+  allowedSubagents?: "all" | string[];
   systemPrompt: string;
   promptMode: "replace" | "append";
   /** Default for spawn: fork parent conversation. undefined = caller decides. */
@@ -134,6 +136,26 @@ export interface AgentRecord {
   isBackground?: boolean;
   /** Resolved spawn params, captured for UI display. Fixed at spawn time. */
   invocation?: AgentInvocation;
+  /** Nesting depth: main session is 0, top-level subagents are 1. */
+  depth?: number;
+  /** Parent agent ID for ownership-scoped nested controls. */
+  parentAgentId?: string;
+  /** Parent description shown in a nested conversation viewer. */
+  parentDescription?: string;
+  /** Effective inherited nesting cap for this branch. */
+  maxSubagentDepth?: number;
+  /** Root session id used for nested output transcripts. */
+  rootSessionId?: string;
+  /** Most recent live activity, including nested rows not tracked by the root UI callback. */
+  liveActivity?: {
+    activeTools: Map<string, string>;
+    responseText: string;
+    turnCount: number;
+    maxTurns?: number;
+    session?: AgentSession;
+  };
+  /** Latest nested delegation refusal, retained so the widget can explain it. */
+  nestedIssue?: string;
 }
 
 export interface AgentInvocation {

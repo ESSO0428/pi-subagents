@@ -549,12 +549,16 @@ export class ConversationViewer implements Component {
     const headerParts: string[] = [duration];
     const toolUses = this.activity?.toolUses ?? this.record.toolUses;
     if (toolUses > 0) headerParts.unshift(`${toolUses} tool${toolUses === 1 ? "" : "s"}`);
-    const tokens = getLifetimeTotal(this.activity?.lifetimeUsage);
+    const tokens = getLifetimeTotal(this.record.lifetimeUsage);
     if (tokens > 0) {
-      const percent = getSessionContextPercent(this.activity?.session);
+      const percent = getSessionContextPercent(this.activity?.session ?? this.record.session);
       headerParts.push(formatSessionTokens(tokens, percent, th, this.record.compactionCount));
+      if (this.record.parentAgentId) headerParts.push(th.fg("dim", "already counted in parent"));
     }
-    const headerText = `${statusIcon} ${th.bold(name)}${modeTag}  ${th.fg("muted", this.record.description)} ${th.fg("dim", "·")} ${fgPreservingNestedStyles(th, "dim", headerParts.join(" · "))}`;
+    const owner = this.record.parentAgentId
+      ? ` · child of ${this.record.parentDescription ?? this.record.parentAgentId}`
+      : "";
+    const headerText = `${statusIcon} ${th.bold(name)}${modeTag}  ${th.fg("muted", this.record.description)}${th.fg("dim", owner)} ${th.fg("dim", "·")} ${fgPreservingNestedStyles(th, "dim", headerParts.join(" · "))}`;
     const previewLabel = this.hoveredPreview ? th.fg("text", th.bold("[preview]")) : th.fg("dim", "[preview]");
     const closeLabel = this.hoveredClose ? th.fg("text", th.bold("[Esc]")) : th.fg("dim", "[Esc]");
     const actionsWidth = visibleWidth(previewLabel) + 1 + visibleWidth(closeLabel);
