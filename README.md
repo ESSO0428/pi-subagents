@@ -17,6 +17,7 @@ https://github.com/user-attachments/assets/8685261b-9338-4fea-8dfe-1c590d5df543
 - **Agents panel UI** — persistent above-editor widget with animated spinners, live tool activity, token counts, colored status icons, and one focus-gated navigator. It shows every agent by default; press `↓` at an empty prompt to activate the panel, `↑`/`↓` to select, `Enter` to open a live or read-only history viewer, and `Esc` to return. Long rosters reserve a right-hand track/thumb scrollbar and show `↑ N more` or `↓ N more` at the clipped edge. Configure via `/agents → Settings → Widget`: `all`, `background`, or `off`
 - **Conversation viewer** — select any agent in `/agents` to open a live-scrolling overlay of its full conversation (auto-follows new content, scroll up to pause). The main viewer reserves a right-hand scrollbar rail for the transcript and exposes a `[preview]` header action for the focused tool. Steer a running agent inline by pressing `e` to open a Pi-native composer, typing, then `Enter` to send (`Esc` or an empty submit returns); the follow-up appears as a muted/gray USER message and redirects the agent after its current tool. `Alt+Up` (`a-up`/`alt+up`) recalls submitted follow-up drafts. Read-only tool previews replace the viewer in place, use the larger viewport with the same right-hand track/thumb scrollbar and top/bottom hidden-line affordances, and return with `Esc`, `q`, or the close control. Stop a still-running agent by pressing `x` (then `x` again to confirm) — both work for background agents too
 - **Custom agent types** — define agents in `.pi/agents/<name>.md` or `.agents/agents/<name>.md` (project) or globally, with YAML frontmatter: custom system prompts, model selection, thinking levels, tool restrictions
+- **Nested subagents** — opt-in, default-off delegation: an agent whose frontmatter sets `allowed_subagents` gets its own ownership-scoped `Agent`, a blocking `wait_for_nested_agent`, and a scoped `steer_subagent`, depth-capped from the main session (default 2). Unlike upstream, nested children are **not** hidden — the agents roster renders them as an indented subtree you can navigate into. The allowlist is a privilege boundary, so it is set by hand in the agent file and never enabled automatically
 - **Mid-run steering** — inject messages into running agents to redirect their work without restarting
 - **Session resume** — pick up where an agent left off, preserving full conversation context
 - **Durable interruption recovery** — catchable shutdowns preserve running/queued metadata and partial transcripts so interrupted agents remain indexed after reload; abrupt `SIGKILL` termination cannot be checkpointed
@@ -246,6 +247,7 @@ All fields are optional — sensible defaults for everything.
 | `skills` | `true` | Inherit skills from parent. Can be a comma-separated list of skill names to preload (see [Skill Preloading](#skill-preloading) for discovery locations) |
 | `memory` | — | Persistent agent memory scope: `project`, `local`, or `user`. Auto-detects read-only agents |
 | `disallowed_tools` | — | Comma-separated tools to deny even if extensions provide them |
+| `allowed_subagents` | none | Opt in to scoped nested `Agent`, `wait_for_nested_agent`, and `steer_subagent` tools. Omitted / empty / `none` / `false` = no nesting; `all` (or `"*"` / `true`) = any enabled agent; comma-separated list = only those agent types |
 | `isolation` | — | Set to `worktree` to run in an isolated git worktree |
 | `model` | inherit parent | Model — `provider/modelId` or fuzzy name (`"haiku"`, `"sonnet"`). Resolved tolerantly (`.`/`-` and a trailing date stamp are interchangeable) and falls back to the same model under another provider if the named one doesn't have it |
 | `thinking` | inherit | off, minimal, low, medium, high, xhigh, max — actual availability depends on your pi version and model; pi clamps unsupported levels down |
@@ -299,6 +301,69 @@ A few rules the examples don't make obvious:
 - `exclude_extensions:` wins over `extensions:` and over `ext:` selectors — an excluded extension never loads and a `tools: ext:` entry can't pull it back. Plain names only (no paths, no `*`); a name matching nothing fires an `extension-error:…` warning.
 - `exclude_extensions:` is **not a sandbox**: excluded extensions' factory code still executes once during loading. Exclusion suppresses their tools and their bound lifecycle hooks (`pi.on` handlers like `session_start` only fire for extensions bound to the session), but not other load-time side effects — a factory that subscribes directly to the shared `pi.events` bus stays live. Don't rely on it to contain an untrusted extension.
 - Array and string forms are equivalent: `[a, b]` == `"a, b"`.
+
+### Nested subagents
+
+Nested delegation is default-off and hand-authored. An agent that owns a real
+fan-out responsibility opts in by setting `allowed_subagents` in its own
+frontmatter:
+
+```yaml
+# .pi/agents/support-coordinator.md
+---
+name: support-coordinator
+description: Coordinates support-triage work across several areas
+allowed_subagents: support-file-finder, support-callsite-tracer
+tools: read, grep, find, ls
+---
+```
+
+Omitted, empty, `none`, or `false` means no nested tools are injected at all.
+`all` (or `"*"` / `true`) allows any enabled agent; a comma-separated list
+restricts nesting to exactly those types. Unknown, disabled, and out-of-list
+types are **rejected**, never fallen back to — a configured fallback agent
+cannot hand a nested caller something outside its allowlist.
+
+**The allowlist is a privilege boundary.** A nested child runs with its own tool
+set, so choose it as carefully as you would `tools:`. It is set by hand in the
+agent file and is never enabled automatically; no skill or tool description
+teaches a model to grant itself delegation.
+
+A nested child receives an ownership-scoped `Agent`, a `wait_for_nested_agent`
+that always blocks until that child finishes, and a `steer_subagent` scoped to
+its own children. Result, resume, and steer are ownership-checked, so a parent
+cannot read, steer, or resume a foreign child. `maxSubagentDepth` caps how deep
+nesting goes (default 2: main session 0, its subagents 1, nested children 2);
+an agent already at the cap receives no nested tools at all — not even
+`wait_for_nested_agent` — since it can never own a child. Change it project-wide
+via `maxSubagentDepth` in `subagents.json` or `/agents` → Settings → Nested
+depth. Nested children occupy no concurrency slot: their parent already holds
+one, and queueing a child behind its own parent would deadlock.
+
+Nested children consume **no** concurrency slot and are never reported to the
+main session as top-level agents — their completion surfaces inside the parent,
+and their token usage folds into every ancestor's total. Each still writes its
+own durable transcript.
+
+### How nested children are shown
+
+Upstream hides nested children from every surface. This fork keeps the same
+reporting semantics but makes the hierarchy visible: the agents roster renders
+children as an indented subtree, each with its own spinner and activity line,
+token counts marked `(in parent)` so totals are not double-counted, and a
+`nested blocked: …` note when the allowlist or depth cap refuses a dispatch.
+`↑`/`↓` move across every visible row regardless of depth and `Enter` opens that
+level's conversation viewer. Because the lookup is case-insensitive, an override
+named `Explore` also changes what a lowercase `explore` request resolves to.
+
+The `parentAgentId` and `depth` of a nested child are recorded in its recovery
+checkpoint, so a reload rebuilds the same subtree rather than flattening it. If
+a parent record is ever removed before its child, the child keeps its indent and
+says its parent is gone.
+
+`subagents.agentOverrides` applies to nested dispatch exactly as it does at
+top level, including the project-over-global precedence described in
+[Priority Chain](#priority-chain).
 
 ## `npm:pi-subagents`-Style JSON Agent Overrides
 

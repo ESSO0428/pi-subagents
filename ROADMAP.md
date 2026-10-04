@@ -12,6 +12,18 @@
 - v0.17.6 的 ConversationViewer baseline（scrollbar rail、`[preview]`/`[Esc]`、`w` preview、in-place read-only Tool Output、鍵盤與 wheel scroll）不可被改寫
 - 資源安全政策不因功能恢復而撤回：Vitest / E2E / build 在此裝置需明確授權
 
+## 未來：讓模型知道 nested 怎麼用
+
+`allowed_subagents` 目前只能由人手寫進 agent 檔案。上游刻意如此 — 它的 `Agent` 工具描述、`promptGuidelines`、`skills/`、範例 agent 檔全都沒有提 nested，所以模型不會自己開自己的權限。這是對的安全立場，不是缺陷。
+
+若要改善可用性，安全作法是**只教模型怎麼「建議」**，不給它自己開的權限：
+
+- 在建立/編輯 agent 檔案的流程裡提示 `allowed_subagents` 的存在與語意（`all` / 逗號清單 / 省略 = 不開）
+- 明確標示這是授權邊界，該由人確認，不接受模型自行套用
+- 不在 `Agent` 工具描述或 `promptGuidelines` 中指示模型對既有 agent 開啟巢狀
+
+設計前提未定：這段提示該放哪（工具描述、skill、`/agents` 建立精靈的表單、還是 agent 檔的模板註解），以及如何避免模型把「建議」當成「已授權」。
+
 ## 交付 B：Workflow
 
 上游規模約 6,200 行：`src/workflow/**` 11 檔約 4,458 行（`runtime.ts` 1,219 + `worker-source.ts` 781 為骨幹）、`ui/workflow-*.ts` 3 檔約 1,778 行（`workflow-dialog.ts` 1,115 最大）。含 `node:vm` sandbox、worker thread、journal，是新的執行模型而非 UI，風險等級與 nested 不同，不與其他交付合併。

@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.34] - 2026-10-05
+
+### Added
+- **Documented nested subagents**: README now carries the feature entry, the `allowed_subagents` frontmatter row, and a `### Nested subagents` section covering the allowlist as a privilege boundary, depth cap, ownership scoping, pool behaviour, transcript durability, and how this fork diverges from upstream by rendering children as a navigable subtree. Also records that the mechanism is hand-authored and deliberately absent from the tool description, so a model never grants itself delegation.
+
 ## [0.17.33] - 2026-10-05
 
 ### Fixed
