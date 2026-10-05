@@ -83,6 +83,8 @@ export function buildAgentStatusMenuEntries(
   records: readonly AgentRecord[],
   cwd: string | undefined,
   sessionId?: string,
+  /** Recovered legacy records, already filtered to the openable ones. */
+  legacy: readonly AgentRecord[] = [],
 ): string[] {
   const { active, history } = splitAgentRecords(records, cwd);
   // This-session history is what you almost always want, so it is the default
@@ -91,9 +93,14 @@ export function buildAgentStatusMenuEntries(
   // branch or checkpoint are stamped with the current session, so an inherited
   // agent counts as present here rather than disappearing into the other bucket.
   const inSession = sessionId ? history.filter((record) => record.sessionId === sessionId) : [];
+  // Legacy records are merged into this list when it opens, so the count has to
+  // include the ones the in-memory set does not already carry — otherwise the
+  // menu advertises fewer entries than the list actually shows.
+  const inMemory = new Set(history.map((record) => record.id));
+  const allSessions = history.length + legacy.filter((record) => !inMemory.has(record.id)).length;
   return [
     ...(active.length > 0 ? [`Running agents (${active.length})`] : []),
     ...(inSession.length > 0 ? [`Agent history this session (${inSession.length})`] : []),
-    ...(history.length > 0 ? [`Agent history all sessions (${history.length})`] : []),
+    ...(allSessions > 0 ? [`Agent history all sessions (${allSessions})`] : []),
   ];
 }

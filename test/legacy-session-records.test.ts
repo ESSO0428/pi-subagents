@@ -98,12 +98,19 @@ describe("legacy subagents:record reader", () => {
 });
 
 describe("legacy records must clear the same bar as everything else", () => {
-  it("excludes a legacy record that has no durable transcript", async () => {
+  it("filters out legacy records that have no durable transcript", () => {
     // Listing an entry that can only answer "No agent history." is a dead link.
-    // The this-session list and the roster already enforce this; the legacy
-    // reader must not be the surface that quietly skips the check.
+    // The this-session list and the roster already enforce this, so the shared
+    // cache every legacy consumer reads must enforce it too — the menu counts
+    // and the history list are only consistent if they share one filtered list.
     const src = readFileSync(new URL("../src/index.ts", import.meta.url), "utf-8");
-    const merge = src.slice(src.indexOf("mergeLegacyRecords(\n        scoped,"), src.indexOf("));", src.indexOf("mergeLegacyRecords(\n        scoped,")));
-    expect(merge).toContain("canOpenAgentHistory(record, ctx.cwd)");
+    const cache = src.slice(
+      src.indexOf("async function legacyHistoryFor"),
+      src.indexOf("function setWidgetMode"),
+    );
+    expect(cache).toContain("canOpenAgentHistory(record, key)");
+    // Both consumers must go through the cache rather than scanning separately,
+    // or the menu count and the list drift apart again.
+    expect(src).toContain("await legacyHistoryFor(ctx)");
   });
 });

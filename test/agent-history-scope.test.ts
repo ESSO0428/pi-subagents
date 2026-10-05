@@ -68,3 +68,22 @@ describe("session stamp provenance", () => {
     expect(completed).toContain("sessionId");
   });
 });
+
+  it("counts recovered legacy records the menu cannot see in memory", () => {
+    const inMemory = [
+      record({ id: "a", sessionId: "s1" }),
+      record({ id: "b", sessionId: "s2" }),
+    ];
+    const legacy = [
+      record({ id: "c", sessionId: "s-old" }),
+      record({ id: "d", sessionId: "s-old" }),
+      // Same agent already restored from a checkpoint — must not be counted twice.
+      record({ id: "b", sessionId: "s-old" }),
+    ];
+
+    const entries = buildAgentStatusMenuEntries(inMemory, undefined, "s1", legacy);
+    const label = entries.find((e) => e.startsWith("Agent history all sessions"))!;
+
+    // The list opens with 2 in-memory + 2 genuinely-new legacy records.
+    expect(label).toBe("Agent history all sessions (4)");
+  });

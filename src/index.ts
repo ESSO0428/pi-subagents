@@ -675,7 +675,25 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
+  /**
+   * Legacy `subagents:record` entries recovered from session files, per cwd.
+   *
+   * The scan is not cheap, and both the menu's counts and the history list need
+   * it — reading it twice would double the cost on every `/agents` visit, and a
+   * stale count in the menu is worse than a slow one.
+   */
+  const legacyHistoryCache = new Map<string, AgentRecord[]>();
+  async function legacyHistoryFor(ctx: ExtensionCommandContext): Promise<AgentRecord[]> {
+    const key = ctx.cwd;
+    const cached = legacyHistoryCache.get(key);
+    if (cached) return cached;
+    const records = (await readLegacySessionRecords(key)).filter(record => canOpenAgentHistory(record, key));
+    legacyHistoryCache.set(key, records);
+    return records;
+  }
+
   function setWidgetMode(m: WidgetMode): void {
+    legacyHistoryCache.clear();
     widgetMode = m;
     widget.update();
   }
@@ -1701,7 +1719,8 @@ Terse command-style prompts produce shallow, generic work.
     // Keep active agents and terminal history in separate menu entries.
     const records = manager.listAgents();
     const { active, history } = splitAgentRecords(records, ctx.cwd);
-    options.push(...buildAgentStatusMenuEntries(records, ctx.cwd, ctx.sessionManager?.getSessionId?.()));
+    const legacy = await legacyHistoryFor(ctx);
+    options.push(...buildAgentStatusMenuEntries(records, ctx.cwd, ctx.sessionManager?.getSessionId?.(), legacy));
 
     // Agent types list
     if (allNames.length > 0) {
@@ -1937,10 +1956,7 @@ Terse command-style prompts produce shallow, generic work.
     // answer "No agent history." is a dead link, not history.
     const merged = scope === "this-session"
       ? scoped
-      : mergeLegacyRecords(
-        scoped,
-        (await readLegacySessionRecords(ctx.cwd)).filter(record => canOpenAgentHistory(record, ctx.cwd)),
-      );
+      : mergeLegacyRecords(scoped, await legacyHistoryFor(ctx));
     const pairs = merged.map((record) => ({ record, label: formatAgentHistoryOption(record, Date.now()) }));
     makeUniqueAgentOptionLabels(pairs);
     const title = scope === "this-session" ? "Agent history — this session" : "Agent history — all sessions";

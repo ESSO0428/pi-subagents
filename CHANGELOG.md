@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.37] - 2026-10-05
+
+### Fixed
+- **The `/agents` menu no longer undercounts the project-wide history**: the entry advertised the in-memory record count while the list it opened also merged records recovered from older session files, so the label read 150 against 230 rows. Both now read one cached, filtered legacy set per cwd — cached because the scan is not cheap, and shared because separate reads would let the count and the list drift apart again.
+
 ## [0.17.36] - 2026-10-05
 
 ### Fixed
