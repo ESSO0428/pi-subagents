@@ -147,7 +147,10 @@ describe("output_transcript agent wiring", () => {
     await lifecycle.get("session_shutdown")?.({}, makeCtx(cwd));
   });
 
-  it("does not copy a durable result into the parent session record", async () => {
+  it("no longer appends a session-branch record for finished agents", async () => {
+    // Durable checkpoints replaced this entry: they survive reboot, carry the
+    // owning session, and do not bloat the parent session file. It is still read
+    // for sessions recorded before the change, so old history stays reachable.
     const { pi, tools, lifecycle } = makePi();
     subagentsExtension(pi);
 
@@ -160,11 +163,8 @@ describe("output_transcript agent wiring", () => {
     );
     await new Promise<void>(resolve => setImmediate(resolve));
 
-    const persisted = pi.appendEntry.mock.calls.find(([type]: [string]) => type === "subagents:record")?.[1];
-    expect(persisted).toEqual(expect.objectContaining({
-      result: undefined,
-      transcriptPath: expect.any(String),
-    }));
+    const persisted = pi.appendEntry.mock.calls.filter(([type]: [string]) => type === "subagents:record");
+    expect(persisted).toHaveLength(0);
     await lifecycle.get("session_shutdown")?.({}, makeCtx(cwd));
   });
 

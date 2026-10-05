@@ -140,6 +140,8 @@ export interface AgentRecord {
   depth?: number;
   /** Parent agent ID for ownership-scoped nested controls. */
   parentAgentId?: string;
+  /** Session this record belongs to; re-stamped on restore. */
+  sessionId?: string;
   /** Parent description shown in a nested conversation viewer. */
   parentDescription?: string;
   /** Effective inherited nesting cap for this branch. */

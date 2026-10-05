@@ -80,7 +80,7 @@ function makeHarness(custom: (factory: CustomFactory, options?: unknown) => Prom
     onTerminalInput: () => () => {},
     select: async (title: string, options: string[]) => {
       if (title !== "Agents" || agentsMenuVisits++ > 0) return undefined;
-      return options.find(option => option.startsWith("Agent history ("));
+      return options.find(option => option.startsWith("Agent history all sessions ("));
     },
     custom,
   };
@@ -195,7 +195,7 @@ describe("/agents history navigation", () => {
       if (title !== "Agents") return undefined;
       agentsMenuCalls++;
       if (agentsMenuCalls === 1) return options.find(option => option.startsWith("Running agents ("));
-      if (agentsMenuCalls === 2) return options.find(option => option.startsWith("Agent history ("));
+      if (agentsMenuCalls === 2) return options.find(option => option.startsWith("Agent history all sessions ("));
       return undefined;
     };
 
@@ -258,7 +258,7 @@ describe("/agents history navigation", () => {
       // in history; the list itself is what proves the state was reset.
       agentsMenuCalls++;
       return agentsMenuCalls % 2 === 1
-        ? options.find(option => option.startsWith("Agent history ("))
+        ? options.find(option => option.startsWith("Agent history all sessions ("))
         : undefined;
     };
     await harness.handlers.get("session_start")?.({}, ctx);

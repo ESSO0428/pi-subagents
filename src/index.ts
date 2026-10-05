@@ -26,6 +26,7 @@ import { loadCustomAgents } from "./custom-agents.js";
 import { isModelInScope, readEnabledModels, resolveEnabledModels } from "./enabled-models.js";
 import { GroupJoinManager } from "./group-join.js";
 import { resolveAgentInvocationConfig, resolveJoinMode } from "./invocation-config.js";
+import { readLegacySessionRecords } from "./legacy-session-records.js";
 import { type ModelRegistry, resolveModel } from "./model-resolver.js";
 import { isScopeModelsEnabled, setScopeModelsEnabled } from "./model-scope.js";
 import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
@@ -443,21 +444,10 @@ export default function (pi: ExtensionAPI) {
       pi.events.emit("subagents:completed", eventData);
     }
 
-    // Persist final record for cross-extension history reconstruction
-    pi.appendEntry("subagents:record", {
-      id: record.id, type: record.type, description: record.description,
-      status: record.status,
-      // Durable transcripts are the source of truth for full output. Avoid
-      // copying a potentially large result into the parent session branch;
-      // get_subagent_result reloads it on demand after cleanup/restart.
-      result: record.transcriptPath ? undefined : record.result,
-      error: record.error,
-      startedAt: record.startedAt, completedAt: record.completedAt,
-      toolUses: record.toolUses,
-      lifetimeUsage: record.lifetimeUsage,
-      invocation: record.invocation,
-      transcriptPath: record.transcriptPath,
-    });
+    // Durable checkpoints replaced this entry: they survive reboot, carry the
+    // owning session, and do not bloat the parent session branch. It is still
+    // read for sessions recorded before that change, so history written by an
+    // older build stays reachable.
 
     // Explicit wait-group members never emit individual notifications. Result
     // consumption does not remove membership; the sealed group still delivers
@@ -590,10 +580,11 @@ export default function (pi: ExtensionAPI) {
     resetAgentMenuSelections();
     currentCtx = ctx;
     manager.clearCompleted(true);
+    const sessionId = ctx.sessionManager?.getSessionId?.();
     const branch = ctx.sessionManager?.getBranch?.() ?? [];
     manager.restoreCompleted(branch
       .filter((entry: any) => entry?.type === "custom" && entry?.customType === "subagents:record")
-      .map((entry: any) => entry.data));
+      .map((entry: any) => entry.data), sessionId);
     // Checkpoint files cover agents whose parent session never got a terminal
     // branch entry (shutdown, session switch, or a process restart).
     manager.restoreRecovered(ctx.cwd);
@@ -666,6 +657,7 @@ export default function (pi: ExtensionAPI) {
         const ctx = currentCtx;
         if (ctx) void viewAgentConversation(ctx as ExtensionCommandContext, record, mode);
       },
+      getSessionId: () => currentCtx?.sessionManager?.getSessionId?.(),
     },
   );
 
@@ -1709,7 +1701,7 @@ Terse command-style prompts produce shallow, generic work.
     // Keep active agents and terminal history in separate menu entries.
     const records = manager.listAgents();
     const { active, history } = splitAgentRecords(records, ctx.cwd);
-    options.push(...buildAgentStatusMenuEntries(records, ctx.cwd));
+    options.push(...buildAgentStatusMenuEntries(records, ctx.cwd, ctx.sessionManager?.getSessionId?.()));
 
     // Agent types list
     if (allNames.length > 0) {
@@ -1742,8 +1734,11 @@ Terse command-style prompts produce shallow, generic work.
     if (choice.startsWith("Running agents (")) {
       await showRunningAgents(ctx);
       await showAgentsMenu(ctx);
-    } else if (choice.startsWith("Agent history (")) {
-      await showAgentHistory(ctx);
+    } else if (choice.startsWith("Agent history this session (")) {
+      await showAgentHistory(ctx, "this-session");
+      await showAgentsMenu(ctx);
+    } else if (choice.startsWith("Agent history all sessions (")) {
+      await showAgentHistory(ctx, "all-sessions");
       await showAgentsMenu(ctx);
     } else if (choice.startsWith("Agent types (")) {
       await showAllAgentsList(ctx);
@@ -1922,21 +1917,39 @@ Terse command-style prompts produce shallow, generic work.
     await showRunningAgents(ctx);
   }
 
-  async function showAgentHistory(ctx: ExtensionCommandContext) {
+  async function showAgentHistory(ctx: ExtensionCommandContext, scope: "this-session" | "all-sessions" = "all-sessions") {
     const { history } = splitAgentRecords(manager.listAgents(), ctx.cwd);
-    if (history.length === 0) {
-      ctx.ui.notify("No agent history.", "info");
+    const sessionId = ctx.sessionManager?.getSessionId?.();
+    const scoped = scope === "this-session" && sessionId
+      ? history.filter((record) => record.sessionId === sessionId)
+      : history;
+    if (scoped.length === 0) {
+      ctx.ui.notify(scope === "this-session" ? "No agent history in this session." : "No agent history.", "info");
       return;
     }
 
-    const pairs = history.map((record) => ({ record, label: formatAgentHistoryOption(record, Date.now()) }));
+    // Sessions recorded before durable checkpoints only exist as
+    // `subagents:record` entries in their session file. They are merged here for
+    // the project-wide view; the this-session view never needs the scan.
+    const merged = scope === "this-session"
+      ? scoped
+      : mergeLegacyRecords(scoped, await readLegacySessionRecords(ctx.cwd));
+    const pairs = merged.map((record) => ({ record, label: formatAgentHistoryOption(record, Date.now()) }));
     makeUniqueAgentOptionLabels(pairs);
-    const record = await selectAgentFromReadOnlyList(ctx, "Agent history", pairs, historyAgentSelection);
+    const title = scope === "this-session" ? "Agent history — this session" : "Agent history — all sessions";
+    const record = await selectAgentFromReadOnlyList(ctx, title, pairs, historyAgentSelection);
     if (!record) return;
 
     await viewAgentConversation(ctx, record, "history");
     // Back-navigation: re-show the list at the previously selected agent.
-    await showAgentHistory(ctx);
+    await showAgentHistory(ctx, scope);
+  }
+
+  /** In-memory records win; legacy session entries only fill genuine gaps. */
+  function mergeLegacyRecords(current: readonly AgentRecord[], legacy: readonly AgentRecord[]): AgentRecord[] {
+    const known = new Set(current.map((record) => record.id));
+    return [...current, ...legacy.filter((record) => !known.has(record.id))]
+      .sort((a, b) => b.startedAt - a.startedAt);
   }
 
   async function viewAgentConversation(

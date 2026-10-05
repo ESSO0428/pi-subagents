@@ -36,6 +36,13 @@ export interface AgentRecoveryCheckpoint {
   parentAgentId?: string;
   /** Nesting depth of a nested child; absent on top-level agents. */
   depth?: number;
+  /**
+   * Session this record was spawned in. Absent on older checkpoints, and
+   * re-stamped with the *current* session when a branch or checkpoint restore
+   * brings the record forward, so "this session" means "present in this session"
+   * rather than "originally spawned here".
+   */
+  sessionId?: string;
 }
 
 function isSafeString(value: unknown, maxLength: number): value is string {
@@ -104,6 +111,7 @@ export function isAgentRecoveryCheckpoint(value: unknown): value is AgentRecover
     || (checkpoint.compactionCount as number) < 0) return false;
 
   if (checkpoint.parentAgentId !== undefined && !isSafeString(checkpoint.parentAgentId, 256)) return false;
+  if (checkpoint.sessionId !== undefined && !isSafeString(checkpoint.sessionId, 256)) return false;
   if (checkpoint.depth !== undefined && (!Number.isInteger(checkpoint.depth) || (checkpoint.depth as number) < 0)) return false;
 
   const status = checkpoint.status as AgentRecoveryStatus;

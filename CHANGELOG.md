@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.35] - 2026-10-05
+
+### Added
+- **Scope agent history and the roster to the current session**: agent records now carry the session that spawned them, so `/agents` offers `Agent history this session` alongside `Agent history all sessions`, and the above-editor roster shows only this session's agents. Records restored from a session branch are stamped with the current session — a fork continues its parent's context, so those agents count as present here — while records reloaded from project checkpoints keep their own stamp, because those files mix every session that ran in the directory.
+- **Legacy session history**: `/agents` → `Agent history all sessions` also recovers `subagents:record` entries written by earlier builds, so history from before durable checkpoints stayed reachable. Nothing writes those entries any more, and the scan is scoped to the project's own session directory.
+
+### Changed
+- **Stopped appending `subagents:record` to the session branch on completion**: durable checkpoints supersede it. They survive reboot, record the owning session, and do not grow the parent session file. The entry is still read for backward compatibility.
+
+### Fixed
+- **Orphaned nested rows keep their place**: a nested child whose parent record was removed keeps its original indent and says its parent is gone, instead of being promoted to a top-level row.
+
 ## [0.17.34] - 2026-10-05
 
 ### Added

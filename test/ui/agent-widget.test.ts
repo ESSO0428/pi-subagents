@@ -77,6 +77,7 @@ function createNavigableWidgetHarness(
     onOpen?: (record: AgentRecord, mode: AgentWidgetOpenMode) => void;
     canOpenHistory?: (record: AgentRecord) => boolean;
     rows?: number;
+    getSessionId?: () => string | undefined;
   } = {},
 ) {
   const manager = { listAgents: () => records } as unknown as AgentManager;
@@ -100,6 +101,7 @@ function createNavigableWidgetHarness(
   const widget = new AgentWidget(manager, new Map(), () => "all", {
     canOpenHistory: overrides.canOpenHistory ?? ((record) => record.status !== "running" && record.status !== "queued"),
     onOpen: overrides.onOpen ?? (() => {}),
+    getSessionId: overrides.getSessionId,
   });
   widget.setUICtx(ui);
   widget.update();
@@ -607,3 +609,37 @@ describe("AgentWidget live records", () => {
     harness.widget.dispose();
   });
 });
+
+  it("shows only agents from the current session", () => {
+    const records = [
+      makeRecord({ id: "here", description: "this session", status: "running", completedAt: undefined, sessionId: "s-current" }),
+      makeRecord({ id: "there", description: "other session", status: "running", completedAt: undefined, sessionId: "s-other" }),
+      makeRecord({ id: "unstamped", description: "no stamp", status: "running", completedAt: undefined }),
+    ];
+    const harness = createNavigableWidgetHarness(records, { getSessionId: () => "s-current" });
+    const text = harness.render().join("\n");
+    expect(text).toContain("this session");
+    expect(text).not.toContain("other session");
+    expect(text).not.toContain("no stamp");
+    harness.widget.dispose();
+  });
+
+  it("keeps a nested child whose parent is in this session", () => {
+    const records = [
+      makeRecord({ id: "p", description: "parent", status: "running", completedAt: undefined, sessionId: "s-current" }),
+      makeRecord({ id: "c", description: "child", status: "running", completedAt: undefined, parentAgentId: "p", depth: 2, sessionId: "s-current" }),
+    ];
+    const harness = createNavigableWidgetHarness(records, { getSessionId: () => "s-current" });
+    // Depth 1 under a single root: the root has no following sibling, so the
+    // child gets a blank ancestor slot rather than a continuation bar.
+    const childLine = harness.render().find((line) => line.includes("child") && line.includes("└─"));
+    expect(childLine).toMatch(/^ {3}[├└]─/);
+    harness.widget.dispose();
+  });
+
+  it("falls back to showing everything when the session id is unknown", () => {
+    const records = [makeRecord({ id: "a", description: "alpha", status: "running", completedAt: undefined })];
+    const harness = createNavigableWidgetHarness(records, { getSessionId: () => undefined });
+    expect(harness.render().join("\n")).toContain("alpha");
+    harness.widget.dispose();
+  });

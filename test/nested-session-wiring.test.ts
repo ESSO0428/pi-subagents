@@ -1,4 +1,7 @@
-import { describe, expect, it, vi } from "vitest";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 // Captures the config handed to pi's createAgentSession so we can assert what a
 // real child session receives. Everything above that seam is the real code under
@@ -31,11 +34,13 @@ const { AgentManager } = await import("../src/agent-manager.js");
 const { registerAgents, getAgentConfig } = await import("../src/agent-types.js");
 const { loadCustomAgents } = await import("../src/custom-agents.js");
 
-const PROJECT_CWD = "/nfs/ev02_sdb/home/Andy6/research/breeding_support_system-wip-ffp-offspringlevel-generalization";
+
+const cleanupDirs: string[] = [];
+afterEach(() => { for (const d of cleanupDirs.splice(0)) rmSync(d, { recursive: true, force: true }); });
 
 const piStub = { exec: async () => ({ code: 1, stdout: "", stderr: "" }) };
 const ctxStub = {
-  cwd: PROJECT_CWD,
+  cwd: "/tmp",
   getSystemPrompt: () => "test",
   hasUI: false,
   model: undefined,
@@ -46,14 +51,25 @@ describe("nested tools reach a real child session", () => {
   it("passes all three nested tools through customTools without excluding them", async () => {
     // Load the registry exactly the way the extension does at startup, from the
     // real project cwd, so this exercises the live path rather than a fixture.
-    registerAgents(loadCustomAgents(PROJECT_CWD));
-    const liveConfig = getAgentConfig("fanout-demo") as unknown as { allowedSubagents?: unknown; description?: string } | undefined;
+    // Own the fixture instead of depending on a file in someone's project, which
+    // this test did until it was deleted underneath it.
+    const cwd = mkdtempSync(join(tmpdir(), "nested-wiring-"));
+    cleanupDirs.push(cwd);
+    mkdirSync(join(cwd, ".pi", "agents"), { recursive: true });
+    writeFileSync(
+      join(cwd, ".pi", "agents", "fanout.md"),
+      "---\nname: fanout\ndescription: fan-out test agent\nallowed_subagents: all\n---\nbody\n",
+      "utf-8",
+    );
+
+    registerAgents(loadCustomAgents(cwd));
+    const liveConfig = getAgentConfig("fanout") as unknown as { allowedSubagents?: unknown } | undefined;
     expect(liveConfig?.allowedSubagents).toBe("all");
 
     const manager = new AgentManager(undefined, 2);
     captured.config = undefined;
 
-    manager.spawn(piStub as never, ctxStub as never, "fanout-demo", "do the thing", {
+    manager.spawn(piStub as never, { ...ctxStub, cwd } as never, "fanout", "do the thing", {
       description: "fan-out",
       isBackground: true,
     } as never);

@@ -100,7 +100,7 @@ describe("agent history list helpers", () => {
       record({ status: "stopped", session: undefined }),
     ], undefined);
 
-    expect(entries).toEqual(["Running agents (1)", "Agent history (2)"]);
+    expect(entries).toEqual(["Running agents (1)", "Agent history all sessions (2)"]);
     expect(buildAgentStatusMenuEntries([record({ status: "queued", session: undefined })], undefined)).toEqual([]);
   });
 

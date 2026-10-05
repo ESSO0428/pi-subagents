@@ -82,10 +82,18 @@ export function formatAgentHistoryOption(record: AgentRecord, now: number): stri
 export function buildAgentStatusMenuEntries(
   records: readonly AgentRecord[],
   cwd: string | undefined,
+  sessionId?: string,
 ): string[] {
   const { active, history } = splitAgentRecords(records, cwd);
+  // This-session history is what you almost always want, so it is the default
+  // entry. Project-wide history stays one keystroke away for the occasional
+  // "which agent was that, two sessions ago" lookup. Records restored from a
+  // branch or checkpoint are stamped with the current session, so an inherited
+  // agent counts as present here rather than disappearing into the other bucket.
+  const inSession = sessionId ? history.filter((record) => record.sessionId === sessionId) : [];
   return [
     ...(active.length > 0 ? [`Running agents (${active.length})`] : []),
-    ...(history.length > 0 ? [`Agent history (${history.length})`] : []),
+    ...(inSession.length > 0 ? [`Agent history this session (${inSession.length})`] : []),
+    ...(history.length > 0 ? [`Agent history all sessions (${history.length})`] : []),
   ];
 }

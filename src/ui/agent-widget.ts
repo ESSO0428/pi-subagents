@@ -57,6 +57,13 @@ export type AgentWidgetOpenCallback = (record: AgentRecord, mode: AgentWidgetOpe
 export type AgentWidgetOptions = {
   canOpenHistory: (record: AgentRecord) => boolean;
   onOpen: AgentWidgetOpenCallback;
+  /**
+   * Current session id. The roster shows only agents belonging to it, so a
+   * long-lived project directory does not fill the widget with work from other
+   * sessions. Read live — the session id is only known once pi has started.
+   * Nested children carry their parent's session id, so trees stay intact.
+   */
+  getSessionId?: () => string | undefined;
 };
 /** @deprecated Use AgentWidgetOpenMode. */
 export type AgentOpenMode = AgentWidgetOpenMode;
@@ -307,6 +314,7 @@ export class AgentWidget {
     private options: AgentWidgetOptions = {
       canOpenHistory: (record) => record.session !== undefined || record.completedAt !== undefined,
       onOpen: () => {},
+      getSessionId: () => undefined,
     },
   ) {}
 
@@ -322,9 +330,15 @@ export class AgentWidget {
    *   - `all`: every agent.
    */
   private widgetAgents() {
-    const all = this.manager.listAgents();
+    if (this.mode() === "off") return [];
+    // Scope to this session before the mode filter. Restored records from other
+    // sessions are still openable through `/agents` history; they just do not
+    // clutter the roster sitting under the editor.
+    const sessionId = this.options.getSessionId?.();
+    const all = sessionId
+      ? this.manager.listAgents().filter(record => record.sessionId === sessionId)
+      : this.manager.listAgents();
     switch (this.mode()) {
-      case "off": return [];
       case "background": return all.filter(a => a.parentAgentId !== undefined || a.isBackground !== false);
       default: return all;
     }

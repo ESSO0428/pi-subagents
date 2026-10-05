@@ -159,6 +159,8 @@ interface SpawnArgs {
 }
 
 export interface SpawnOptions extends Partial<Omit<NestedSpawnOptions, "description" | "signal" | "onAssistantUsage" | "onSessionCreated">> {
+  /** Overrides the session stamp applied at spawn (used by restore paths). */
+  sessionId?: string;
   description: string;
   model?: Model<any>;
   maxTurns?: number;
@@ -284,6 +286,7 @@ export class AgentManager {
       // flattens, because nothing on disk records the nesting.
       ...(record.parentAgentId !== undefined && { parentAgentId: record.parentAgentId }),
       ...(record.depth !== undefined && { depth: record.depth }),
+      ...(record.sessionId !== undefined && { sessionId: record.sessionId }),
     };
     return checkpoint;
   }
@@ -341,6 +344,10 @@ export class AgentManager {
         this.recoveryCwds.set(checkpoint.id, cwd);
         continue;
       }
+      // No session stamp here: these files are project-level and mix every
+      // session that ever ran in this directory. Re-stamping them would make
+      // "this session" mean "everything", which is the thing the scope exists to
+      // avoid. Records with no stamp stay reachable under the all-sessions entry.
       this.agents.set(checkpoint.id, this.createRestoredRecord({
         ...checkpoint,
         status,
@@ -391,6 +398,7 @@ export class AgentManager {
       parentDescription: options.parentAgentId ? this.agents.get(options.parentAgentId)?.description : undefined,
       maxSubagentDepth: options.maxSubagentDepth,
       rootSessionId: options.rootSessionId ?? ctx.sessionManager?.getSessionId?.(),
+      sessionId: options.sessionId ?? ctx.sessionManager?.getSessionId?.(),
       liveActivity: {
         activeTools: new Map(),
         responseText: "",
@@ -780,11 +788,16 @@ export class AgentManager {
   }
 
   /** Restore terminal records persisted by a parent branch without runtime handles. */
-  restoreCompleted(records: readonly unknown[]): void {
+  /**
+   * Restore terminal records carried by a parent branch. A fork continues its
+   * parent's context, so those agents count as present in this session and are
+   * stamped with the current session id rather than the one that spawned them.
+   */
+  restoreCompleted(records: readonly unknown[], sessionId?: string): void {
     const latest = new Map<string, ReturnType<typeof this.createRestoredRecord>>();
     for (const value of records) {
       if (isRestorableAgentRecord(value)) {
-        latest.set(value.id, this.createRestoredRecord(value));
+        latest.set(value.id, this.createRestoredRecord({ ...value, sessionId }));
       }
     }
 
@@ -811,6 +824,7 @@ export class AgentManager {
     compactionCount?: number;
     parentAgentId?: string;
     depth?: number;
+    sessionId?: string;
   }): AgentRecord {
     return {
       id: record.id,
@@ -830,6 +844,7 @@ export class AgentManager {
       compactionCount: record.compactionCount ?? 0,
       parentAgentId: record.parentAgentId,
       depth: record.depth,
+      sessionId: record.sessionId,
     };
   }
 
