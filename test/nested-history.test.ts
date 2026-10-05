@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agent-manager.js";
-import { getAgentConfig, registerAgents } from "../src/agent-types.js";
+import { registerAgents } from "../src/agent-types.js";
 import { createNestedSubagentTools } from "../src/nested-tools.js";
 import type { AgentRecord } from "../src/types.js";
 

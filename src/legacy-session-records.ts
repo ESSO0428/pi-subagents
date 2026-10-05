@@ -1,7 +1,7 @@
 import { createReadStream, readdirSync } from "node:fs";
 import { join } from "node:path";
-import { encodeCwd } from "./output-file.js";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { encodeCwd } from "./output-file.js";
 import type { AgentInvocation, AgentRecord } from "./types.js";
 
 /**
