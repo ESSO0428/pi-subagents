@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.36] - 2026-10-05
+
+### Fixed
+- **Legacy session history no longer lists records that cannot be opened**: recovering `subagents:record` entries from older sessions bypassed the `canOpenAgentHistory` check that the this-session list, the project-wide list, and the roster all apply, so entries with no durable transcript were offered and could only ever answer "No agent history." They now clear the same bar, which drops roughly half of what the scan recovers.
+
 ## [0.17.35] - 2026-10-05
 
 ### Added

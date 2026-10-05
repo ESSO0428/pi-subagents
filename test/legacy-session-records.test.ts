@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -94,5 +94,16 @@ describe("legacy subagents:record reader", () => {
 
   it("returns nothing when the sessions directory is absent", async () => {
     expect(await readLegacySessionRecords("/fake", "/definitely/not/here")).toEqual([]);
+  });
+});
+
+describe("legacy records must clear the same bar as everything else", () => {
+  it("excludes a legacy record that has no durable transcript", async () => {
+    // Listing an entry that can only answer "No agent history." is a dead link.
+    // The this-session list and the roster already enforce this; the legacy
+    // reader must not be the surface that quietly skips the check.
+    const src = readFileSync(new URL("../src/index.ts", import.meta.url), "utf-8");
+    const merge = src.slice(src.indexOf("mergeLegacyRecords(\n        scoped,"), src.indexOf("));", src.indexOf("mergeLegacyRecords(\n        scoped,")));
+    expect(merge).toContain("canOpenAgentHistory(record, ctx.cwd)");
   });
 });

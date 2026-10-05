@@ -1931,9 +1931,16 @@ Terse command-style prompts produce shallow, generic work.
     // Sessions recorded before durable checkpoints only exist as
     // `subagents:record` entries in their session file. They are merged here for
     // the project-wide view; the this-session view never needs the scan.
+    //
+    // They must clear the same `canOpenAgentHistory` bar as everything else:
+    // most carry no durable transcript, and listing an entry that can only ever
+    // answer "No agent history." is a dead link, not history.
     const merged = scope === "this-session"
       ? scoped
-      : mergeLegacyRecords(scoped, await readLegacySessionRecords(ctx.cwd));
+      : mergeLegacyRecords(
+        scoped,
+        (await readLegacySessionRecords(ctx.cwd)).filter(record => canOpenAgentHistory(record, ctx.cwd)),
+      );
     const pairs = merged.map((record) => ({ record, label: formatAgentHistoryOption(record, Date.now()) }));
     makeUniqueAgentOptionLabels(pairs);
     const title = scope === "this-session" ? "Agent history — this session" : "Agent history — all sessions";
