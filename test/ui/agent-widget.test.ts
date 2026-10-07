@@ -643,3 +643,25 @@ describe("AgentWidget live records", () => {
     expect(harness.render().join("\n")).toContain("alpha");
     harness.widget.dispose();
   });
+
+describe("re-registration recovery", () => {
+  it("re-registers the widget so a broken panel is rebuilt", () => {
+    const records = [makeRecord({ id: "a", description: "alpha", status: "running", completedAt: undefined })];
+    const harness = createNavigableWidgetHarness(records);
+    harness.widget.update();
+
+    expect(harness.render().join("\n")).toContain("`/agents re-focus` re-focus agents select");
+
+    let registrations = 0;
+    const ui = (harness.widget as unknown as { uiCtx: { setWidget: (k: string, c: unknown) => void } }).uiCtx;
+    const original = ui.setWidget.bind(ui);
+    ui.setWidget = (key: string, content: unknown) => { registrations += 1; original(key, content); };
+
+    harness.widget.reRegister();
+
+    // The point of the lever: registration happens again rather than the panel
+    // staying stuck behind a requestRender() against a dead reference.
+    expect(registrations).toBeGreaterThan(0);
+    harness.widget.dispose();
+  });
+});

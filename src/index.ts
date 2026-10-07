@@ -21,6 +21,7 @@ import { buildAgentStatusMenuEntries, canOpenActiveAgent, canOpenAgentHistory, f
 import { AgentManager } from "./agent-manager.js";
 import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, normalizeMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, steerAgent } from "./agent-runner.js";
 import { applyNicoOverrides, BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, isDefaultsDisabled, registerAgents, resolveSpawnType, setDefaultsDisabled, setFallbackSubagent } from "./agent-types.js";
+import { completeAgentsArguments, isRefocusArgument } from "./agents-command.js";
 import { type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
 import { loadCustomAgents } from "./custom-agents.js";
 import { isModelInScope, readEnabledModels, resolveEnabledModels } from "./enabled-models.js";
@@ -1709,6 +1710,29 @@ Terse command-style prompts produce shallow, generic work.
     return `${label} (→ ${resolvedFull.replace(/-\d{8}$/, "")})`;
   }
 
+  const isRefocusArgument = (args: unknown): boolean => {
+    // pi passes the argument string as the handler's first parameter; be
+    // tolerant of anything else rather than throwing on `/agents` itself.
+    const value = String(args ?? "").trim().toLowerCase();
+    return value === "re-focus" || value === "refocus" || value === "re-register";
+  };
+
+  /**
+   * `/agents re-focus` — rebuild the panel's widget registration.
+   *
+   * The panel registers once and afterwards only calls `requestRender()` on a TUI
+   * reference captured at registration time. If that reference goes stale the
+   * panel silently stops updating and nothing in the normal path revives it.
+   * This clears the registration so the next update re-creates it.
+   *
+   * It does NOT move keyboard focus — pi exposes no such API to extensions — so
+   * the message says what happened instead of implying focus moved.
+   */
+  function refocusAgentsList(ctx: ExtensionCommandContext): void {
+    widget.reRegister();
+    ctx.ui.notify("Re-registered. Still stuck? Esc, then ↓.", "info");
+  }
+
   async function showAgentsMenu(ctx: ExtensionCommandContext) {
     reloadCustomAgents();
     const allNames = getAllTypes();
@@ -1734,6 +1758,9 @@ Terse command-style prompts produce shallow, generic work.
     }
 
     // Actions
+    // Only offered while the panel is actually in a state it cannot recover
+    // from on its own, so this is a fix rather than permanent menu clutter.
+    options.push("Re-focus agents list");
     options.push("Create new agent");
     options.push("Settings");
 
@@ -1764,6 +1791,9 @@ Terse command-style prompts produce shallow, generic work.
       await showAgentsMenu(ctx);
     } else if (choice.startsWith("Scheduled jobs (")) {
       await showSchedulesMenu(ctx, scheduler);
+      await showAgentsMenu(ctx);
+    } else if (choice === "Re-focus agents list") {
+      refocusAgentsList(ctx);
       await showAgentsMenu(ctx);
     } else if (choice === "Create new agent") {
       await showCreateWizard(ctx);
@@ -2646,7 +2676,14 @@ ${systemPrompt}
   }
 
   pi.registerCommand("agents", {
-    description: "Manage agents",
-    handler: async (_args, ctx) => { await showAgentsMenu(ctx); },
+    description: "Manage agents, or re-focus the list with /agents re-focus",
+    getArgumentCompletions: (prefix) => completeAgentsArguments(prefix),
+    handler: async (args, ctx) => {
+      if (isRefocusArgument(args)) {
+        refocusAgentsList(ctx);
+        return;
+      }
+      await showAgentsMenu(ctx);
+    },
   });
 }

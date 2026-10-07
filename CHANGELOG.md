@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.38] - 2026-10-05
+
+### Added
+- **`/agents re-focus`, with tab completion, to rebuild the agents list**: the panel registers its widget once and thereafter only calls `requestRender()`, so a panel that stops responding to `↑↓` has no self-recovery path other than a theme change. This drops the registration so the next update re-creates it, and is reachable from the `/agents` menu. The header names the command, the notification is deliberately short, and the command says what actually happened — it does not move keyboard focus, which pi's extension API cannot do. Argument completion follows the same contract `pi-goal` uses for `/goal`: everything when empty, prefix-filtered after, `null` once a space makes the sub-command unambiguous.
+
 ## [0.17.37] - 2026-10-05
 
 ### Fixed

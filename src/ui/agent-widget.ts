@@ -376,6 +376,21 @@ export class AgentWidget {
     return true;
   }
 
+  /**
+   * Drop the registration so the next `update()` calls `setWidget` again.
+   *
+   * Named "re-focus" for users: the panel stopped responding and this is the
+   * lever for bringing it back. It does not move keyboard focus — nothing in
+   * pi's extension API can — so the caller reports what actually happened rather
+   * than implying focus moved.
+   */
+  reRegister(): void {
+    this.widgetRegistered = false;
+    this.tui = undefined;
+    this.lastRenderKey = undefined;
+    this.update();
+  }
+
   /** Called on each new turn (tool_execution_start). */
   onTurnStart() {
     this.update();
@@ -754,7 +769,7 @@ export class AgentWidget {
     const rows = renderedRows;
     const totalBody = rows.reduce((total, row) => total + row.lines.length, 0);
 
-    const heading = "Agents  ↑↓ select · enter view · esc back";
+    const heading = "Agents  ↑↓ select · enter view · esc back · `/agents re-focus` re-focus agents select";
     const lines: string[] = [truncate(theme.fg(headingColor, headingIcon) + " " + theme.fg(headingColor, heading))];
 
     if (maxLines === 1) {
