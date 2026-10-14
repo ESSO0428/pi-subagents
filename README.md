@@ -448,14 +448,43 @@ In this example, `researcher` gets `openai-codex/gpt-5.4` from the local overrid
 the global `opencode/deepseek-v4-flash-free`). `fixer` and `explorer` don't exist in global
 overrides and have no `.md` files — they are **auto-registered** from this JSON alone.
 
+### Default tools
+
+Set `subagents.defaultTools` to apply one tool policy to every agent that does not provide
+`agentOverrides.<name>.tools`:
+
+```json
+{
+  "subagents": {
+    "defaultTools": ["read", "bash", "+codemode", "-write"]
+  }
+}
+```
+
+A list containing any plain entry (such as `read`, `bash`, `*`, `all`, or `ext:...`) is a
+complete selection; `*` and `all` select all built-ins. A list containing only `+name` and
+`-name` entries patches each agent's existing tool scope. For example, `["+codemode"]`
+adds that direct tool, while `["-write"]` removes `write`. An empty list is an explicit
+empty tool set. Global and local `defaultTools` merge with local-only +/- entries applied to
+the inherited global list; a local list with a plain entry or an empty list replaces it.
+
+A per-agent `tools` value always wins over `defaultTools`, including `tools: false` for an
+explicit empty set. Its +/- entries are resolved against that agent's existing base scope.
+Built-in names remain a built-in allowlist, `ext:` entries remain extension selectors, and
+other direct names (for example `codemode`) are passed through to matching extension tools.
+Complete and empty selections also make extension tools opt-in, so `tools: ["read"]` does
+not expose every loaded extension tool; patch-only lists keep the agent's existing extension
+scope.
+
 ### Supported Override Fields
 
 | Field | Type | Description |
 |---|---|---|
 | `model` | `string \| false` | Model to use; `false` clears override and inherits parent |
 | `thinking` | `string \| false` | Thinking level: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` |
-| `systemPrompt` | `string` | Full system prompt (replaces agent's default) |
-| `tools` | `string[]` | Tool allowlist — agent gets exactly these tools and no others |
+| `systemPrompt` | `string` | Full system prompt text |
+| `systemPromptMode` | `"replace" \| "append"` | Prompt mode for the JSON `systemPrompt`; works for both existing and auto-registered agents |
+| `tools` | `string[] \| false` | Tool selection for this agent; plain entries select, +/- entries patch its base scope, and this overrides `defaultTools` |
 | `disabled` | `boolean` | `true` hides the agent from the type list |
 | `skills` | `string[]` | Skill list. `["*"]` = all skills, `[]` = none, `["simplify"]` = only named |
 

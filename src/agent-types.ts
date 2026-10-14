@@ -66,8 +66,8 @@ export function registerAgents(userAgents: Map<string, AgentConfig>): void {
  * exist in the registry yet.
  */
 export function applyNicoOverrides(): void {
-  const { overrides, defaultModel } = readNicoAgentOverrides(process.cwd());
-  applyNicoOverridesToMap(agents, overrides, defaultModel);
+  const { overrides, defaultModel, defaultTools } = readNicoAgentOverrides(process.cwd());
+  applyNicoOverridesToMap(agents, overrides, defaultModel, defaultTools);
 }
 
 /** Case-insensitive key resolution within a registry. */
@@ -214,14 +214,17 @@ export function getReadOnlyMemoryToolNames(existingToolNames: Set<string>): stri
   return READONLY_MEMORY_TOOL_NAMES.filter(n => !existingToolNames.has(n));
 }
 
-/** Get built-in tool names for a type (case-insensitive). */
+/** Get built-in and direct tool names for a type (case-insensitive). */
 export function getToolNamesForType(type: string): string[] {
   const key = resolveKey(type);
   const raw = key ? agents.get(key) : undefined;
   const config = raw?.enabled !== false ? raw : undefined;
   // `undefined` (definition omitted the field) → all built-ins; an explicit `[]`
   // (`tools: none` or a `tools:` with only `ext:` entries) → zero built-ins.
-  return config?.builtinToolNames ?? [...BUILTIN_TOOL_NAMES];
+  return [
+    ...(config?.builtinToolNames ?? BUILTIN_TOOL_NAMES),
+    ...(config?.directToolNames ?? []),
+  ];
 }
 
 /** Get config for a type (case-insensitive, returns a SubagentTypeConfig-compatible object). Falls back to general-purpose. */

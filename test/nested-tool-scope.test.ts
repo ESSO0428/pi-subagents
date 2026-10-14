@@ -26,6 +26,11 @@ describe("installExtensionToolScope re-admits injected tools", () => {
   }
 
   const loader = { getExtensions: () => ({ extensions: [] }) } as never;
+  const loaderWithExtension = {
+    getExtensions: () => ({
+      extensions: [{ path: "/tmp/ext.js", tools: new Map([["extension_tool", {}]]) }],
+    }),
+  } as never;
 
   it("keeps an injected nested Agent and steer_subagent active", () => {
     const all = ["read", "bash", "Agent", "get_subagent_result", "steer_subagent", "subagent_wait_group", "wait_for_nested_agent"];
@@ -66,5 +71,23 @@ describe("installExtensionToolScope re-admits injected tools", () => {
 
     expect(active).not.toContain("Agent");
     expect(active).toContain("steer_subagent");
+  });
+
+  it("does not include every extension tool when JSON selected an explicit tool set", () => {
+    const all = ["read", "extension_tool"];
+    const active = [...all];
+    const harness = fakeSession(all, active);
+
+    installExtensionToolScope(harness.session, {
+      loader: loaderWithExtension,
+      toolNames: ["read"],
+      disallowedSet: undefined,
+      extNames: new Set(),
+      narrowing: new Map(),
+      explicitExtensionTools: true,
+      readmitToolNames: new Set(),
+    });
+
+    expect(active).toEqual(["read"]);
   });
 });

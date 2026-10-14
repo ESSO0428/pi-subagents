@@ -26,6 +26,10 @@ export interface AgentConfig {
   displayName?: string;
   description: string;
   builtinToolNames?: string[];
+  /** Direct non-built-in tool names, e.g. ["codemode"]. */
+  directToolNames?: string[];
+  /** Explicit JSON tool selections opt extension tools into the same exact scope as built-ins. */
+  extensionToolScope?: "inherit" | "explicit";
   /** Raw `ext:` selector entries from the `tools:` CSV, e.g. ["ext:foo", "ext:bar/x"].
    * Presence of any entry flips extension tools to an explicit allowlist. */
   extSelectors?: string[];

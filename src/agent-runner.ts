@@ -234,6 +234,7 @@ export function installExtensionToolScope(
     disallowedSet: Set<string> | undefined;
     extNames: Set<string>;
     narrowing: Map<string, Set<string>>;
+    explicitExtensionTools?: boolean;
     /**
      * Injected `customTools` that must survive the scope gate. They are deleted
      * below along with `EXCLUDED_TOOL_NAMES` — the scoped nested `Agent` and
@@ -245,7 +246,7 @@ export function installExtensionToolScope(
     readmitToolNames: Set<string>;
   },
 ): void {
-  const { loader, toolNames, disallowedSet, extNames, narrowing, readmitToolNames } = ctx;
+  const { loader, toolNames, disallowedSet, extNames, narrowing, explicitExtensionTools, readmitToolNames } = ctx;
 
   // The names allowed right now. Mirrors the `ext:` opt-in flip: when any `ext:`
   // selector is present, extension tools become an explicit allowlist — a loaded
@@ -253,7 +254,7 @@ export function installExtensionToolScope(
   // and `ext:foo/bar` narrows `foo` to just `bar`.
   const inScope = (): Set<string> => {
     const keep = new Set(toolNames.filter((t) => !disallowedSet?.has(t)));
-    const optInActive = extNames.size > 0;
+    const optInActive = explicitExtensionTools === true || extNames.size > 0;
     for (const extension of loader.getExtensions().extensions) {
       const canons = extensionCanonicalNames(extension.path);
       if (optInActive && !canons.some((c) => extNames.has(c))) continue;
@@ -560,6 +561,8 @@ export async function runAgent(
     }
   }
 
+  // Includes built-ins plus any direct non-built-in names resolved from Nico
+  // defaultTools/agentOverrides; both static and live scope paths use this list.
   let toolNames = getToolNamesForType(type);
 
   // Persistent memory: detect write capability and branch accordingly.
@@ -804,6 +807,7 @@ export async function runAgent(
   // `noExtensions`/`isolated` keeps the historical static allowlist: nothing
   // async can appear there, and a hard registry gate is the correct boundary.
   const builtinToolNameSet = new Set(toolNames);
+  const explicitExtensionTools = agentConfig?.extensionToolScope === "explicit";
 
   let sessionTools: string[] | undefined;
   let sessionExcludeTools: string[] | undefined;
@@ -903,6 +907,7 @@ export async function runAgent(
       disallowedSet,
       extNames,
       narrowing,
+      explicitExtensionTools,
       readmitToolNames: new Set([...nestedToolNames].filter((name) => !disallowedSet?.has(name))),
     });
   }

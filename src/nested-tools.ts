@@ -124,8 +124,8 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
     // `subagents.agentOverrides` in settings.json is not visible here. Apply the
     // same overrides to this map or a nested child would ignore configuration
     // that governs the very same agent type one level up.
-    const { overrides, defaultModel } = readNicoAgentOverrides(context.configCwd);
-    applyNicoOverridesToMap(registry, overrides, defaultModel);
+    const { overrides, defaultModel, defaultTools } = readNicoAgentOverrides(context.configCwd);
+    applyNicoOverridesToMap(registry, overrides, defaultModel, defaultTools);
     return registry;
   };
   const allowedTypesIn = (registry: Map<string, AgentConfig>): Set<string> | undefined =>

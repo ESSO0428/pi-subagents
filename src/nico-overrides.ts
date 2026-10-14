@@ -45,6 +45,7 @@ export interface NicoAgentOverride {
 
 interface NicoSubagentsSettings {
   defaultModel?: string;
+  defaultTools?: string[];
   disableBuiltins?: boolean;
   disableThinking?: boolean;
   agentOverrides?: Record<string, NicoAgentOverride>;
@@ -54,20 +55,140 @@ interface NicoSettingsFile {
   subagents?: NicoSubagentsSettings;
 }
 
+/** Resolved tool fields kept separate so direct extension tool names do not look like built-ins. */
+export interface ResolvedNicoTools {
+  builtinToolNames: string[];
+  directToolNames?: string[];
+  extensionToolScope?: "inherit" | "explicit";
+  extSelectors?: string[];
+}
+
+/**
+ * Merge local Pi-style defaultTools over global defaults. A local list made
+ * entirely of +/- entries patches the inherited list; any plain entry (or an
+ * explicit empty list) replaces it.
+ */
+export function mergeNicoDefaultTools(
+  globalTools: string[] | undefined,
+  localTools: string[],
+): string[] {
+  if (localTools.length === 0 || localTools.some((entry) => !entry.startsWith("+") && !entry.startsWith("-"))) {
+    return [...localTools];
+  }
+  return [...(globalTools ?? []), ...localTools];
+}
+
+function toolFields(config: ResolvedNicoTools): ResolvedNicoTools {
+  return {
+    builtinToolNames: [...config.builtinToolNames],
+    ...(config.directToolNames?.length ? { directToolNames: [...config.directToolNames] } : {}),
+    ...(config.extensionToolScope ? { extensionToolScope: config.extensionToolScope } : {}),
+    ...(config.extSelectors?.length ? { extSelectors: [...config.extSelectors] } : {}),
+  };
+}
+
+/**
+ * Resolve a Nico/Pi defaultTools-style list against an agent's existing scope.
+ * Plain entries start a complete selection; a list made only of +/- entries
+ * patches the supplied base. `ext:` selectors remain separate from direct
+ * tool names so the runner can apply its existing extension scoping rules.
+ */
+export function resolveNicoTools(
+  entries: string[],
+  base: Pick<AgentConfig, "builtinToolNames" | "directToolNames" | "extensionToolScope" | "extSelectors"> = {},
+): ResolvedNicoTools {
+  const normalized = entries.map((entry) => entry.trim()).filter(Boolean);
+  const patchOnly = normalized.length > 0 && normalized.every((entry) => entry.startsWith("+") || entry.startsWith("-"));
+  const builtinToolNames = patchOnly
+    ? [...(base.builtinToolNames ?? BUILTIN_TOOL_NAMES)]
+    : [];
+  const directToolNames = patchOnly ? [...(base.directToolNames ?? [])] : [];
+  const extSelectors = patchOnly ? [...(base.extSelectors ?? [])] : [];
+  const extensionToolScope = patchOnly ? base.extensionToolScope : "explicit";
+
+  const add = (name: string): void => {
+    if (name === "*" || name.toLowerCase() === "all") {
+      for (const builtin of BUILTIN_TOOL_NAMES) {
+        if (!builtinToolNames.includes(builtin)) builtinToolNames.push(builtin);
+      }
+    } else if (name.startsWith("ext:")) {
+      if (!extSelectors.includes(name)) extSelectors.push(name);
+    } else if (BUILTIN_TOOL_NAMES.includes(name)) {
+      if (!builtinToolNames.includes(name)) builtinToolNames.push(name);
+    } else if (!directToolNames.includes(name)) {
+      directToolNames.push(name);
+    }
+  };
+
+  const remove = (name: string): void => {
+    if (name === "*" || name.toLowerCase() === "all") {
+      builtinToolNames.splice(0, builtinToolNames.length);
+    } else if (name.startsWith("ext:")) {
+      for (let i = extSelectors.length - 1; i >= 0; i--) {
+        if (extSelectors[i] === name) extSelectors.splice(i, 1);
+      }
+    } else {
+      for (let i = builtinToolNames.length - 1; i >= 0; i--) {
+        if (builtinToolNames[i] === name) builtinToolNames.splice(i, 1);
+      }
+      for (let i = directToolNames.length - 1; i >= 0; i--) {
+        if (directToolNames[i] === name) directToolNames.splice(i, 1);
+      }
+    }
+  };
+
+  const applyEntry = (entry: string): void => {
+    const operation = entry[0];
+    const name = operation === "+" || operation === "-" ? entry.slice(1) : entry;
+    if (!name) return;
+    if (operation === "-") remove(name);
+    else add(name);
+  };
+
+  if (patchOnly) {
+    for (const entry of normalized) applyEntry(entry);
+  } else {
+    // Plain entries define the complete selection regardless of where +/-
+    // entries appear in the array; patches are applied afterwards.
+    for (const entry of normalized) {
+      if (!entry.startsWith("+") && !entry.startsWith("-")) add(entry);
+    }
+    for (const entry of normalized) {
+      if (entry.startsWith("+") || entry.startsWith("-")) applyEntry(entry);
+    }
+  }
+
+  return toolFields({ builtinToolNames, directToolNames, extensionToolScope, extSelectors });
+}
+
+function applyNicoTools(agent: AgentConfig, entries: string[]): AgentConfig {
+  const resolved = resolveNicoTools(entries, agent);
+  return {
+    ...agent,
+    ...resolved,
+    directToolNames: resolved.directToolNames,
+    extensionToolScope: resolved.extensionToolScope,
+    extSelectors: resolved.extSelectors,
+  };
+}
+
 // ============================================================================
 // Reader
 // ============================================================================
 
 /**
- * Read subagents.agentOverrides and subagents.defaultModel from both local
- * and global Nico-style settings.json. Local overrides global on key collision.
+ * Read subagents.agentOverrides, subagents.defaultModel, and
+ * subagents.defaultTools from both local and global Nico-style settings.json.
+ * Local overrides global on key collision.
  */
 export function readNicoAgentOverrides(cwd: string): {
   overrides: Record<string, NicoAgentOverride>;
   defaultModel: string | undefined;
+  defaultTools: string[] | undefined;
 } {
   const merged: Record<string, NicoAgentOverride> = {};
   let defaultModel: string | undefined;
+  let defaultTools: string[] | undefined;
 
   // Global: ~/.pi/agent/settings.json
   const globalPath = join(getAgentDir(), "settings.json");
@@ -75,6 +196,7 @@ export function readNicoAgentOverrides(cwd: string): {
   if (globalSettings) {
     mergeOverrides(merged, globalSettings.agentOverrides);
     if (defaultModel === undefined) defaultModel = globalSettings.defaultModel;
+    if (globalSettings.defaultTools !== undefined) defaultTools = [...globalSettings.defaultTools];
   }
 
   // Local: .pi/settings.json
@@ -84,10 +206,13 @@ export function readNicoAgentOverrides(cwd: string): {
     if (localSettings) {
       mergeOverrides(merged, localSettings.agentOverrides);
       if (localSettings.defaultModel !== undefined) defaultModel = localSettings.defaultModel;
+      if (localSettings.defaultTools !== undefined) {
+        defaultTools = mergeNicoDefaultTools(defaultTools, localSettings.defaultTools);
+      }
     }
   }
 
-  return { overrides: merged, defaultModel };
+  return { overrides: merged, defaultModel, defaultTools };
 }
 
 function readNicoSettingsFile(filePath: string): NicoSubagentsSettings | undefined {
@@ -96,7 +221,10 @@ function readNicoSettingsFile(filePath: string): NicoSubagentsSettings | undefin
     const raw = JSON.parse(readFileSync(filePath, "utf-8")) as NicoSettingsFile;
     const sub = raw?.subagents;
     if (!sub || typeof sub !== "object") return undefined;
-    return sub;
+    const defaultTools = Array.isArray(sub.defaultTools)
+      ? sub.defaultTools.filter((entry): entry is string => typeof entry === "string")
+      : undefined;
+    return { ...sub, defaultTools };
   } catch {
     // Silently skip — bad Nico config must not break tintinweb
     return undefined;
@@ -145,6 +273,7 @@ export function applyNicoOverride(
   agent: AgentConfig,
   override: NicoAgentOverride,
   nicoDefaultModel?: string,
+  nicoDefaultTools?: string[],
 ): AgentConfig {
   let modified = false;
   let next: AgentConfig = agent;
@@ -168,13 +297,21 @@ export function applyNicoOverride(
     modified = true;
   }
 
+  if (override.systemPromptMode !== undefined) {
+    next = { ...next, promptMode: override.systemPromptMode === "append" ? "append" : "replace" };
+    modified = true;
+  }
+
   if (override.disabled !== undefined) {
     next = { ...next, enabled: !override.disabled };
     modified = true;
   }
 
   if (override.tools !== undefined) {
-    next = { ...next, builtinToolNames: override.tools === false ? [] : [...override.tools] };
+    next = applyNicoTools(next, override.tools === false ? [] : override.tools);
+    modified = true;
+  } else if (nicoDefaultTools !== undefined) {
+    next = applyNicoTools(next, nicoDefaultTools);
     modified = true;
   }
 
@@ -189,14 +326,19 @@ function createAgentFromOverride(
   name: string,
   override: NicoAgentOverride,
   defaultModel?: string,
+  defaultTools?: string[],
 ): AgentConfig {
+  const resolvedTools = override.tools !== undefined
+    ? resolveNicoTools(override.tools === false ? [] : override.tools, { builtinToolNames: BUILTIN_TOOL_NAMES })
+    : defaultTools !== undefined
+      ? resolveNicoTools(defaultTools, { builtinToolNames: BUILTIN_TOOL_NAMES })
+      : { builtinToolNames: [...BUILTIN_TOOL_NAMES] };
+
   return {
     name,
     displayName: name,
     description: `Auto-registered from npm:pi-subagents JSON settings`,
-    builtinToolNames: override.tools !== undefined
-      ? (override.tools === false ? [] : [...override.tools])
-      : [...BUILTIN_TOOL_NAMES],
+    ...toolFields(resolvedTools),
     extensions: true,
     skills: resolveNicoSkills(override.skills),
     model: override.model !== undefined ? (override.model === false ? undefined : override.model) : defaultModel,
@@ -223,13 +365,20 @@ export function applyNicoOverridesToMap(
   agents: Map<string, AgentConfig>,
   overrides: Record<string, NicoAgentOverride>,
   defaultModel?: string,
+  defaultTools?: string[],
 ): void {
   for (const [name, override] of Object.entries(overrides)) {
     const existing = agents.get(name);
     if (existing) {
-      agents.set(name, applyNicoOverride(existing, override, defaultModel));
+      agents.set(name, applyNicoOverride(existing, override, defaultModel, defaultTools));
     } else {
-      agents.set(name, createAgentFromOverride(name, override, defaultModel));
+      agents.set(name, createAgentFromOverride(name, override, defaultModel, defaultTools));
+    }
+  }
+
+  if (defaultTools !== undefined) {
+    for (const [name, agent] of agents) {
+      if (overrides[name] === undefined) agents.set(name, applyNicoTools(agent, defaultTools));
     }
   }
 }
