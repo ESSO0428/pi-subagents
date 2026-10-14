@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.39] - 2026-10-14
+
 ### Added
 - **Pi-style `subagents.defaultTools` compatibility**: Nico-style settings can now define global tool defaults with plain, `+`, and `-` entries. Global and local defaults merge using Pi's replacement/patch rules, per-agent `tools` values take precedence, and direct non-built-in names such as `codemode` are kept separate from the built-in allowlist while `ext:` selectors retain their existing behavior. Complete and empty selections make extension tools opt-in rather than exposing every loaded extension. JSON `systemPromptMode` also now applies to existing agents, not only auto-registered ones.
 
