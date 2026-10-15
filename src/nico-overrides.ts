@@ -104,7 +104,9 @@ export function resolveNicoTools(
     : [];
   const directToolNames = patchOnly ? [...(base.directToolNames ?? [])] : [];
   const extSelectors = patchOnly ? [...(base.extSelectors ?? [])] : [];
-  const extensionToolScope = patchOnly ? base.extensionToolScope : "explicit";
+  const extensionToolScope = patchOnly
+    ? base.extSelectors?.length ? "explicit" : base.extensionToolScope
+    : "explicit";
 
   const add = (name: string): void => {
     if (name === "*" || name.toLowerCase() === "all") {
@@ -186,7 +188,7 @@ export function readNicoAgentOverrides(cwd: string): {
   defaultModel: string | undefined;
   defaultTools: string[] | undefined;
 } {
-  const merged: Record<string, NicoAgentOverride> = {};
+  const merged = Object.create(null) as Record<string, NicoAgentOverride>;
   let defaultModel: string | undefined;
   let defaultTools: string[] | undefined;
 
@@ -310,7 +312,11 @@ export function applyNicoOverride(
   if (override.tools !== undefined) {
     next = applyNicoTools(next, override.tools === false ? [] : override.tools);
     modified = true;
-  } else if (nicoDefaultTools !== undefined) {
+  }
+
+  // defaultTools is the final policy layer, including when an agent has an
+  // explicit per-agent tool selection.
+  if (nicoDefaultTools !== undefined) {
     next = applyNicoTools(next, nicoDefaultTools);
     modified = true;
   }
@@ -328,11 +334,12 @@ function createAgentFromOverride(
   defaultModel?: string,
   defaultTools?: string[],
 ): AgentConfig {
-  const resolvedTools = override.tools !== undefined
+  const overrideTools = override.tools !== undefined
     ? resolveNicoTools(override.tools === false ? [] : override.tools, { builtinToolNames: BUILTIN_TOOL_NAMES })
-    : defaultTools !== undefined
-      ? resolveNicoTools(defaultTools, { builtinToolNames: BUILTIN_TOOL_NAMES })
-      : { builtinToolNames: [...BUILTIN_TOOL_NAMES] };
+    : { builtinToolNames: [...BUILTIN_TOOL_NAMES] };
+  const resolvedTools = defaultTools !== undefined
+    ? resolveNicoTools(defaultTools, overrideTools)
+    : overrideTools;
 
   return {
     name,
@@ -378,7 +385,7 @@ export function applyNicoOverridesToMap(
 
   if (defaultTools !== undefined) {
     for (const [name, agent] of agents) {
-      if (overrides[name] === undefined) agents.set(name, applyNicoTools(agent, defaultTools));
+      if (!Object.hasOwn(overrides, name)) agents.set(name, applyNicoTools(agent, defaultTools));
     }
   }
 }

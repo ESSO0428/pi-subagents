@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Applied `subagents.defaultTools` as the final tool policy**: default tools now apply after per-agent selections, including `tools: false`, while preserving the existing plain, `+`, and `-` resolution semantics and nested registry behavior.
+
 ## [0.17.39] - 2026-10-14
 
 ### Added

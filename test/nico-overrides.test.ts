@@ -48,7 +48,18 @@ describe("resolveNicoTools", () => {
     }))).toEqual({
       builtinToolNames: ["read"],
       directToolNames: ["old-direct", "codemode"],
+      extensionToolScope: "explicit",
       extSelectors: ["ext:keep"],
+    });
+  });
+
+  it("preserves explicit extension scope after removing the final selector", () => {
+    expect(resolveNicoTools(["-ext:mcp/search"], {
+      builtinToolNames: ["read"],
+      extSelectors: ["ext:mcp/search"],
+    })).toEqual({
+      builtinToolNames: ["read"],
+      extensionToolScope: "explicit",
     });
   });
 
@@ -114,18 +125,36 @@ describe("readNicoAgentOverrides", () => {
 
     expect(readNicoAgentOverrides(cwd).defaultTools).toEqual([]);
   });
+
+  it("preserves special own keys when reading JSON overrides", () => {
+    writeFileSync(join(globalDir, "settings.json"),
+      '{"subagents":{"agentOverrides":{"__proto__":{"tools":["read"]}}}}');
+
+    const { overrides } = readNicoAgentOverrides(cwd);
+    const specialName = "__proto__";
+    expect(Object.hasOwn(overrides, specialName)).toBe(true);
+    expect(overrides[specialName]).toEqual({ tools: ["read"] });
+  });
 });
 
 describe("Nico tool application", () => {
-  it("applies defaultTools only when an override omits tools", () => {
+  it("applies defaultTools as the final policy after explicit tools", () => {
     const agent = makeAgent({ description: "keep this" });
     const patched = applyNicoOverride(agent, { model: "test/model" }, undefined, ["-write"]);
     expect(patched.builtinToolNames).toEqual(["read"]);
     expect(patched.description).toBe("keep this");
 
-    const explicit = applyNicoOverride(agent, { tools: ["+codemode"] }, undefined, ["read"]);
-    expect(explicit.builtinToolNames).toEqual(["read", "write"]);
+    const explicit = applyNicoOverride(agent, { tools: ["read", "grep"] }, undefined, ["+codemode"]);
+    expect(explicit.builtinToolNames).toEqual(["read", "grep"]);
     expect(explicit.directToolNames).toEqual(["codemode"]);
+
+    const falseTools = applyNicoOverride(agent, { tools: false }, undefined, ["+codemode"]);
+    expect(falseTools.builtinToolNames).toEqual([]);
+    expect(falseTools.directToolNames).toEqual(["codemode"]);
+
+    const plainDefault = applyNicoOverride(agent, { tools: ["read", "+codemode"] }, undefined, ["bash"]);
+    expect(plainDefault.builtinToolNames).toEqual(["bash"]);
+    expect(plainDefault.directToolNames).toBeUndefined();
   });
 
   it("preserves existing fields and handles false as an explicit empty set", () => {
@@ -144,17 +173,31 @@ describe("Nico tool application", () => {
     expect(updated.promptMode).toBe("append");
   });
 
-  it("applies defaults to unoverridden and auto-registered agents", () => {
-    const agents = new Map<string, AgentConfig>([["existing", makeAgent({ name: "existing" })]]);
+  it("applies final defaults to explicit, unoverridden, and auto-registered agents", () => {
+    const agents = new Map<string, AgentConfig>([
+      ["existing", makeAgent({ name: "existing" })],
+      ["untouched", makeAgent({ name: "untouched" })],
+      ["constructor", makeAgent({ name: "constructor" })],
+    ]);
     applyNicoOverridesToMap(
       agents,
-      { "existing": { model: "test/model" }, "new-agent": {} },
+      {
+        existing: { model: "test/model" },
+        explicit: { tools: ["read"] },
+        "new-agent": { tools: ["read"] },
+      },
       undefined,
-      ["read", "+codemode"],
+      ["+codemode"],
     );
 
-    expect(agents.get("existing")?.builtinToolNames).toEqual(["read"]);
+    expect(agents.get("existing")?.builtinToolNames).toEqual(["read", "write"]);
     expect(agents.get("existing")?.directToolNames).toEqual(["codemode"]);
+    expect(agents.get("untouched")?.builtinToolNames).toEqual(["read", "write"]);
+    expect(agents.get("untouched")?.directToolNames).toEqual(["codemode"]);
+    expect(agents.get("constructor")?.builtinToolNames).toEqual(["read", "write"]);
+    expect(agents.get("constructor")?.directToolNames).toEqual(["codemode"]);
+    expect(agents.get("explicit")?.builtinToolNames).toEqual(["read"]);
+    expect(agents.get("explicit")?.directToolNames).toEqual(["codemode"]);
     expect(agents.get("new-agent")?.builtinToolNames).toEqual(["read"]);
     expect(agents.get("new-agent")?.directToolNames).toEqual(["codemode"]);
   });

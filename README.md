@@ -450,8 +450,8 @@ overrides and have no `.md` files — they are **auto-registered** from this JSO
 
 ### Default tools
 
-Set `subagents.defaultTools` to apply one tool policy to every agent that does not provide
-`agentOverrides.<name>.tools`:
+Set `subagents.defaultTools` to apply one final tool policy to every agent, after any
+`agentOverrides.<name>.tools` value:
 
 ```json
 {
@@ -468,8 +468,11 @@ adds that direct tool, while `["-write"]` removes `write`. An empty list is an e
 empty tool set. Global and local `defaultTools` merge with local-only +/- entries applied to
 the inherited global list; a local list with a plain entry or an empty list replaces it.
 
-A per-agent `tools` value always wins over `defaultTools`, including `tools: false` for an
-explicit empty set. Its +/- entries are resolved against that agent's existing base scope.
+A per-agent `tools` value is resolved first against that agent's original scope, then
+`defaultTools` is resolved against the result as the final policy layer. Thus
+`defaultTools: ["+codemode"]` adds `codemode` even to an agent with plain per-agent tools,
+and re-adds it after `tools: false` without restoring any built-ins. A plain `defaultTools`
+list replaces the per-agent result. Agents without an override receive the same final policy.
 Built-in names remain a built-in allowlist, `ext:` entries remain extension selectors, and
 other direct names (for example `codemode`) are passed through to matching extension tools.
 Complete and empty selections also make extension tools opt-in, so `tools: ["read"]` does
@@ -484,7 +487,7 @@ scope.
 | `thinking` | `string \| false` | Thinking level: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` |
 | `systemPrompt` | `string` | Full system prompt text |
 | `systemPromptMode` | `"replace" \| "append"` | Prompt mode for the JSON `systemPrompt`; works for both existing and auto-registered agents |
-| `tools` | `string[] \| false` | Tool selection for this agent; plain entries select, +/- entries patch its base scope, and this overrides `defaultTools` |
+| `tools` | `string[] \| false` | Tool selection for this agent; resolved against its base scope before the final `defaultTools` policy |
 | `disabled` | `boolean` | `true` hides the agent from the type list |
 | `skills` | `string[]` | Skill list. `["*"]` = all skills, `[]` = none, `["simplify"]` = only named |
 
