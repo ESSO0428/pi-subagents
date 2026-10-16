@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.41] - 2026-10-15
+
 ### Fixed
 - **Register selected `codemode` tools in child SDK sessions**: child sessions now supply Pi's replaceable built-in codemode extension only when the effective tool policy selects it and extensions are enabled. Include/exclude and isolated policies remain authoritative, while older Pi hosts without `createCodemodeExtension` emit a clear tools warning and continue without crashing.
 
