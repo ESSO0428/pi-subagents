@@ -477,7 +477,9 @@ Built-in names remain a built-in allowlist, `ext:` entries remain extension sele
 other direct names (for example `codemode`) are passed through to matching extension tools.
 Complete and empty selections also make extension tools opt-in, so `tools: ["read"]` does
 not expose every loaded extension tool; patch-only lists keep the agent's existing extension
-scope.
+scope. On supported Pi hosts, selecting `codemode` also registers Pi's codemode built-in in
+the child SDK session. Older hosts without the codemode factory cannot expose that tool and
+produce a warning instead of crashing.
 
 ### Supported Override Fields
 

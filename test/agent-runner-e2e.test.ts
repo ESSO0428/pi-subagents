@@ -41,6 +41,7 @@ import { fauxProvider } from "./helpers/pi-ai.js";
 vi.setConfig({ testTimeout: 30_000 });
 
 const FIXTURE = resolve(fileURLToPath(new URL("./fixtures/e2e-probe-ext.mjs", import.meta.url)));
+const CODEMODE_REPLACEMENT_FIXTURE = resolve(fileURLToPath(new URL("./fixtures/codemode.mjs", import.meta.url)));
 /** The fixture registers exactly this tool. */
 const EXT_TOOL = "e2e_probe";
 const BUILTINS = ["read", "bash", "edit", "write", "grep", "find", "ls"];
@@ -72,7 +73,13 @@ describe("agent-runner end-to-end (real pi-mono session + real extension)", () =
    * Register `cfg` as agent type "e2e", run it through the REAL runAgent, and
    * return the real session's active tool names captured at construction time.
    */
-  async function activeToolsFor(cfg: Partial<AgentConfig>): Promise<string[]> {
+  async function activeToolsFor(
+    cfg: Partial<AgentConfig>,
+    options: {
+      isolated?: boolean;
+      onToolActivity?: (activity: { type: "start" | "end"; toolName: string }) => void;
+    } = {},
+  ): Promise<string[]> {
     registerAgents(
       new Map([
         [
@@ -107,21 +114,27 @@ describe("agent-runner end-to-end (real pi-mono session + real extension)", () =
     const ctx: any = { cwd, getSystemPrompt: () => "PARENT", model, modelRegistry };
 
     let active: string[] = [];
+    let sessionCreated = false;
+    const stopAfterCapture = new Error("stop after capturing active tools");
     try {
       await runAgent(ctx, "e2e", "go", {
         pi: makePi(),
         model,
+        ...options,
         onSessionCreated: (s) => {
           active = s.getActiveToolNames();
+          sessionCreated = true;
           // The tool set is fixed before the prompt; stop here instead of
           // starting an unnecessary faux-provider turn.
-          throw new Error("stop after capturing active tools");
+          throw stopAfterCapture;
         },
       });
-    } catch {
+    } catch (error) {
+      if (error !== stopAfterCapture) throw error;
       // onSessionCreated intentionally aborts the run after capturing the
       // construction-time gated tool set.
     }
+    expect(sessionCreated).toBe(true);
     return active;
   }
 
@@ -136,6 +149,118 @@ describe("agent-runner end-to-end (real pi-mono session + real extension)", () =
     const active = await activeToolsFor({ extensions: false });
     expect(active).not.toContain(EXT_TOOL);
     for (const b of BUILTINS) expect(active).toContain(b);
+  });
+
+  it("direct codemode selection loads and activates the real SDK built-in", async () => {
+    const active = await activeToolsFor({ directToolNames: ["codemode"], extensions: true });
+    expect(active).toContain("codemode");
+  });
+
+  it("does not supply the SDK codemode factory when direct codemode is unselected", async () => {
+    const active = await activeToolsFor({ extensions: true });
+    expect(active).not.toContain("codemode");
+    for (const b of BUILTINS) expect(active).toContain(b);
+  });
+
+  it("a codemode extension replaces the SDK built-in without collision diagnostics", async () => {
+    const onToolActivity = vi.fn();
+    const active = await activeToolsFor(
+      {
+        directToolNames: ["codemode"],
+        extensions: [CODEMODE_REPLACEMENT_FIXTURE],
+      },
+      { onToolActivity },
+    );
+    expect(active.filter((name) => name === "codemode")).toHaveLength(1);
+    expect(onToolActivity.mock.calls.map(([activity]) => activity.toolName)).not.toEqual(
+      expect.arrayContaining([expect.stringMatching(/(?:collision|load error|extension-error)/i)]),
+    );
+  });
+
+  it("isolated mode disables a requested extension and the SDK codemode built-in", async () => {
+    const active = await activeToolsFor(
+      { directToolNames: ["codemode"], extensions: [FIXTURE] },
+      { isolated: true },
+    );
+    expect(active).not.toContain(EXT_TOOL);
+    expect(active).not.toContain("codemode");
+    for (const b of BUILTINS) expect(active).toContain(b);
+  });
+
+  it("wildcard extension selection activates the real SDK codemode built-in", async () => {
+    const active = await activeToolsFor({ directToolNames: ["codemode"], extensions: ["*"] });
+    expect(active).toContain("codemode");
+  });
+
+  it("direct codemode selection works with an explicit codemode extension include", async () => {
+    const active = await activeToolsFor({ directToolNames: ["codemode"], extensions: ["codemode"] });
+    expect(active).toContain("codemode");
+  });
+
+  it("builtin:codemode selects the real SDK built-in", async () => {
+    const active = await activeToolsFor({
+      directToolNames: ["codemode"],
+      extensions: ["builtin:codemode"],
+    });
+    expect(active).toContain("codemode");
+  });
+
+  it("direct codemode selection stays absent when extensions are disabled", async () => {
+    const active = await activeToolsFor({ directToolNames: ["codemode"], extensions: false });
+    expect(active).not.toContain("codemode");
+    for (const b of BUILTINS) expect(active).toContain(b);
+  });
+
+  it("an explicit extension allowlist that omits codemode does not load it", async () => {
+    const active = await activeToolsFor({ directToolNames: ["codemode"], extensions: ["some-other-extension"] });
+    expect(active).not.toContain("codemode");
+  });
+
+  it("explicit codemode exclusion prevents loading the real SDK built-in", async () => {
+    const active = await activeToolsFor({
+      directToolNames: ["codemode"],
+      extensions: true,
+      excludeExtensions: ["codemode"],
+    });
+    expect(active).not.toContain("codemode");
+  });
+
+  it("builtin:codemode exclusion has no unmatched-exclusion warning", async () => {
+    const onToolActivity = vi.fn();
+    const active = await activeToolsFor(
+      {
+        directToolNames: ["codemode"],
+        extensions: true,
+        excludeExtensions: ["builtin:codemode"],
+      },
+      { onToolActivity },
+    );
+    expect(active).not.toContain("codemode");
+    expect(onToolActivity).not.toHaveBeenCalledWith(
+      expect.objectContaining({ toolName: expect.stringContaining("did not match any discovered extension") }),
+    );
+  });
+
+  it("disallowedTools removes the real SDK codemode built-in", async () => {
+    const active = await activeToolsFor({
+      directToolNames: ["codemode"],
+      extensions: ["*"],
+      disallowedTools: ["codemode"],
+    });
+    expect(active).not.toContain("codemode");
+    expect(active).toContain("read");
+  });
+
+  it("the codemode modifier preserves requested built-ins and extension tools", async () => {
+    const active = await activeToolsFor({
+      builtinToolNames: ["read"],
+      directToolNames: ["codemode"],
+      extensions: [FIXTURE, "builtin:codemode"],
+    });
+    expect(active).toContain("read");
+    expect(active).toContain(EXT_TOOL);
+    expect(active).toContain("codemode");
+    expect(active).not.toContain("bash");
   });
 
   it("disallowedTools removes a real extension tool from the live session", async () => {

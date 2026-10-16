@@ -12,6 +12,7 @@ const {
   sessionManagerCreate,
   settingsManagerCreate,
   settingsManagerGetSessionDir,
+  codemodeHostRef,
 } = vi.hoisted(() => ({
   createAgentSession: vi.fn(),
   defaultResourceLoaderCtor: vi.fn(),
@@ -27,6 +28,7 @@ const {
   sessionManagerCreate: vi.fn(() => ({ kind: "persistent-session-manager" })),
   settingsManagerGetSessionDir: vi.fn(() => undefined as string | undefined),
   settingsManagerCreate: vi.fn(() => ({ kind: "settings-manager", getSessionDir: settingsManagerGetSessionDir })),
+  codemodeHostRef: { current: true },
 }));
 
 vi.mock("@earendil-works/pi-coding-agent", async (importOriginal) => {
@@ -34,6 +36,9 @@ vi.mock("@earendil-works/pi-coding-agent", async (importOriginal) => {
   return {
     ...actual,
     createAgentSession,
+    get createCodemodeExtension() {
+      return codemodeHostRef.current ? actual.createCodemodeExtension : undefined;
+    },
     // Mock loader simulates pi-mono: reload() applies additionalExtensionPaths
     // (an unknown path becomes an error row, mirroring a failed load) and then
     // runs extensionsOverride over the result.
@@ -931,6 +936,29 @@ describe("agent-runner master tool allowlist", () => {
     expect(activated.has("mcp")).toBe(true);
     expect(activated.has("read")).toBe(true);
     expect(activated.has("bash")).toBe(false);
+  });
+
+  it("warns and continues when codemode is requested on an older Pi host", async () => {
+    vi.mocked(getConfig).mockReturnValueOnce(makeConfig({ extensions: true }));
+    vi.mocked(getAgentConfig).mockReturnValueOnce(
+      makeAgentConfig({ extensions: true, directToolNames: ["codemode"] }),
+    );
+    vi.mocked(getToolNamesForType).mockReturnValueOnce([...BUILTINS_7, "codemode"]);
+    const { session } = createSession("OK");
+    createAgentSession.mockResolvedValue({ session });
+    const onToolActivity = vi.fn();
+    codemodeHostRef.current = false;
+
+    try {
+      const result = await runAgent(ctx, "Explore", "go", { pi, onToolActivity });
+
+      expect(result.responseText).toBe("OK");
+      expect(onToolActivity).toHaveBeenCalledWith(
+        expect.objectContaining({ toolName: expect.stringContaining("tools-error:codemode requested") }),
+      );
+    } finally {
+      codemodeHostRef.current = true;
+    }
   });
 });
 

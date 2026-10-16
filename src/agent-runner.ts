@@ -7,6 +7,7 @@ import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
 import type { ExtensionContext, LoadExtensionsResult, ModelRuntime } from "@earendil-works/pi-coding-agent";
+import * as PiCodingAgent from "@earendil-works/pi-coding-agent";
 import {
   type AgentSession,
   type AgentSessionEvent,
@@ -118,8 +119,16 @@ function extensionPackageName(extPath: string): string | undefined {
  */
 export function extensionCanonicalNames(extPath: string): string[] {
   const canonical = extensionCanonicalName(extPath);
+  const aliases = [canonical];
+  // Pi 1.2 exposes SDK-provided built-ins as `builtin:<name>` paths. Keep the
+  // path alias for diagnostics while also matching the user-facing short name.
+  if (canonical.startsWith("builtin:")) aliases.push(canonical.slice("builtin:".length));
+  if (canonical.startsWith("<inline:") && canonical.endsWith(">")) {
+    aliases.push(canonical.slice("<inline:".length, -1));
+  }
   const pkg = extensionPackageName(extPath);
-  return pkg && pkg !== canonical ? [canonical, pkg] : [canonical];
+  if (pkg && !aliases.includes(pkg)) aliases.push(pkg);
+  return aliases;
 }
 
 /**
@@ -148,7 +157,9 @@ export function parseExtensionsSpec(
     }
     const isPathEntry = entry.includes("/") || entry.includes("\\") || entry.startsWith("~");
     if (!isPathEntry) {
-      names.add(entry.toLowerCase());
+      const canonical = entry.toLowerCase();
+      names.add(canonical);
+      if (canonical.startsWith("builtin:")) names.add(canonical.slice("builtin:".length));
       continue;
     }
     let p = entry;
@@ -641,6 +652,30 @@ export async function runAgent(
   // (`extensions: true` or a `"*"` wildcard) nor nothing (`noExtensions`).
   const loadAll = extensions === true || extensionsSpec?.wildcard === true;
   const additionalExtensionPaths = extensionsSpec?.paths.length ? extensionsSpec.paths : undefined;
+  const disallowedSet = agentConfig?.disallowedTools
+    ? new Set(agentConfig.disallowedTools)
+    : undefined;
+  const codemodeRequested = toolNames.includes("codemode");
+  const codemodeExcluded = excludeNames.has("codemode") || excludeNames.has("builtin:codemode");
+  const codemodePermitted = codemodeRequested && !noExtensions && !disallowedSet?.has("codemode")
+    && !codemodeExcluded
+    && (loadAll || keepNames.has("codemode") || keepNames.has("builtin:codemode"));
+  // Only opt this SDK-provided built-in into the loader when the child actually
+  // selected it. Otherwise every live extension scope would inherit codemode.
+  const codemodeExtension = codemodePermitted && typeof PiCodingAgent.createCodemodeExtension === "function"
+    ? {
+        name: "codemode",
+        factory: PiCodingAgent.createCodemodeExtension(),
+        builtin: true,
+        replaceable: true,
+      }
+    : undefined;
+  if (codemodePermitted && !codemodeExtension) {
+    options.onToolActivity?.({
+      type: "end",
+      toolName: `tools-error:codemode requested by agent "${type}" but this Pi host does not expose createCodemodeExtension; upgrade the host to a Pi 1.2+ runtime`,
+    });
+  }
   // Pre-filter discovered set, captured by the override — the exclude-typo warning
   // must compare against this, not the surviving set (absence from survivors is
   // an exclude *succeeding*).
@@ -665,6 +700,7 @@ export async function runAgent(
     agentDir,
     noExtensions,
     additionalExtensionPaths,
+    ...(codemodeExtension ? { extensionFactories: [codemodeExtension] } : {}),
     extensionsOverride,
     noSkills,
     noPromptTemplates: true,
@@ -712,7 +748,8 @@ export async function runAgent(
   // flags path-like and "*" entries — excludes are plain names only.
   if (hasExcludes && discoveredNames) {
     for (const name of excludeNames) {
-      if (!discoveredNames.has(name)) {
+      const isKnownSdkBuiltin = name === "codemode" || name === "builtin:codemode";
+      if (!discoveredNames.has(name) && !isKnownSdkBuiltin) {
         options.onToolActivity?.({
           type: "end",
           toolName: `extension-error:exclude_extensions: "${name}" for agent "${type}" did not match any discovered extension`,
@@ -751,10 +788,6 @@ export async function runAgent(
 
   // Resolve thinking level: explicit option > agent config > undefined (inherit)
   const thinkingLevel = options.thinkingLevel ?? agentConfig?.thinking;
-
-  const disallowedSet = agentConfig?.disallowedTools
-    ? new Set(agentConfig.disallowedTools)
-    : undefined;
 
   // Nested tools are built for this session and injected directly. Nested child
   // sessions deliberately do not bind the pi-subagents extension again: doing
@@ -817,6 +850,10 @@ export async function runAgent(
       ...[...nestedToolNames].filter(t => !disallowedSet?.has(t)),
     ];
   } else {
+    // Pi 1.2's codemode extension registers inactive by default. A modifier
+    // activates only this selected tool while preserving the live extension
+    // registry needed by async extension tools.
+    if (codemodeExtension) sessionTools = ["+codemode"];
     const denyTools = new Set<string>(EXCLUDED_TOOL_NAMES.filter(name => !nestedToolNames.has(name)));
     // Keep only the built-ins the agent asked for — deny the rest.
     for (const name of BUILTIN_TOOL_NAMES) {
