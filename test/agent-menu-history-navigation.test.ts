@@ -158,7 +158,7 @@ describe("/agents history navigation", () => {
     expect(selectedRows[1]).toContain("Second history");
   });
 
-  it("keeps Running selection separate from History selection", async () => {
+  it("restores Agent Tree selection separately from all-session History", async () => {
     const cwd = mkdtempSync(join(tmpdir(), "pi-subagents-menu-test-"));
     tempDirectories.push(cwd);
     const first = makeRecord(cwd, "agent-1", "First history", 2);
@@ -194,7 +194,7 @@ describe("/agents history navigation", () => {
     ctx.ui.select = async (title: string, options: string[]) => {
       if (title !== "Agents") return undefined;
       agentsMenuCalls++;
-      if (agentsMenuCalls === 1) return options.find(option => option.startsWith("Running agents ("));
+      if (agentsMenuCalls === 1) return options.find(option => option.startsWith("Agent conversations this session ("));
       if (agentsMenuCalls === 2) return options.find(option => option.startsWith("Agent history all sessions ("));
       return undefined;
     };
@@ -220,7 +220,7 @@ describe("/agents history navigation", () => {
     expect(selectedRows).toHaveLength(3);
     expect(selectedRows[0]).toContain("Live two");
     expect(selectedRows[1]).toContain("Live one");
-    // Running selection does not become the initial History row.
+    // Tree selection does not become the initial all-session History row.
     expect(selectedRows[2]).toContain("First history");
   });
 

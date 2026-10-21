@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-10-21
+
+> **Breaking: direct `Agent` calls now block by default.** Use `run_in_background: true` for explicit detached execution. Scheduled agents, cross-extension RPC spawns, and `TaskExecute` remain detached.
+
+### Fixed
+- **Restored AgentWidget keyboard focus across Pi package boundaries**: keyboard ownership now uses Pi's structural `EditorComponent` contract (`getText`, `setText`, `handleInput`, `render`, and `invalidate`) instead of cross-module class identity, so native editors and compatible wrappers work without allowing SettingsList or non-editor overlays to consume their keys. Existing modal-depth suppression and widget registration/render lifecycle remain unchanged.
+- **Preserved durable agent and workflow transcripts across reloads**: workflow-host children attach mandatory project-local history/transcript metadata before the first checkpoint and attach the optional `.output` mirror when enabled by project or agent `outputTranscript` settings. Parent pre-fork inheritance recovery remains out of scope.
+
+### Changed
+- **Shared workflow Agent Tree observability**: AgentWidget and `/agents → Agent conversations this session` now share a collapsible visible-preorder tree; workflow roots are grouping-only, real workflow agents and nested descendants open their own Agent Views, and `/agents → Workflows` remains the secondary inspector.
+- **Clarified transcript storage controls**: every spawned agent has mandatory project-local `.pi-subagents` history, which keeps Agent View/conversation history reopenable after completion, cleanup, or reload. `output_transcript` frontmatter and `outputTranscript` settings control only the optional OS-temp `.output` mirror; neither changes `Agent`/`TaskExecute` results, `get_subagent_result` results, notifications, join/wait behavior, or what the main agent sees.
+- **Restored explicit Agent execution modes**: omitted and `run_in_background: false` calls wait for a terminal result and return it inline without a completion follow-up; `run_in_background: true` calls return an ID and remain detached. Tool-call values override agent frontmatter defaults, and fresh and resumed calls use the same resolution.
+- **Unified nested Agent/result semantics**: nested agents now expose ownership-scoped `Agent`, `get_subagent_result`, and `steer_subagent` with the same blocking/detached mode resolution as top-level calls; foreign result, resume, and steer requests fail closed.
+- **Made detached result joins cancellable**: `get_subagent_result({ wait: true })` now waits through queued and running states, consumes successful terminal results, and cancels the pending completion notification. Cancelling the wait leaves the child running and its result available. With `wait` omitted or `false`, the call returns immediately: queued or running status checks do not consume the result, while retrieving any terminal result consumes it and cancels the pending notification.
+- **Aligned detached completion delivery with upstream automatic join**: detached completions are joined internally by parent turn, preserving `smart`, compatibility `async`, and `group` modes with the existing 30-second partial and 15-second straggler windows. Blocking results stay inline and out of the notification outbox.
+
+### Removed
+- **Removed public wait-group controls and the nested wait tool**: `subagent_wait_group`, the Agent-level `wait`, `wait_group`, and `wait_group_done` controls are no longer public APIs, and nested `wait_for_nested_agent` was replaced by scoped `get_subagent_result`. The `get_subagent_result({ wait: true })` join remains available; use blocking calls for inline results, or explicitly detach and join by agent ID.
+
 ## [0.17.41] - 2026-10-15
 
 ### Fixed

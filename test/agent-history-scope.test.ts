@@ -21,7 +21,7 @@ function record(over: Partial<AgentRecord> & { id: string }): AgentRecord {
 }
 
 describe("agent history menu scope", () => {
-  it("lists this session's history before the project-wide one", () => {
+  it("lists this session's conversation tree before project-wide history", () => {
     const entries = buildAgentStatusMenuEntries(
       [
         record({ id: "here", sessionId: "session-a" }),
@@ -32,24 +32,24 @@ describe("agent history menu scope", () => {
       "session-a",
     );
 
-    const thisSession = entries.find((e) => e.startsWith("Agent history this session"));
+    const thisSession = entries.find((e) => e.startsWith("Agent conversations this session"));
     const all = entries.find((e) => e.startsWith("Agent history all sessions"));
 
-    expect(thisSession).toBe("Agent history this session (1)");
+    expect(thisSession).toBe("Agent conversations this session (1)");
     // Unattributable records stay reachable through the project-wide entry.
     expect(all).toBe("Agent history all sessions (3)");
     expect(entries.indexOf(thisSession!)).toBeLessThan(entries.indexOf(all!));
   });
 
-  it("omits the this-session entry when nothing belongs to this session", () => {
+  it("omits the current-session tree when nothing belongs to this session", () => {
     const entries = buildAgentStatusMenuEntries([record({ id: "other", sessionId: "session-z" })], undefined, "session-a");
-    expect(entries.some((e) => e.startsWith("Agent history this session"))).toBe(false);
+    expect(entries.some((e) => e.startsWith("Agent conversations this session"))).toBe(false);
     expect(entries.some((e) => e.startsWith("Agent history all sessions"))).toBe(true);
   });
 
   it("falls back to the project-wide entry with no session id", () => {
     const entries = buildAgentStatusMenuEntries([record({ id: "x", sessionId: "a" })], undefined, undefined);
-    expect(entries.some((e) => e.startsWith("Agent history this session"))).toBe(false);
+    expect(entries.some((e) => e.startsWith("Agent conversations this session"))).toBe(false);
     expect(entries.some((e) => e.startsWith("Agent history all sessions"))).toBe(true);
   });
 });

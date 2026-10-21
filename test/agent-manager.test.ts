@@ -1,3 +1,6 @@
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agent-manager.js";
@@ -14,12 +17,16 @@ vi.mock("../src/worktree.js", () => ({
   pruneWorktrees: vi.fn(),
 }));
 
-import { runAgent } from "../src/agent-runner.js";
+import { resumeAgent, runAgent } from "../src/agent-runner.js";
 
 const mockPi = {} as any;
 const mockCtx = { cwd: "/tmp" } as any;
 
-const mockSession = () => ({ dispose: vi.fn() } as any);
+const mockSession = () => ({
+  messages: [],
+  subscribe: vi.fn(() => vi.fn()),
+  dispose: vi.fn(),
+} as any);
 
 const resolvedRun = () =>
   vi.mocked(runAgent).mockResolvedValue({
@@ -72,6 +79,87 @@ describe("AgentManager — result consumption and completion callbacks", () => {
 
     expect(completedRecord).toBeDefined();
     expect(completedRecord!.resultConsumed).toBeFalsy();
+  });
+
+  it("spawnAndWait runs blocking and consumes before onComplete observes the record", async () => {
+    let completedRecord: AgentRecord | undefined;
+    manager = new AgentManager((r) => {
+      completedRecord = r;
+    });
+    resolvedRun();
+
+    const { id, record } = await manager.spawnAndWait(
+      mockPi,
+      mockCtx,
+      "general-purpose",
+      "blocking task",
+      { description: "blocking task" },
+    );
+
+    expect(id).toBe(record.id);
+    expect(record.status).toBe("completed");
+    expect(record.isBackground).toBe(false);
+    expect(record.resultConsumed).toBe(true);
+    expect(completedRecord?.resultConsumed).toBe(true);
+  });
+
+  it("resume applies blocking and detached lifecycle modes", async () => {
+    manager = new AgentManager();
+    const session = mockSession();
+    vi.mocked(runAgent).mockResolvedValue({
+      responseText: "first",
+      session,
+      aborted: false,
+      steered: false,
+    });
+    const id = manager.spawn(mockPi, mockCtx, "general-purpose", "first", {
+      description: "resume me",
+      isBackground: true,
+      bypassQueue: true,
+    });
+    await manager.getRecord(id)!.promise;
+
+    vi.mocked(resumeAgent).mockResolvedValue({ text: "blocking result" });
+    const blocking = await manager.resume(id, "blocking prompt", { isBackground: false });
+    expect(blocking?.isBackground).toBe(false);
+    expect(blocking?.resultConsumed).toBe(true);
+    expect(blocking?.invocation?.runInBackground).toBe(false);
+
+    vi.mocked(resumeAgent).mockResolvedValue({ text: "detached result" });
+    const detached = await manager.resume(id, "detached prompt", { isBackground: true });
+    expect(detached?.isBackground).toBe(true);
+    expect(detached?.resultConsumed).toBe(false);
+    expect(detached?.invocation?.runInBackground).toBe(true);
+  });
+
+  it("does not queue a top-level background spawn for an owned detached resume", async () => {
+    manager = new AgentManager(undefined, 1);
+    const session = mockSession();
+    vi.mocked(runAgent).mockImplementation((_ctx, _type, prompt) => {
+      if (prompt === "owned initial") {
+        return Promise.resolve({ responseText: "first", session, aborted: false, steered: false });
+      }
+      return new Promise(() => {});
+    });
+
+    const ownedId = manager.spawn(mockPi, mockCtx, "general-purpose", "owned initial", {
+      description: "owned child",
+      isBackground: true,
+      parentAgentId: "workflow-1",
+    });
+    await manager.getRecord(ownedId)!.promise;
+
+    vi.mocked(resumeAgent).mockImplementation(() => new Promise(() => {}));
+    void manager.resume(ownedId, "owned resume", { isBackground: true });
+
+    const topLevelId = manager.spawn(mockPi, mockCtx, "general-purpose", "top-level", {
+      description: "top-level child",
+      isBackground: true,
+    });
+
+    expect(manager.getRecord(ownedId)?.isBackground).toBe(true);
+    expect(manager.getRecord(ownedId)?.invocation?.runInBackground).toBe(true);
+    expect(manager.getRecord(topLevelId)?.status).toBe("running");
   });
 });
 
@@ -129,6 +217,72 @@ describe("AgentManager — detached onSpawned + output file wiring (#105)", () =
     await manager.getRecord(id)!.promise;
 
     expect(spawnedId).toBe(id);
+  });
+
+  it("creates durable history before onSpawned and streams it without an output mirror", async () => {
+    manager = new AgentManager();
+    const cwd = mkdtempSync(join(tmpdir(), "pi-agent-manager-history-"));
+    const prompt = "initial prompt";
+    let onEvent: ((event: { type: string }) => void) | undefined;
+    let seenAtSpawned: {
+      historyFile?: string;
+      transcriptPath?: string;
+      historyExists: boolean;
+      historyContents: string;
+      outputFile?: string;
+    } | undefined;
+    const session = {
+      messages: [{ role: "user", content: prompt }],
+      subscribe: vi.fn((handler: (event: { type: string }) => void) => {
+        onEvent = handler;
+        return vi.fn();
+      }),
+      dispose: vi.fn(),
+    } as any;
+
+    vi.mocked(runAgent).mockImplementation(async (_ctx, _type, _prompt, options) => {
+      options.onSessionCreated?.(session);
+      session.messages.push({ role: "assistant", content: "answer" });
+      onEvent?.({ type: "turn_end" });
+      return { responseText: "answer", session, aborted: false, steered: false };
+    });
+
+    try {
+      const id = manager.spawn(mockPi, { ...mockCtx, cwd }, "general-purpose", prompt, {
+        description: "test",
+        isBackground: true,
+        bypassQueue: true,
+        onSpawned: spawnedId => {
+          const record = manager.getRecord(spawnedId)!;
+          seenAtSpawned = {
+            historyFile: record.historyFile,
+            transcriptPath: record.transcriptPath,
+            historyExists: record.historyFile !== undefined && existsSync(record.historyFile),
+            historyContents: record.historyFile ? readFileSync(record.historyFile, "utf8") : "",
+            outputFile: record.outputFile,
+          };
+        },
+      });
+      const record = manager.getRecord(id)!;
+      await record.promise;
+
+      expect(seenAtSpawned).toMatchObject({
+        historyFile: expect.any(String),
+        transcriptPath: expect.stringMatching(/^\.pi-subagents\/agent-transcripts\/[^/]+\.jsonl$/),
+        historyExists: true,
+        outputFile: undefined,
+      });
+      expect(seenAtSpawned?.historyContents).toContain('"content":"initial prompt"');
+      expect(record.historyFile).toBe(seenAtSpawned?.historyFile);
+      expect(record.transcriptPath).toBe(seenAtSpawned?.transcriptPath);
+      expect(record.outputFile).toBeUndefined();
+
+      const entries = readFileSync(record.historyFile!, "utf8").trim().split("\n").map(line => JSON.parse(line));
+      expect(entries).toHaveLength(2);
+      expect(entries.map(entry => entry.message.content)).toEqual([prompt, "answer"]);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
   });
 
   it("onComplete fires on the error path with resultConsumed=true", async () => {
@@ -734,7 +888,7 @@ describe("AgentManager — steer()", () => {
     });
     const id = manager.spawn(mockPi, mockCtx, "X", "p", { description: "r", isBackground: true });
     // Simulate the session becoming ready.
-    captured?.({ steer, dispose: vi.fn() });
+    captured?.({ ...mockSession(), steer });
 
     expect(manager.steer(id, "go left")).toBe(true);
     expect(steer).toHaveBeenCalledWith("go left");

@@ -46,9 +46,18 @@ describe("resolveAgentInvocationConfig", () => {
     expect(resolved.thinking).toBe("high");
     expect(resolved.maxTurns).toBe(42);
     expect(resolved.inheritContext).toBe(false);
-    expect(resolved.runInBackground).toBe(false);
+    expect(resolved.runInBackground).toBe(true);
     expect(resolved.isolated).toBe(false);
     expect(resolved.isolation).toBe("worktree");
+  });
+
+  it("resolves run_in_background as tool call, then frontmatter, then fallback", () => {
+    expect(resolveAgentInvocationConfig(makeConfig({ runInBackground: true }), {}).runInBackground).toBe(true);
+    expect(resolveAgentInvocationConfig(makeConfig({ runInBackground: false }), {}).runInBackground).toBe(false);
+    expect(resolveAgentInvocationConfig(makeConfig({ runInBackground: true }), { run_in_background: false }).runInBackground).toBe(false);
+    expect(resolveAgentInvocationConfig(makeConfig({ runInBackground: false }), { run_in_background: true }).runInBackground).toBe(true);
+    expect(resolveAgentInvocationConfig(undefined, {}, { defaultRunInBackground: true }).runInBackground).toBe(true);
+    expect(resolveAgentInvocationConfig(undefined, {}).runInBackground).toBe(false);
   });
 
   it("uses tool-call params when no agent config is available", () => {

@@ -109,25 +109,21 @@ The same predicate silently scopes the events. **Every lifecycle event is top-le
 
 ## The notification race
 
-When a background agent finishes, pi-subagents sends the user a completion notification. If you have already shown the model that result yourself, that notification arrives on top of an answer that was already given, and it costs the parent a turn to dismiss. `subagents:rpc:consume` is how you say you have handled it — the bus-side half of what `get_subagent_result` does when it returns a result.
+When a background agent finishes, pi-subagents emits the lifecycle event and then decides whether to queue a completion notification. If a synchronous `subagents:rpc:consume` handler marks the record consumed while that event is being dispatched, the completion callback sees `record.resultConsumed` before it calls `CompletionOutbox.add`, so no outbox item is created.
 
-**When you send it decides whether it works.** The timeline:
+If the result is consumed after queueing, consume calls `CompletionOutbox.cancel(id)` to remove that agent from the pending item. For a grouped notification, cancellation removes only that id; if no ids remain, the item is dropped. These are two different race windows — delivery is not governed by one fixed 200 ms window while the parent is busy.
 
-1. The agent settles and `subagents:completed` is emitted — `src/index.ts:581`.
-2. Eleven lines later, at `src/index.ts:592`, the code checks `record.resultConsumed` and decides whether to notify at all.
-3. `pi.events` dispatch is synchronous and in-process, so a handler that emits `subagents:rpc:consume` **without awaiting anything** has already set that flag before step 2 evaluates.
+`CompletionOutbox` is created in `src/index.ts`; individual and group completion paths call `outbox.add`. Delivery then depends on the parent state:
 
-| When you consume | What happens |
-|---|---|
-| Synchronously, inside your `subagents:completed` handler | The notification is never scheduled. This is the clean path |
-| After an `await`, within 200 ms | Still suppressed. The nudge is held for `NUDGE_HOLD_MS` (`src/index.ts:451`), `consume` cancels the pending timer (`:819`), and there is a re-check at send time (`:474`) |
-| After 200 ms | Too late. The follow-up has fired with `triggerTurn: true` and cost the parent a turn |
+- **Busy parent:** the outbox holds completions until a successful `turn_end`, after the current tool batch and before the next model call. An aborted or error turn keeps the items queued; `agent_end` and `agent_settled` arm pending delivery once the run has ended.
+- **Idle parent:** the first completion arms `NOTIFICATION_HOLD_MS` (`src/completion-outbox.ts`), currently 200 ms. Later completions join that hold without extending it.
+- **Send:** the `CompletionOutbox` wiring calls `pi.sendMessage` with `{ deliverAs: "followUp", triggerTurn: true }`, so the flushed notification starts a parent turn.
 
-Fire-and-forget is the intended use: the reply carries nothing to act on, and the channel sits outside the `subagents:rpc:ping` version handshake on purpose (`src/cross-extension-rpc.ts:190`), so you can send it unconditionally and an older pi-subagents with no handler simply keeps notifying.
+The synchronous consume-before-queue behavior depends on the in-process event bus: the lifecycle handler must mark the result consumed before dispatch returns. Once `CompletionOutbox.add` has run, use `outbox.cancel(id)` rather than relying on the first-completion hold to suppress the notification.
 
-Consumption is not terminal. An `@handle` steer un-consumes the record (`src/index.ts:920`) because the agent's reply to that message still needs relaying, and so does a background resume (`src/agent-manager.ts:1135`) because the record is starting a new run.
+Consumption is not terminal. A background resume resets the record's consumed state before starting its new run (`src/agent-manager.ts`, `resume`), so that run can produce another notification.
 
-One related thing that lives nowhere else: on every top-level settle, pi-subagents writes a session entry — not an event — via `pi.appendEntry("subagents:record", …)` (`src/index.ts:585`), carrying `id`, `type`, `description`, `status`, `result`, `error`, `startedAt` and `completedAt`. It exists for cross-extension history reconstruction. It is append-only history, not something to react to.
+Durable checkpoints replaced new `pi.appendEntry("subagents:record", …)` writes. On session start, legacy `subagents:record` entries remain readable, while current records are restored from the manager's durable checkpoints (`src/agent-recovery.ts`; `restoreCompleted` / `restoreRecovered` in `src/index.ts`).
 
 ## The manager registry
 

@@ -69,4 +69,15 @@ describe("orphan nested rows", () => {
     const childLine = lines.find((l) => l.includes("child row"))!;
     expect(childLine).not.toContain("is gone");
   });
+
+  it("renders cyclic records once as safe orphan rows", () => {
+    const cycleA = makeRecord({ id: "cycle-a", description: "cycle alpha", parentAgentId: "cycle-b" });
+    const cycleB = makeRecord({ id: "cycle-b", description: "cycle beta", parentAgentId: "cycle-a" });
+
+    const lines = harness([cycleA, cycleB])();
+
+    expect(lines.filter(line => line.includes("cycle alpha"))).toHaveLength(1);
+    expect(lines.filter(line => line.includes("cycle beta"))).toHaveLength(1);
+    expect(lines.filter(line => line.includes("parent cycle"))).toHaveLength(2);
+  });
 });

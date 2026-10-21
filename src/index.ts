@@ -5,23 +5,23 @@
  *   Agent             — LLM-callable: spawn a sub-agent
  *   get_subagent_result  — LLM-callable: check background agent status/result
  *   steer_subagent       — LLM-callable: send a steering message to a running agent
- *   subagent_wait_group  — LLM-callable: create, update, or seal a wait group
  *
  * Commands:
  *   /agents                 — Interactive agent management menu
  */
 
-import { existsSync, mkdirSync, readFileSync, unlinkSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { defineTool, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, getAgentDir, getSelectListTheme, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
 import { Container, Key, matchesKey, SelectList, type SettingItem, SettingsList, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
-import { agentHistoryLocator, createAgentHistoryPath, readAgentHistory, readAgentHistoryResult } from "./agent-history.js";
-import { buildAgentStatusMenuEntries, canOpenActiveAgent, canOpenAgentHistory, formatAgentHistoryOption, splitAgentRecords } from "./agent-history-list.js";
+import { abortable } from "./abortable.js";
+import { readAgentHistory, readAgentHistoryResult } from "./agent-history.js";
+import { buildAgentStatusMenuEntries, canOpenActiveAgent, canOpenAgentHistory, formatAgentHistoryOption, resolveAgentViewMode, splitAgentRecords } from "./agent-history-list.js";
 import { AgentManager } from "./agent-manager.js";
 import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, normalizeMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, steerAgent } from "./agent-runner.js";
 import { applyNicoOverrides, BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, isDefaultsDisabled, registerAgents, resolveSpawnType, setDefaultsDisabled, setFallbackSubagent } from "./agent-types.js";
-import { completeAgentsArguments } from "./agents-command.js";
+import { CompletionOutbox } from "./completion-outbox.js";
 import { type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
 import { loadCustomAgents } from "./custom-agents.js";
 import { isModelInScope, readEnabledModels, resolveEnabledModels } from "./enabled-models.js";
@@ -31,12 +31,13 @@ import { readLegacySessionRecords } from "./legacy-session-records.js";
 import { type ModelRegistry, resolveModel } from "./model-resolver.js";
 import { isScopeModelsEnabled, setScopeModelsEnabled } from "./model-scope.js";
 import { getMaxSubagentDepth, setMaxSubagentDepth } from "./nested-tools.js";
-import { createOutputFilePath, streamToOutputFile, writeInitialEntry } from "./output-file.js";
+import { createOutputFilePath, writeInitialEntry } from "./output-file.js";
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
 import { applyAndEmitLoaded, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
 import { getStatusNote } from "./status-note.js";
 import { type AgentConfig, type AgentInvocation, type AgentRecord, type JoinMode, type NotificationDetails, type SubagentType, type WidgetMode } from "./types.js";
+import { createAgentTreeMenuState, showAgentTreeMenu } from "./ui/agent-tree-menu.js";
 import {
   type AgentActivity,
   type AgentDetails,
@@ -53,9 +54,20 @@ import {
   type Theme,
   type UICtx,
 } from "./ui/agent-widget.js";
+import { ConversationViewer, createStaticConversationSource, VIEWPORT_HEIGHT_PCT } from "./ui/conversation-viewer.js";
 import { showSchedulesMenu } from "./ui/schedule-menu.js";
+import { renderWorkflowCard } from "./ui/workflow-card.js";
+import { openWorkflowFromFleet, showWorkflowsMenu } from "./ui/workflow-menu.js";
 import { addUsage, getLifetimeTotal, getSessionContextPercent, type LifetimeUsage } from "./usage.js";
-import { WaitGroupManager } from "./wait-group.js";
+import { decideWorkflowCollision } from "./workflow/collisions.js";
+import { createWorkflowHost } from "./workflow/host.js";
+import { appendJournal, readJournal, type WorkflowJournalEntry } from "./workflow/journal.js";
+import { extractMeta, type WorkflowMeta, workflowCallName } from "./workflow/meta.js";
+import { elapsedMs } from "./workflow/progress.js";
+import { MAX_SCRIPT_LENGTH, runWorkflow } from "./workflow/runtime.js";
+import { resolveWorkflowScript } from "./workflow/saved.js";
+import { completeWorkflowTask, createWorkflowTask, failWorkflowTask, formatWorkflowNotification, resolveResumeTarget, toWorkflowTreeRoot, updateWorkflowProgressBatch, type WorkflowTask, workflowResultText, workflowRunId } from "./workflow/task.js";
+import { fullWorkflowToolDescription } from "./workflow/tool-description.js";
 
 // ---- Shared helpers ----
 
@@ -148,6 +160,16 @@ function partialOutputSuffix(record: AgentRecord, fallback?: string): string {
   return partial ? `\n\nPartial output before the failure:\n${partial}` : "";
 }
 
+/** Poll only while a queued record has not acquired its run promise. */
+async function waitForTerminalRecord(record: AgentRecord, signal?: AbortSignal): Promise<void> {
+  while (record.status === "queued" || (record.status === "running" && !record.promise)) {
+    await abortable(new Promise<void>((resolve) => setTimeout(resolve, 25)), signal);
+  }
+  if (record.status === "running" && record.promise) {
+    await abortable(record.promise, signal);
+  }
+}
+
 /** Human-readable status label for agent completion. */
 function getStatusLabel(status: string, error?: string): string {
   switch (status) {
@@ -215,6 +237,31 @@ function buildNotificationDetails(record: AgentRecord, resultMaxLen: number, act
   };
 }
 
+function formatInlineAgentResult(record: AgentRecord): string {
+  if (record.status === "error") {
+    return `Error: ${record.error ?? "unknown error"}${partialOutputSuffix(record)}`;
+  }
+  return record.result?.trim() || "No output.";
+}
+
+function buildInlineAgentDetails(
+  record: AgentRecord,
+  base: Omit<AgentDetails, "toolUses" | "tokens" | "durationMs" | "status" | "turnCount" | "maxTurns" | "error" | "agentId">,
+  activity?: AgentActivity,
+): AgentDetails {
+  return {
+    ...base,
+    agentId: record.id,
+    toolUses: record.toolUses,
+    tokens: formatLifetimeTokens(record),
+    durationMs: record.completedAt ? record.completedAt - record.startedAt : 0,
+    status: record.status,
+    turnCount: activity?.turnCount ?? 0,
+    maxTurns: activity?.maxTurns,
+    error: record.error,
+  };
+}
+
 export default function (pi: ExtensionAPI) {
   // ---- Register custom notification renderer ----
   pi.registerMessageRenderer<NotificationDetails>(
@@ -252,19 +299,16 @@ export default function (pi: ExtensionAPI) {
           line += "\n  " + theme.fg("dim", `⎿  ${preview}`);
         }
 
-        // Line 4: output file link (if present)
+        // Line 4: optional `.output` mirror link (if present)
         if (d.outputFile) {
-          line += "\n  " + theme.fg("muted", `transcript: ${d.outputFile}`);
+          line += "\n  " + theme.fg("muted", `optional .output mirror: ${d.outputFile}`);
         }
 
         return line;
       }
 
       const all = [d, ...(d.others ?? [])];
-      const groupHeader = d.groupSummary
-        ? theme.fg("dim", `Wait group: ${d.groupSummary} (${d.groupId ?? ""})`)
-        : undefined;
-      return new Text([groupHeader, all.map(renderOne).join("\n")].filter(Boolean).join("\n"), 0, 0);
+      return new Text(all.map(renderOne).join("\n"), 0, 0);
     }
   );
 
@@ -281,51 +325,35 @@ export default function (pi: ExtensionAPI) {
   // ---- Agent activity tracking + widget ----
   const agentActivity = new Map<string, AgentActivity>();
 
-  // ---- Cancellable pending notifications ----
-  // Holds notifications briefly so get_subagent_result can cancel them
-  // before they reach pi.sendMessage (fire-and-forget).
-  const pendingNudges = new Map<string, ReturnType<typeof setTimeout>>();
-  const NUDGE_HOLD_MS = 200;
-
-  function scheduleNudge(key: string, send: () => void, delay = NUDGE_HOLD_MS) {
-    cancelNudge(key);
-    pendingNudges.set(key, setTimeout(() => {
-      pendingNudges.delete(key);
-      try { send(); } catch { /* ignore stale completion side-effect errors */ }
-    }, delay));
-  }
-
-  function cancelNudge(key: string) {
-    const timer = pendingNudges.get(key);
-    if (timer != null) {
-      clearTimeout(timer);
-      pendingNudges.delete(key);
-    }
-  }
-
   const resultRetrievalInstruction =
     "Next action: call get_subagent_result once for each <task-id> above, with wait omitted or false, " +
     "to render native expandable Get Subagent Result tool output. Do not pass wait:true.";
 
-  // ---- Individual nudge helper (async join mode) ----
-  function emitIndividualNudge(record: AgentRecord) {
-    if (record.resultConsumed) return;  // re-check at send time
-
-    const notification = formatTaskNotification(record, 500);
-    const footer = record.outputFile ? `\nFull transcript available at: ${record.outputFile}` : '';
-
-    pi.sendMessage<NotificationDetails>({
+  // ---- Completion delivery ----
+  // Every detached completion is queued until the parent's turn boundary or a
+  // short idle hold. Reading the result cancels its pending notification.
+  const outbox = new CompletionOutbox(
+    (message) => pi.sendMessage<NotificationDetails>({
       customType: "subagent-notification",
-      content: `${notification + footer}\n\n${resultRetrievalInstruction}`,
+      content: message.content,
       display: true,
-      details: buildNotificationDetails(record, 500, agentActivity.get(record.id)),
-    }, { deliverAs: "followUp", triggerTurn: true });
-  }
+      details: message.details,
+    }, { deliverAs: "followUp", triggerTurn: true }),
+    () => currentCtx?.signal !== undefined,
+  );
 
   function sendIndividualNudge(record: AgentRecord) {
     agentActivity.delete(record.id);
     widget.markFinished(record.id);
-    scheduleNudge(record.id, () => emitIndividualNudge(record));
+    try {
+      const notification = formatTaskNotification(record, 500);
+      const footer = record.outputFile ? `\nOptional .output mirror available at: ${record.outputFile}` : '';
+      const message = {
+        content: `${notification + footer}\n\n${resultRetrievalInstruction}`,
+        details: buildNotificationDetails(record, 500, agentActivity.get(record.id)),
+      };
+      outbox.add({ ids: [record.id], build: () => message });
+    } catch { /* ignore stale completion side-effect errors */ }
     widget.update();
   }
 
@@ -334,74 +362,35 @@ export default function (pi: ExtensionAPI) {
     (records, partial) => {
       for (const r of records) { agentActivity.delete(r.id); widget.markFinished(r.id); }
 
-      const groupKey = `group:${records.map(r => r.id).join(",")}`;
-      scheduleNudge(groupKey, () => {
-        // Re-check at send time
-        const unconsumed = records.filter(r => !r.resultConsumed);
-        if (unconsumed.length === 0) {
-          widget.update();
-          return;
-        }
+      const members = records.filter(r => !r.resultConsumed).map(r => ({
+        id: r.id,
+        text: formatTaskNotification(r, 300),
+        details: buildNotificationDetails(r, 300, agentActivity.get(r.id)),
+      }));
+      if (members.length > 0) {
+        outbox.add({
+          ids: members.map(m => m.id),
+          build: (ids) => {
+            const unread = members.filter(m => ids.includes(m.id));
+            const notifications = unread.map(m => m.text).join('\n\n');
+            const label = partial
+              ? `${unread.length} agent(s) finished (partial — others still running)`
+              : `${unread.length} agent(s) finished`;
 
-        const notifications = unconsumed.map(r => formatTaskNotification(r, 300)).join('\n\n');
-        const label = partial
-          ? `${unconsumed.length} agent(s) finished (partial — others still running)`
-          : `${unconsumed.length} agent(s) finished`;
-
-        const [first, ...rest] = unconsumed;
-        const details = buildNotificationDetails(first, 300, agentActivity.get(first.id));
-        if (rest.length > 0) {
-          details.others = rest.map(r => buildNotificationDetails(r, 300, agentActivity.get(r.id)));
-        }
-
-        pi.sendMessage<NotificationDetails>({
-          customType: "subagent-notification",
-          content: `Background agent group completed: ${label}\n\n${notifications}\n\n${resultRetrievalInstruction}`,
-          display: true,
-          details,
-        }, { deliverAs: "followUp", triggerTurn: true });
-      });
+            const [first, ...rest] = unread;
+            const details = first.details;
+            if (rest.length > 0) details.others = rest.map(m => m.details);
+            return {
+              content: `Background agent group completed: ${label}\n\n${notifications}\n\n${resultRetrievalInstruction}`,
+              details,
+            };
+          },
+        });
+      }
       widget.update();
     },
     30_000,
   );
-
-  // Explicit wait groups are separate from smart/group join mode: they never
-  // time out or partially deliver, and are released only when sealed.
-  const waitGroups = new WaitGroupManager((groupId, summary, records) => {
-    for (const record of records) {
-      agentActivity.delete(record.id);
-      widget.markFinished(record.id);
-    }
-
-    const groupKey = `wait-group:${groupId}`;
-    scheduleNudge(groupKey, () => {
-      const notifications = records.map(record => {
-        const consumed = record.resultConsumed ? "\n(Result already retrieved via get_subagent_result.)" : "";
-        return formatTaskNotification(record, 300) + consumed;
-      }).join("\n\n");
-      const consumedCount = records.filter(record => record.resultConsumed).length;
-      const consumedNote = consumedCount > 0
-        ? ` ${consumedCount} result${consumedCount === 1 ? " was" : "s were"} already retrieved.`
-        : "";
-      const [first, ...rest] = records;
-      const details = buildNotificationDetails(first, 300, agentActivity.get(first.id));
-      details.groupId = groupId;
-      details.groupSummary = summary;
-      if (rest.length > 0) {
-        details.others = rest.map(record => buildNotificationDetails(record, 300, agentActivity.get(record.id)));
-      }
-
-      pi.sendMessage<NotificationDetails>({
-        customType: "subagent-notification",
-        content: `Background agent wait group completed: ${summary} (group ${groupId}).${consumedNote}\n\n${notifications}\n\n${resultRetrievalInstruction}`,
-        display: true,
-        details,
-      }, { deliverAs: "followUp", triggerTurn: true });
-    });
-    widget.update();
-  });
-
   /** Helper: build event data for lifecycle events from an AgentRecord. */
   function buildEventData(record: AgentRecord) {
     const durationMs = record.completedAt ? record.completedAt - record.startedAt : Date.now() - record.startedAt;
@@ -450,17 +439,6 @@ export default function (pi: ExtensionAPI) {
     // read for sessions recorded before that change, so history written by an
     // older build stays reachable.
 
-    // Explicit wait-group members never emit individual notifications. Result
-    // consumption does not remove membership; the sealed group still delivers
-    // exactly one notification for all terminal members.
-    if (record.waitGroupId) {
-      waitGroups.onAgentComplete(record);
-      agentActivity.delete(record.id);
-      widget.markFinished(record.id);
-      widget.update();
-      return;
-    }
-
     // Skip notification if result was already consumed via get_subagent_result
     if (record.resultConsumed) {
       agentActivity.delete(record.id);
@@ -469,9 +447,9 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    // If this agent is pending batch finalization (debounce window still open),
-    // don't send an individual nudge — finalizeBatch will pick it up retroactively.
-    if (currentBatchAgents.some(a => a.id === record.id)) {
+    // A `group` spawn whose turn has not ended yet: its group is registered at
+    // that turn's end, which picks this completion up retroactively.
+    if (turnGroupSpawns.includes(record.id)) {
       widget.update();
       return;
     }
@@ -566,11 +544,11 @@ export default function (pi: ExtensionAPI) {
   }
 
   type AgentMenuSelection = { id?: string; index: number };
-  let runningAgentSelection: AgentMenuSelection = { index: 0 };
+  let agentTreeMenuState = createAgentTreeMenuState();
   let historyAgentSelection: AgentMenuSelection = { index: 0 };
 
   function resetAgentMenuSelections() {
-    runningAgentSelection = { index: 0 };
+    agentTreeMenuState = createAgentTreeMenuState();
     historyAgentSelection = { index: 0 };
   }
 
@@ -579,6 +557,7 @@ export default function (pi: ExtensionAPI) {
   // bound session_start, so a filtered-out activation never advertises (#142).
   pi.on("session_start", async (_event, ctx) => {
     resetAgentMenuSelections();
+    clearWorkflowTasks();
     currentCtx = ctx;
     manager.clearCompleted(true);
     const sessionId = ctx.sessionManager?.getSessionId?.();
@@ -603,6 +582,7 @@ export default function (pi: ExtensionAPI) {
         pi,
         getCtx: () => currentCtx,
         manager,
+        getOutputTranscript: getOutputTranscriptDefault,
       });
       // Broadcast readiness so extensions loaded alongside us can discover us.
       // Emitting after all factories have run (rather than at factory time)
@@ -610,10 +590,12 @@ export default function (pi: ExtensionAPI) {
       pi.events.emit("subagents:ready", {});
     }
     if (isSchedulingEnabled() && !scheduler.isActive()) startScheduler(ctx);
+    resolveWorkflowCollisions(ctx);
   });
 
   pi.on("session_before_switch", () => {
     resetAgentMenuSelections();
+    clearWorkflowTasks();
     // A switch is catchable. Stop and checkpoint live/queued agents before the
     // old session context is discarded, then retain their unread history.
     manager.abortAll();
@@ -636,11 +618,10 @@ export default function (pi: ExtensionAPI) {
       delete (globalThis as any)[MANAGER_KEY];
     }
     scheduler.stop();
+    clearWorkflowTasks();
     manager.abortAll();
-    for (const timer of pendingNudges.values()) clearTimeout(timer);
-    pendingNudges.clear();
     groupJoin.dispose();
-    waitGroups.dispose();
+    outbox.dispose();
     widget.dispose();
     manager.dispose();
   });
@@ -648,6 +629,9 @@ export default function (pi: ExtensionAPI) {
   // Live widget: show all agents above the editor. Read live at render time.
   let widgetMode: WidgetMode = "all";
   function getWidgetMode(): WidgetMode { return widgetMode; }
+  function getWorkflowRoots() {
+    return [...workflowTasks.values()].map(toWorkflowTreeRoot);
+  }
   const widget = new AgentWidget(
     manager,
     agentActivity,
@@ -659,6 +643,12 @@ export default function (pi: ExtensionAPI) {
         if (ctx) void viewAgentConversation(ctx as ExtensionCommandContext, record, mode);
       },
       getSessionId: () => currentCtx?.sessionManager?.getSessionId?.(),
+      getWorkflowRoots,
+      onOpenWorkflow: (id: string) => {
+        void withModal(async () => {
+          await openWorkflowFromFleet(id, workflowMenuDeps);
+        });
+      },
     },
   );
 
@@ -699,9 +689,11 @@ export default function (pi: ExtensionAPI) {
     widget.update();
   }
 
-  // Project/global default for writing the subagent .output transcript. A custom
-  // agent's `output_transcript` frontmatter overrides this per spawn; when the
-  // frontmatter is silent, this default applies. Read live at spawn time.
+  // Project/global default for writing the optional temporary `.output` mirror.
+  // Durable `.pi-subagents` history is always written by AgentManager. A custom
+  // agent's `output_transcript` frontmatter overrides this mirror setting per
+  // spawn; when the frontmatter is silent, this default applies. Read live at
+  // spawn time.
   let outputTranscriptDefault = true;
   function getOutputTranscriptDefault(): boolean { return outputTranscriptDefault; }
   function setOutputTranscript(b: boolean): void { outputTranscriptDefault = b; }
@@ -749,45 +741,36 @@ export default function (pi: ExtensionAPI) {
   function getToolDescriptionMode(): ToolDescriptionMode { return toolDescriptionMode; }
   function setToolDescriptionMode(mode: ToolDescriptionMode): void { toolDescriptionMode = mode; }
 
-  // ---- Batch tracking for smart join mode ----
-  // Collects background agent IDs spawned in the current turn for smart grouping.
-  // Uses a debounced timer: each new agent resets the 100ms window so that all
-  // parallel tool calls (which may be dispatched across multiple microtasks by the
-  // framework) are captured in the same batch.
-  let currentBatchAgents: { id: string; joinMode: JoinMode }[] = [];
-  let batchFinalizeTimer: ReturnType<typeof setTimeout> | undefined;
-  let batchCounter = 0;
+  // ---- Turn batches for `group` join mode ----
+  // Background spawns made during one parent turn share that turn's boundary.
+  // `smart`/`async` remain individual outbox items; only explicit `group` mode
+  // registers a GroupJoinManager group here.
+  let turnGroupSpawns: string[] = [];
+  let turnGroupCounter = 0;
 
-  /** Finalize the current batch: if 2+ smart-mode agents, register as a group. */
-  function finalizeBatch() {
-    batchFinalizeTimer = undefined;
-    const batchAgents = [...currentBatchAgents];
-    currentBatchAgents = [];
+  function joinTurnGroup(id: string, joinMode: JoinMode | undefined): void {
+    // Outside a parent turn no turn boundary is coming, so a group of one is
+    // delivered like an ordinary completion.
+    if (joinMode === "group" && currentCtx?.signal !== undefined) turnGroupSpawns.push(id);
+  }
 
-    const smartAgents = batchAgents.filter(a => a.joinMode === 'smart' || a.joinMode === 'group');
-    if (smartAgents.length >= 2) {
-      const groupId = `batch-${++batchCounter}`;
-      const ids = smartAgents.map(a => a.id);
-      groupJoin.registerGroup(groupId, ids);
-      // Retroactively process agents that already completed during the debounce window.
-      // Their onComplete fired but was deferred (agent was in currentBatchAgents),
-      // so we feed them into the group now.
-      for (const id of ids) {
-        const record = manager.getRecord(id);
-        if (!record) continue;
-        record.groupId = groupId;
-        if (record.completedAt != null && !record.resultConsumed) {
-          groupJoin.onAgentComplete(record);
-        }
-      }
-    } else {
-      // No group formed — send individual nudges for any agents that completed
-      // during the debounce window and had their notification deferred.
-      for (const { id } of batchAgents) {
-        const record = manager.getRecord(id);
-        if (record?.completedAt != null && !record.resultConsumed) {
-          sendIndividualNudge(record);
-        }
+  function registerTurnGroup(): void {
+    const ids = turnGroupSpawns;
+    turnGroupSpawns = [];
+    if (ids.length < 2) {
+      const record = ids.length === 1 ? manager.getRecord(ids[0]) : undefined;
+      if (record?.completedAt != null && !record.resultConsumed) sendIndividualNudge(record);
+      return;
+    }
+
+    const groupId = `turn-${++turnGroupCounter}`;
+    groupJoin.registerGroup(groupId, ids);
+    for (const id of ids) {
+      const record = manager.getRecord(id);
+      if (!record) continue;
+      record.groupId = groupId;
+      if (record.completedAt != null && !record.resultConsumed) {
+        groupJoin.onAgentComplete(record);
       }
     }
   }
@@ -797,6 +780,15 @@ export default function (pi: ExtensionAPI) {
     widget.setUICtx(ctx.ui as UICtx);
     widget.onTurnStart();
   });
+
+  // The parent's tool batch is done and its next model call not yet made: the
+  // boundary where completions are delivered.
+  pi.on("turn_end", (event) => {
+    registerTurnGroup();
+    outbox.onTurnEnd(event.message.role === "assistant" ? event.message.stopReason : undefined);
+  });
+  pi.on("agent_end", () => outbox.onAgentEnd());
+  pi.on("agent_settled", () => outbox.onAgentEnd());
 
   /** Format an agent's tool scope: "*" when it has all built-ins, else a comma-separated list. */
   const formatToolsSuffix = (cfg: AgentConfig | undefined): string => {
@@ -896,10 +888,10 @@ Custom agents: .pi/agents/<name>.md (project) or ${getAgentDir()}/agents/<name>.
 
 Notes:
 - description: 3-5 words (shown in UI). Prompts must be self-contained — the agent has not seen this conversation.
-- Every Agent call is detached and returns an agent ID immediately. run_in_background is accepted for compatibility but has no effect. You are notified when agents finish — never poll or sleep.
-- For nonblocking grouped notification, add wait: true. Use subagent_wait_group to create/update/seal explicit groups; wait_group_done seals after the final spawn.
-- Results arrive via the completion notification; then call get_subagent_result once per task ID with wait omitted or false to render the native expandable result. The result is not shown inline. Verify an agent's claimed code changes before reporting work done.
-- resume continues a previous agent by ID and is also detached; steer_subagent messages a running one.
+- model, thinking, max_turns, inherit_context, isolated, and isolation only fill fields left unspecified by the selected agent's frontmatter or \`agentOverrides\`; an explicit \`run_in_background\` value overrides its configured default.
+- Agent calls block by default and return the full result inline. Set run_in_background: true to return an agent ID immediately and receive a completion notification instead.
+- Detached results arrive via the completion notification; then call get_subagent_result once per task ID with wait omitted or false to render the native expandable result. Verify an agent's claimed code changes before reporting work done.
+- resume follows the same mode: it blocks by default, or is detached with run_in_background: true; steer_subagent messages a running one.
 - isolation: "worktree" runs the agent in an isolated git worktree; changes land on a branch.`;
 
   const fullAgentToolDescription = `Launch a new agent to handle complex, multi-step tasks autonomously. Each agent type has specific capabilities and tools available to it.
@@ -918,16 +910,14 @@ If the target is already known, use a direct tool — \`read\` for a known path,
 ## Usage notes
 
 - Always include a short (3-5 word) description summarizing what the agent will do (shown in UI).
-- Every Agent call is detached and returns an agent ID immediately. run_in_background is accepted for compatibility but has no effect. When you launch multiple agents for independent work, send them in a single message with multiple tool uses so they run concurrently.
-- Results arrive via the completion notification; call get_subagent_result once per completed task ID with wait omitted or false to render the native expandable result. Agent results are not returned inline — never poll or sleep waiting for them.
-- For nonblocking grouped notification, set wait: true. Omit wait_group for a one-agent implicit group, or create an explicit group with subagent_wait_group and seal it (or set wait_group_done: true on the final Agent call).
+- Agent calls block by default and return the full result inline. Set run_in_background: true to return an agent ID immediately and receive a completion notification instead. When launching detached agents for independent work, send them in a single message with multiple tool uses so they run concurrently.
+- Detached results arrive via the completion notification; call get_subagent_result once per completed task ID with wait omitted or false to render the native expandable result. Blocking results are already returned inline — never poll or sleep waiting for them.
 - Trust but verify: an agent's summary describes what it intended to do, not necessarily what it did. When an agent writes or edits code, check the actual changes before reporting work as done.
 - Use resume with an agent ID to continue a previous agent's work; resume is detached and also returns immediately.
 - Use steer_subagent to send mid-run messages to a running agent.
 - Clearly tell the agent whether you expect it to write code or just to do research (search, file reads, etc.), since it is not aware of the user's intent.
 - If an agent's description says it should be used proactively, try to use it without the user having to ask for it first.
-- Use model to specify a different model (as "provider/modelId", or fuzzy e.g. "haiku", "sonnet").
-- Use thinking to control extended thinking level.
+- model, thinking, max_turns, inherit_context, isolated, and isolation only fill fields left unspecified by the selected agent's frontmatter or \`agentOverrides\`; \`run_in_background\` is the exception, and an explicit tool-call value overrides its configured default.
 - Use inherit_context if the agent needs the parent conversation history.
 - Use isolation: "worktree" to run the agent in an isolated git worktree (safe parallel file modifications). The worktree is automatically cleaned up if the agent makes no changes; otherwise the path and branch are returned in the result.${scheduleGuideline}
 
@@ -999,9 +989,8 @@ Terse command-style prompts produce shallow, generic work.
     promptGuidelines: [
       "Use Agent with specialized agents when the task matches an agent type's description. Subagents are valuable for parallelizing independent queries or for protecting the main context window from excessive results, but should not be used excessively when not needed. Importantly, avoid duplicating work that subagents are already doing — if you delegate research to a subagent, do not also perform the same searches yourself.",
       "For broad codebase exploration or research, spawn Agent with an appropriate subagent_type (e.g. Explore). Otherwise use direct tools (read, grep, find) when the target is already known.",
-      "Every Agent call is detached and returns an agent ID immediately. run_in_background is accepted for compatibility but has no effect; continue with other work instead of waiting.",
-      "Use wait: true to receive one grouped completion notification; create/update/seal explicit groups with subagent_wait_group.",
-      "Results arrive via the completion notification. Then call get_subagent_result once per completed task ID with wait omitted or false before summarizing if the user needs the outputs; this preserves native expandable result UI without blocking.",
+      "Agent calls block by default and return the full result inline; set run_in_background: true for detached execution with an ID-first response and completion notification.",
+      "Detached results arrive via the completion notification. Then call get_subagent_result once per completed task ID with wait omitted or false before summarizing if needed; blocking results are already inline.",
       "Trust but verify: an agent's summary describes intent, not outcome. When an agent writes or edits code, check the actual changes before reporting work as done.",
     ],
     parameters: Type.Object({
@@ -1017,39 +1006,23 @@ Terse command-style prompts produce shallow, generic work.
       model: Type.Optional(
         Type.String({
           description:
-            'Optional model override. Accepts "provider/modelId" or fuzzy name (e.g. "haiku", "sonnet"). Omit to use the agent type\'s default.',
+            'Optional model. Used only when the selected agent\'s frontmatter or agentOverrides leaves model unspecified. Accepts "provider/modelId" or fuzzy name (e.g. "haiku", "sonnet").',
         }),
       ),
       thinking: Type.Optional(
         Type.String({
-          description: `Thinking level: ${THINKING_LEVELS.join(", ")}. Overrides agent default.`,
+          description: `Thinking level: ${THINKING_LEVELS.join(", ")}. Used only when the selected agent's frontmatter or agentOverrides leaves thinking unspecified.`,
         }),
       ),
       max_turns: Type.Optional(
         Type.Number({
-          description: "Maximum number of agentic turns before stopping. Omit for unlimited (default).",
+          description: "Maximum number of agentic turns before stopping. Used only when the selected agent's frontmatter or agentOverrides leaves max_turns unspecified; omit for unlimited.",
           minimum: 1,
         }),
       ),
       run_in_background: Type.Optional(
         Type.Boolean({
-          description: "Accepted for compatibility; it has no effect. Agent calls always detach, return an agent ID immediately, and notify on completion.",
-        }),
-      ),
-      wait: Type.Optional(
-        Type.Boolean({
-          description: "Suppress the individual completion notification and wait for a sealed group notification. This never blocks execution.",
-        }),
-      ),
-      wait_group: Type.Optional(
-        Type.String({
-          minLength: 1,
-          description: "Existing explicit wait-group ID created by subagent_wait_group. Requires wait: true.",
-        }),
-      ),
-      wait_group_done: Type.Optional(
-        Type.Boolean({
-          description: "With wait: true, seal wait_group after this agent is spawned. Use on the final member.",
+          description: "Run detached and return an agent ID immediately. An explicit tool-call value overrides the selected agent's frontmatter or agentOverrides default; when omitted, that default applies.",
         }),
       ),
       resume: Type.Optional(
@@ -1059,17 +1032,17 @@ Terse command-style prompts produce shallow, generic work.
       ),
       isolated: Type.Optional(
         Type.Boolean({
-          description: "If true, agent gets no extension/MCP tools — only built-in tools.",
+          description: "If true, agent gets no extension/MCP tools — only built-in tools. Used only when the selected agent's frontmatter or agentOverrides leaves isolated unspecified.",
         }),
       ),
       inherit_context: Type.Optional(
         Type.Boolean({
-          description: "If true, fork parent conversation into the agent. Default: false (fresh context).",
+          description: "If true, fork parent conversation into the agent. Used only when the selected agent's frontmatter or agentOverrides leaves inherit_context unspecified.",
         }),
       ),
       isolation: Type.Optional(
         Type.Literal("worktree", {
-          description: 'Set to "worktree" to run the agent in a temporary git worktree (isolated copy of the repo). Changes are saved to a branch on completion.',
+          description: 'Set to "worktree" to run the agent in a temporary git worktree (isolated copy of the repo). Used only when the selected agent\'s frontmatter or agentOverrides leaves isolation unspecified; changes are saved to a branch on completion.',
         }),
       ),
       ...scheduleParam,
@@ -1165,7 +1138,7 @@ Terse command-style prompts produce shallow, generic work.
 
     // ---- Execute ----
 
-    execute: async (toolCallId, params, _signal, _onUpdate, ctx) => {
+    execute: async (toolCallId, params, signal, _onUpdate, ctx) => {
       // Ensure we have UI context for widget rendering
       widget.setUICtx(ctx.ui as UICtx);
 
@@ -1227,35 +1200,16 @@ Terse command-style prompts produce shallow, generic work.
 
       const thinking = resolvedConfig.thinking;
       const inheritContext = resolvedConfig.inheritContext;
-      const wait = params.wait === true;
-      const waitGroup = typeof params.wait_group === "string" ? params.wait_group.trim() : undefined;
-      const waitGroupDone = params.wait_group_done === true;
+      const isBackground = resolvedConfig.runInBackground;
       const isolated = resolvedConfig.isolated;
       const isolation = resolvedConfig.isolation;
-      // Whether this spawn writes its .output transcript. Per-agent
-      // frontmatter (`output_transcript`) wins; otherwise the project/global
-      // default applies. `attachTranscript` below is the SOLE gate — every
-      // downstream consumer keys off record.outputFile being set, so no spawn
-      // path can re-enable the transcript by accident.
+      // Whether this spawn writes its optional temporary `.output` mirror.
+      // Durable project-local history is attached by AgentManager for every spawn.
       const outputTranscript = customConfig?.outputTranscript ?? getOutputTranscriptDefault();
       const attachTranscript = (rec: AgentRecord | undefined, agentId: string): void => {
-        if (!rec || !outputTranscript) return;
+        if (!rec || !outputTranscript || rec.outputFile) return;
         rec.outputFile = createOutputFilePath(ctx.cwd, agentId, ctx.sessionManager.getSessionId());
         writeInitialEntry(rec.outputFile, agentId, params.prompt, ctx.cwd);
-
-        try {
-          rec.historyFile = createAgentHistoryPath(ctx.cwd, agentId);
-          rec.transcriptPath = agentHistoryLocator(ctx.cwd, rec.historyFile);
-          writeInitialEntry(rec.historyFile, agentId, params.prompt, ctx.cwd);
-          manager.setTranscript(agentId, rec.historyFile, rec.transcriptPath, ctx.cwd);
-        } catch (err) {
-          rec.historyFile = undefined;
-          rec.transcriptPath = undefined;
-          ctx.ui.notify(
-            `Could not create durable transcript for agent ${agentId}: ${err instanceof Error ? err.message : String(err)}`,
-            "warning",
-          );
-        }
       };
 
       const parentModelId = ctx.model?.id;
@@ -1274,8 +1228,7 @@ Terse command-style prompts produce shallow, generic work.
         maxTurns: normalizeMaxTurns(resolvedConfig.maxTurns),
         isolated,
         inheritContext,
-        // Agent calls are always detached; run_in_background is a compatibility no-op.
-        runInBackground: true,
+        runInBackground: isBackground,
         isolation,
       };
       // Tool-result render shows the mode label too; viewer's header already does.
@@ -1289,16 +1242,6 @@ Terse command-style prompts produce shallow, generic work.
         modelName,
         tags: agentTags.length > 0 ? agentTags : undefined,
       };
-
-      if ((waitGroup || waitGroupDone) && !wait) {
-        return textResult("wait_group and wait_group_done require wait: true.");
-      }
-      if (wait && params.schedule) {
-        return textResult("Cannot combine wait: true with schedule — scheduled jobs are separate future runs.");
-      }
-      if (wait && params.resume) {
-        return textResult("Cannot combine wait: true with resume — wait groups apply to fresh background spawns.");
-      }
 
       // ---- Schedule: register a job, don't spawn now ----
       if (params.schedule) {
@@ -1338,7 +1281,7 @@ Terse command-style prompts produce shallow, generic work.
         }
       }
 
-      // Resume existing agent without blocking the parent tool call.
+      // Resume uses the same resolved mode as a fresh Agent call.
       if (params.resume) {
         const existing = manager.getRecord(params.resume);
         if (!existing) {
@@ -1348,58 +1291,79 @@ Terse command-style prompts produce shallow, generic work.
           return textResult(`Agent "${params.resume}" has no active session to resume.`);
         }
 
-        // A resumed turn has a new unread result and follows the same detached
-        // completion-notification flow as a fresh Agent call.
         existing.resultConsumed = false;
         existing.toolCallId = toolCallId;
-        void manager.resume(params.resume, params.prompt);
-        widget.ensureTimer();
-        widget.update();
+        const resumed = manager.resume(params.resume, params.prompt, {
+          isBackground,
+          ...(isBackground ? {} : { signal }),
+        });
 
+        if (isBackground) {
+          void resumed;
+          widget.ensureTimer();
+          widget.update();
+          return textResult(
+            `Agent resumed in background.\n` +
+            `Agent ID: ${params.resume}\n` +
+            `Type: ${displayName}\n` +
+            `Description: ${params.description}\n\n` +
+            `You will receive a completion notification when this agent finishes.\n` +
+            `Results arrive via that notification; after it, call get_subagent_result with wait omitted or false to render native expandable results.\n` +
+            `Do not duplicate this agent's work.`,
+            { ...detailBase, toolUses: 0, tokens: "", durationMs: 0, status: "background" as const, agentId: params.resume },
+          );
+        }
+
+        const record = await resumed;
+        if (!record) return textResult(`Failed to resume agent "${params.resume}".`);
         return textResult(
-          `Agent resumed in background.\n` +
-          `Agent ID: ${params.resume}\n` +
-          `Type: ${displayName}\n` +
-          `Description: ${params.description}\n\n` +
-          `You will receive a completion notification when this agent finishes.\n` +
-          `Results arrive via that notification; after it, call get_subagent_result with wait omitted or false to render native expandable results.\n` +
-          `Do not duplicate this agent's work.`,
-          { ...detailBase, toolUses: 0, tokens: "", durationMs: 0, status: "background" as const, agentId: params.resume },
+          formatInlineAgentResult(record),
+          buildInlineAgentDetails(record, detailBase),
         );
       }
 
-      // All fresh Agent calls use the detached path. `run_in_background` is
-      // intentionally ignored; bypassQueue preserves the historical behavior
-      // where foreground calls started immediately despite the background cap.
-      const { state: bgState, callbacks: bgCallbacks } = createActivityTracker(effectiveMaxTurns);
+      const { state: activityState, callbacks: activityCallbacks } = createActivityTracker(effectiveMaxTurns);
 
-      // Wrap onSessionCreated to wire output file streaming.
-      // The callback reads the transcript paths installed synchronously by
-      // onSpawned before the agent can queue or start.
-      let id = "";
-      let effectiveWaitGroupId: string | undefined;
-      let implicitWaitGroupId: string | undefined;
-      if (wait) {
-        if (waitGroup) {
-          if (!waitGroups.hasGroup(waitGroup)) {
-            return textResult(`Wait group not found: "${waitGroup}". Create it with subagent_wait_group first.`);
-          }
-          effectiveWaitGroupId = waitGroup;
-        } else {
-          implicitWaitGroupId = waitGroups.create(params.description);
-          effectiveWaitGroupId = implicitWaitGroupId;
+      if (!isBackground) {
+        try {
+          const { id, record } = await manager.spawnAndWait(
+            pi,
+            ctx,
+            subagentType,
+            params.prompt,
+            {
+              description: params.description,
+              model,
+              maxTurns: effectiveMaxTurns,
+              isolated,
+              inheritContext,
+              thinkingLevel: thinking,
+              isolation,
+              invocation: agentInvocation,
+              signal,
+              ...activityCallbacks,
+            },
+            (spawnedId) => attachTranscript(manager.getRecord(spawnedId), spawnedId),
+          );
+          pi.events.emit("subagents:created", {
+            id,
+            type: subagentType,
+            description: params.description,
+            isBackground: false,
+          });
+          return textResult(
+            formatInlineAgentResult(record),
+            buildInlineAgentDetails(record, detailBase, activityState),
+          );
+        } catch (err) {
+          return textResult(err instanceof Error ? err.message : String(err));
         }
       }
-      const joinMode = wait ? undefined : resolveJoinMode(defaultJoinMode, true);
-      const origBgOnSession = bgCallbacks.onSessionCreated;
-      bgCallbacks.onSessionCreated = (session: any) => {
-        origBgOnSession(session);
-        const rec = manager.getRecord(id);
-        if (rec?.outputFile) {
-          rec.outputCleanup = streamToOutputFile(session, rec.outputFile, id, ctx.cwd, rec.historyFile);
-        }
-      };
 
+      // Detached calls return their ID first; completion is delivered through
+      // the existing individual/group notification path.
+      const joinMode = resolveJoinMode(defaultJoinMode, true);
+      let id = "";
       try {
         id = manager.spawn(pi, ctx, subagentType, params.prompt, {
           description: params.description,
@@ -1412,46 +1376,27 @@ Terse command-style prompts produce shallow, generic work.
           bypassQueue: true,
           isolation,
           invocation: agentInvocation,
-          waitGroupId: effectiveWaitGroupId,
           onSpawned: (spawnedId) => {
             id = spawnedId;
             attachTranscript(manager.getRecord(spawnedId), spawnedId);
-            if (effectiveWaitGroupId) waitGroups.addAgent(effectiveWaitGroupId, spawnedId);
           },
-          ...bgCallbacks,
+          ...activityCallbacks,
         });
       } catch (err) {
-        if (effectiveWaitGroupId && id) waitGroups.removeAgent(effectiveWaitGroupId, id);
-        if (implicitWaitGroupId) waitGroups.discard(implicitWaitGroupId);
         return textResult(err instanceof Error ? err.message : String(err));
       }
 
-      // Set join metadata after spawn. Transcript metadata was installed by
-      // the manager's synchronous onSpawned callback before this point.
       const record = manager.getRecord(id);
       if (record && joinMode) {
         record.joinMode = joinMode;
         record.toolCallId = toolCallId;
       }
+      joinTurnGroup(id, joinMode);
 
-      if (effectiveWaitGroupId) {
-        if (implicitWaitGroupId || waitGroupDone) waitGroups.seal(effectiveWaitGroupId);
-      } else if (joinMode == null || joinMode === 'async') {
-        // No join mode or explicit async — not part of any batch.
-      } else {
-        // Smart or group — add to current batch.
-        currentBatchAgents.push({ id, joinMode });
-        // Debounce: reset timer on each new agent so parallel tool calls
-        // dispatched across multiple event loop ticks are captured together.
-        if (batchFinalizeTimer) clearTimeout(batchFinalizeTimer);
-        batchFinalizeTimer = setTimeout(finalizeBatch, 100);
-      }
-
-      agentActivity.set(id, bgState);
+      agentActivity.set(id, activityState);
       widget.ensureTimer();
       widget.update();
 
-      // Emit created event.
       pi.events.emit("subagents:created", {
         id,
         type: subagentType,
@@ -1467,10 +1412,7 @@ Terse command-style prompts produce shallow, generic work.
         `Description: ${params.description}\n` +
         (record?.outputFile ? `Output file: ${record.outputFile}\n` : "") +
         (isQueued ? `Position: queued (max ${manager.getMaxConcurrent()} concurrent)\n` : "") +
-        (effectiveWaitGroupId
-          ? `\nWait group: ${effectiveWaitGroupId}${implicitWaitGroupId || waitGroupDone ? " (sealed)" : " (open — seal it with subagent_wait_group)"}.\n` +
-            `You will receive one grouped completion notification when the sealed wait group completes.\n`
-          : `\nYou will receive a completion notification when this agent completes.\n`) +
+        `\nYou will receive a completion notification when this agent completes.\n` +
         `Results arrive via the completion notification; after it, call get_subagent_result with wait omitted or false to render native expandable results.\n` +
         `Do not duplicate this agent's work.`,
         { ...detailBase, toolUses: 0, tokens: "", durationMs: 0, status: "background" as const, agentId: id },
@@ -1478,74 +1420,6 @@ Terse command-style prompts produce shallow, generic work.
     },
   }));
 
-  // ---- subagent_wait_group tool ----
-
-  pi.registerTool(defineTool({
-    name: SUBAGENT_TOOL_NAMES.WAIT_GROUP,
-    label: "Subagent Wait Group",
-    description:
-      "Create, update, or seal a nonblocking wait group for detached Agent calls. " +
-      "A sealed group sends one completion notification after all member agents finish.",
-    promptSnippet: "Create, update, or seal a grouped subagent completion notification",
-    parameters: Type.Object({
-      action: Type.String({
-        description: "Operation: create, update, or seal.",
-      }),
-      group_id: Type.Optional(Type.String({
-        minLength: 1,
-        description: "Wait group ID. Required for update and seal; optional custom ID for create.",
-      })),
-      summary: Type.Optional(Type.String({
-        minLength: 1,
-        description: "Human-readable group summary. Required for create and update; shown in the eventual notification.",
-      })),
-    }),
-    execute: async (_toolCallId, params) => {
-      const action = String(params.action).trim();
-      const groupId = typeof params.group_id === "string" ? params.group_id.trim() : undefined;
-      const summary = typeof params.summary === "string" ? params.summary.trim() : undefined;
-
-      try {
-        if (action === "create") {
-          if (!summary) return textResult("summary is required when creating a wait group.");
-          const createdId = waitGroups.create(summary, groupId);
-          return textResult(
-            `Created subagent wait group.\n` +
-            `Group ID: ${createdId}\n` +
-            `Summary: ${summary}\n\n` +
-            `Use Agent with wait: true, wait_group: "${createdId}". ` +
-            `Seal the group after adding members. Agent calls are detached automatically.`,
-          );
-        }
-        if (action === "update") {
-          if (!groupId) return textResult("group_id is required when updating a wait group.");
-          if (!summary) return textResult("summary is required when updating a wait group.");
-          waitGroups.update(groupId, summary);
-          return textResult(`Updated subagent wait group ${groupId}.\nSummary: ${summary}`);
-        }
-        if (action === "seal") {
-          if (!groupId) return textResult("group_id is required when sealing a wait group.");
-          const snapshot = waitGroups.getGroup(groupId);
-          const delivered = waitGroups.seal(groupId);
-          if (!snapshot) return textResult(`Wait group not found: "${groupId}".`);
-          if (snapshot.agentIds.length === 0) {
-            return textResult(`Sealed empty subagent wait group ${groupId}. No completion notification will be sent.`);
-          }
-          return textResult(
-            `Sealed subagent wait group ${groupId}.\n` +
-            `Summary: ${snapshot.summary}\n` +
-            `Members: ${snapshot.agentIds.length}\n` +
-            (delivered
-              ? "All members were already complete; notification has been queued."
-              : "You will receive one notification after all members finish."),
-          );
-        }
-        return textResult(`Unknown action "${action}". Use create, update, or seal.`);
-      } catch (err) {
-        return textResult(err instanceof Error ? err.message : String(err));
-      }
-    },
-  }));
 
   // ---- get_subagent_result tool ----
 
@@ -1561,7 +1435,7 @@ Terse command-style prompts produce shallow, generic work.
       }),
       wait: Type.Optional(
         Type.Boolean({
-          description: "Deprecated compatibility flag. Results never block; running agents return current status immediately.",
+          description: "If true, wait cancellably until the agent finishes and return its result. Omit or set false to check immediately.",
         }),
       ),
       verbose: Type.Optional(
@@ -1570,10 +1444,14 @@ Terse command-style prompts produce shallow, generic work.
         }),
       ),
     }),
-    execute: async (_toolCallId, params, _signal, _onUpdate, _ctx) => {
+    execute: async (_toolCallId, params, signal, _onUpdate, _ctx) => {
       const record = manager.getRecord(params.agent_id);
       if (!record) {
         return textResult(`Agent not found: "${params.agent_id}". It may have been cleaned up.`);
+      }
+
+      if (params.wait === true && (record.status === "queued" || record.status === "running")) {
+        await waitForTerminalRecord(record, signal);
       }
 
       const durableResult = !record.result?.trim() && record.transcriptPath && currentCtx?.cwd
@@ -1595,9 +1473,7 @@ Terse command-style prompts produce shallow, generic work.
         `Description: ${record.description}\n\n`;
 
       if (record.status === "running" || record.status === "queued") {
-        output += params.wait
-          ? `Agent is still ${record.status}. wait:true is deprecated and no longer blocks; wait for the background completion notification or check again later.`
-          : `Agent is still ${record.status}. Wait for the background completion notification or check again later.`;
+        output += `Agent is still ${record.status}. Wait for the background completion notification or check again later.`;
       } else if (record.status === "error") {
         output += `Error: ${record.error}${partialOutputSuffix(record, durableResult)}`;
       } else {
@@ -1607,7 +1483,7 @@ Terse command-style prompts produce shallow, generic work.
       // Mark result as consumed — suppresses the completion notification
       if (record.status !== "running" && record.status !== "queued") {
         record.resultConsumed = true;
-        cancelNudge(params.agent_id);
+        outbox.cancel(params.agent_id);
       }
 
       // Verbose: include full conversation
@@ -1675,6 +1551,267 @@ Terse command-style prompts produce shallow, generic work.
     },
   }));
 
+  // ---- SubagentWorkflow tool ----
+
+  /**
+   * Live workflow runs by id, shared by the tree roots, cards, and inspector.
+   *
+   * A workflow is session-owned state, not an AgentRecord; only its real child
+   * agents enter AgentManager.
+   */
+  const workflowTasks = new Map<string, WorkflowTask>();
+  const workflowMenuDeps = {
+    tasks: workflowTasks,
+    getRecord: (id: string) => manager.getRecord(id),
+    viewAgentConversation: (ctx: ExtensionCommandContext, record: AgentRecord) => viewAgentConversation(ctx, record, "live"),
+    getCtx: () => currentCtx as ExtensionCommandContext | undefined,
+  };
+
+  function clearWorkflowTasks(): void {
+    for (const task of workflowTasks.values()) task.abortController.abort();
+    workflowTasks.clear();
+  }
+
+  // Workflows are enabled by default. Collision detection may stand this
+  // feature down for the current session when another extension owns a
+  // workflow tool; user settings can be layered onto these two accessors later.
+  let workflowsEnabled = true;
+  let workflowsPinned = false;
+  function isWorkflowsEnabled(): boolean { return workflowsEnabled; }
+  function isWorkflowsPinned(): boolean { return workflowsPinned; }
+
+  /**
+   * Execute a task without leaking a rejected detached promise. Every path
+   * settles the task, so the menu never leaves a failed run stuck as running.
+   */
+  async function runWorkflowTask(ctx: ExtensionContext, task: WorkflowTask): Promise<void> {
+    try {
+      const result = await runWorkflow({
+        script: task.script,
+        args: task.args,
+        signal: task.abortController.signal,
+        host: createWorkflowHost({
+          pi,
+          ctx,
+          manager,
+          signal: task.abortController.signal,
+          // Real workflow children use the run id as their tree parent; the
+          // grouping-only workflow root itself never enters AgentManager.
+          workflowId: task.id,
+          outputTranscript: getOutputTranscriptDefault(),
+          ...(ctx.sessionManager?.getSessionId?.() ? { rootSessionId: ctx.sessionManager.getSessionId() } : {}),
+        }),
+        onProgress: entries => {
+          updateWorkflowProgressBatch(task, entries);
+          widget.update();
+        },
+        onControl: control => { task.control = control; },
+        journal: {
+          ...(task.replay !== undefined ? { entries: task.replay } : {}),
+          ...(task.journalPath !== undefined
+            ? { append: (entry: WorkflowJournalEntry) => appendJournal(task.journalPath!, entry) }
+            : {}),
+        },
+      });
+      completeWorkflowTask(task, result);
+    } catch (err) {
+      failWorkflowTask(task, err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  function notifyWorkflowFinished(task: WorkflowTask): void {
+    widget.update();
+    const result = workflowResultText(task);
+    const status: NotificationDetails["status"] = task.status === "completed"
+      ? "completed"
+      : task.status === "killed" ? "stopped" : "error";
+    const message = {
+      content: formatWorkflowNotification(task),
+      details: {
+        id: task.id,
+        description: `Workflow ${task.workflowName ?? task.id}`,
+        status,
+        toolUses: task.totalToolCalls,
+        turnCount: 0,
+        totalTokens: task.totalTokens,
+        durationMs: elapsedMs(task, Date.now()),
+        error: task.error,
+        resultPreview: result.length > 500 ? `${result.slice(0, 500)}…` : result,
+      },
+    };
+    outbox.add({ ids: [task.id], build: () => message });
+  }
+
+  const workflowTool = defineTool({
+    name: "SubagentWorkflow",
+    label: "SubagentWorkflow",
+    description: fullWorkflowToolDescription,
+    promptSnippet: "Run a deterministic script that orchestrates many subagents",
+    promptGuidelines: [
+      "Use SubagentWorkflow when the number of agents depends on something discovered at runtime, when work flows through stages, or when findings should be independently verified. Use Agent for one delegated task or a handful you can name up front.",
+      "Prefer `pipeline` over `parallel` — a barrier costs wall-clock whenever the stages are unevenly sized.",
+      "A workflow runs in the background and notifies you when it finishes — do not poll or sleep waiting for it.",
+    ],
+    parameters: Type.Object({
+      script: Type.Optional(Type.String({
+        maxLength: MAX_SCRIPT_LENGTH,
+        description: "Inline workflow source. Must begin with `export const meta = { name, description }`.",
+      })),
+      scriptPath: Type.Optional(Type.String({
+        description: "Path to a workflow script file, absolute or relative to the project. Takes precedence over `script`.",
+      })),
+      name: Type.Optional(Type.String({
+        description: "Name of a saved workflow in `.pi/workflows/`, `.agents/workflows/`, or the agent directory.",
+      })),
+      args: Type.Optional(Type.Any({
+        description: "JSON-shaped value exposed to the script as the global `args`.",
+      })),
+      resumeFromRunId: Type.Optional(Type.String({
+        pattern: "^wf_[a-z0-9-]{6,}$",
+        description: "Run id of an earlier workflow in this session to resume from its journal.",
+      })),
+      title: Type.Optional(Type.String({ description: "Ignored — set the workflow title in the script's `meta` block." })),
+      description: Type.Optional(Type.String({ description: "Ignored — set the workflow description in the script's `meta` block." })),
+    }),
+
+    renderCall(args, theme) {
+      return new Text(
+        `${theme.fg("toolTitle", "▸ ")}${theme.bold(theme.fg("toolTitle", "SubagentWorkflow"))}  ${theme.fg("muted", workflowCallName(args))}`,
+        0,
+        0,
+      );
+    },
+
+    renderResult(result, _options, theme, renderContext) {
+      const text = result.content[0]?.type === "text" ? result.content[0].text : "";
+      const taskId = (result.details as { taskId?: string } | undefined)?.taskId;
+      const task = taskId !== undefined ? workflowTasks.get(taskId) : undefined;
+      if (renderContext.isError || !task) return new Text(text, 0, 0);
+      return renderWorkflowCard(
+        {
+          progress: task.workflowProgress,
+          task: {
+            status: task.status,
+            workflowName: task.workflowName,
+            startTime: task.startTime,
+            endTime: task.endTime,
+            totalPausedMs: task.totalPausedMs,
+          },
+          meta: task.meta,
+          agentCount: task.agentCount,
+          totalTokens: task.totalTokens,
+        },
+        theme,
+      );
+    },
+
+    execute: async (toolCallId, params, _signal, _onUpdate, ctx) => {
+      const resumeFrom = resolveResumeTarget(params.resumeFromRunId, workflowTasks);
+      if (resumeFrom !== undefined && !resumeFrom.ok) return textResult(resumeFrom.message);
+
+      const resolved = resolveWorkflowScript(
+        params.script === undefined && params.scriptPath === undefined && params.name === undefined && resumeFrom !== undefined
+          ? { scriptPath: resumeFrom.scriptPath }
+          : params,
+        ctx.cwd,
+      );
+      if (!resolved.ok) return textResult(resolved.message);
+
+      let meta: WorkflowMeta;
+      try {
+        meta = extractMeta(resolved.script).meta;
+      } catch (err) {
+        return textResult(err instanceof Error ? err.message : String(err));
+      }
+
+      const runId = workflowRunId();
+      let savedPath: string | undefined;
+      let journalPath: string | undefined;
+      try {
+        const sessionId = ctx.sessionManager?.getSessionId?.() ?? "session";
+        const taskDir = dirname(createOutputFilePath(ctx.cwd, runId, sessionId));
+        savedPath = join(taskDir, `${runId}.workflow.js`);
+        writeFileSync(savedPath, resolved.script, "utf-8");
+        journalPath = join(taskDir, `${runId}.workflow.jsonl`);
+      } catch (err) {
+        console.warn(`[pi-subagents] could not persist workflow script: ${err instanceof Error ? err.message : String(err)}`);
+      }
+
+      const replay = resumeFrom !== undefined ? readJournal(resumeFrom.journalPath) : undefined;
+      const task = createWorkflowTask({
+        id: runId,
+        script: resolved.script,
+        scriptPath: resolved.scriptPath ?? savedPath,
+        args: params.args,
+        meta,
+        toolCallId,
+        ...(journalPath !== undefined ? { journalPath } : {}),
+        ...(replay !== undefined && replay.length > 0 ? { replay, resumedFrom: resumeFrom?.runId } : {}),
+      });
+      workflowTasks.set(runId, task);
+
+      // Publish the grouping root before the run starts its first real agent.
+      widget.update();
+      void runWorkflowTask(ctx, task).then(() => notifyWorkflowFinished(task));
+
+      return {
+        content: [{
+          type: "text" as const,
+          text:
+            `Workflow "${meta.name}" started in the background.\n` +
+            `Task ID: ${runId}\n` +
+            (task.scriptPath ? `Script: ${task.scriptPath}\n` : "") +
+            (task.resumedFrom !== undefined
+              ? `Resuming ${task.resumedFrom}: ${task.replay?.length ?? 0} recorded call(s) available to replay.\n`
+              : params.resumeFromRunId !== undefined
+                ? `Nothing to replay from ${params.resumeFromRunId} — every agent runs live.\n`
+                : "") +
+            "\nYou will be notified when it finishes — do NOT poll or sleep waiting for it.\n" +
+            "To iterate, edit the script file and call SubagentWorkflow again with scriptPath.",
+        }],
+        details: { taskId: runId },
+      };
+    },
+  });
+
+  if (isWorkflowsEnabled()) pi.registerTool(workflowTool);
+
+  let collisionsChecked = false;
+  function resolveWorkflowCollisions(ctx: ExtensionContext): void {
+    if (collisionsChecked) return;
+    collisionsChecked = true;
+
+    const warn = (message: string) => {
+      if (ctx.hasUI) ctx.ui.notify(message, "warning");
+      else console.warn(`[pi-subagents] ${message}`);
+    };
+
+    try {
+      if (!isWorkflowsEnabled()) return;
+      const verdict = decideWorkflowCollision({
+        tools: pi.getAllTools(),
+        ownDescription: workflowTool.description,
+        pinned: isWorkflowsPinned(),
+      });
+      if (verdict.kind === "none") return;
+      if (verdict.kind === "report") {
+        warn(verdict.message);
+        return;
+      }
+
+      workflowsEnabled = false;
+      widget.update();
+      warn(verdict.message);
+      if (!verdict.withdraw) return;
+      const active = pi.getActiveTools();
+      if (active.includes("SubagentWorkflow")) {
+        pi.setActiveTools(active.filter(name => name !== "SubagentWorkflow"));
+      }
+    } catch {
+      // getAllTools/setActiveTools are unavailable in some hosts during startup.
+    }
+  }
+
   // ---- /agents interactive menu ----
 
   const projectAgentsDir = () => join(process.cwd(), ".pi", "agents");
@@ -1710,29 +1847,6 @@ Terse command-style prompts produce shallow, generic work.
     return `${label} (→ ${resolvedFull.replace(/-\d{8}$/, "")})`;
   }
 
-  const isRefocusArgument = (args: unknown): boolean => {
-    // pi passes the argument string as the handler's first parameter; be
-    // tolerant of anything else rather than throwing on `/agents` itself.
-    const value = String(args ?? "").trim().toLowerCase();
-    return value === "re-focus" || value === "refocus" || value === "re-register";
-  };
-
-  /**
-   * `/agents re-focus` — rebuild the panel's widget registration.
-   *
-   * The panel registers once and afterwards only calls `requestRender()` on a TUI
-   * reference captured at registration time. If that reference goes stale the
-   * panel silently stops updating and nothing in the normal path revives it.
-   * This clears the registration so the next update re-creates it.
-   *
-   * It does NOT move keyboard focus — pi exposes no such API to extensions — so
-   * the message says what happened instead of implying focus moved.
-   */
-  function refocusAgentsList(ctx: ExtensionCommandContext): void {
-    widget.reRegister();
-    ctx.ui.notify("Re-registered. Still stuck? Esc, then ↓.", "info");
-  }
-
   async function showAgentsMenu(ctx: ExtensionCommandContext) {
     reloadCustomAgents();
     const allNames = getAllTypes();
@@ -1740,11 +1854,17 @@ Terse command-style prompts produce shallow, generic work.
     // Build select options
     const options: string[] = [];
 
-    // Keep active agents and terminal history in separate menu entries.
+    // The shared current-session tree is the primary conversation surface.
     const records = manager.listAgents();
-    const { active, history } = splitAgentRecords(records, ctx.cwd);
+    const { history } = splitAgentRecords(records, ctx.cwd);
     const legacy = await legacyHistoryFor(ctx);
-    options.push(...buildAgentStatusMenuEntries(records, ctx.cwd, ctx.sessionManager?.getSessionId?.(), legacy));
+    options.push(...buildAgentStatusMenuEntries(
+      records,
+      ctx.cwd,
+      ctx.sessionManager?.getSessionId?.(),
+      legacy,
+      workflowTasks.size > 0,
+    ));
 
     // Agent types list
     if (allNames.length > 0) {
@@ -1757,14 +1877,15 @@ Terse command-style prompts produce shallow, generic work.
       options.push(`Scheduled jobs (${jobCount})`);
     }
 
+    if (isWorkflowsEnabled()) {
+      options.push(`Workflows (${workflowTasks.size})`);
+    }
+
     // Actions
-    // Only offered while the panel is actually in a state it cannot recover
-    // from on its own, so this is a fix rather than permanent menu clutter.
-    options.push("Re-focus agents list");
     options.push("Create new agent");
     options.push("Settings");
 
-    const noAgentsMsg = allNames.length === 0 && active.length === 0 && history.length === 0
+    const noAgentsMsg = allNames.length === 0 && records.length === 0 && history.length === 0
       ? "No agents found. Create specialized subagents that can be delegated to.\n\n" +
         "Each subagent has its own context window, custom system prompt, and specific tools.\n\n" +
         "Try creating: Code Reviewer, Security Auditor, Test Writer, or Documentation Writer.\n\n"
@@ -1777,11 +1898,8 @@ Terse command-style prompts produce shallow, generic work.
     const choice = await withModal(() => ctx.ui.select("Agents", options));
     if (!choice) return;
 
-    if (choice.startsWith("Running agents (")) {
-      await showRunningAgents(ctx);
-      await showAgentsMenu(ctx);
-    } else if (choice.startsWith("Agent history this session (")) {
-      await showAgentHistory(ctx, "this-session");
+    if (choice.startsWith("Agent conversations this session (")) {
+      await showAgentConversations(ctx);
       await showAgentsMenu(ctx);
     } else if (choice.startsWith("Agent history all sessions (")) {
       await showAgentHistory(ctx, "all-sessions");
@@ -1790,10 +1908,10 @@ Terse command-style prompts produce shallow, generic work.
       await showAllAgentsList(ctx);
       await showAgentsMenu(ctx);
     } else if (choice.startsWith("Scheduled jobs (")) {
-      await showSchedulesMenu(ctx, scheduler);
+      await withModal(() => showSchedulesMenu(ctx, scheduler));
       await showAgentsMenu(ctx);
-    } else if (choice === "Re-focus agents list") {
-      refocusAgentsList(ctx);
+    } else if (choice.startsWith("Workflows (")) {
+      await withModal(() => showWorkflowsMenu(ctx, workflowMenuDeps));
       await showAgentsMenu(ctx);
     } else if (choice === "Create new agent") {
       await showCreateWizard(ctx);
@@ -1944,26 +2062,35 @@ Terse command-style prompts produce shallow, generic work.
     return pairs.find(({ record }) => record.id === choice)?.record;
   }
 
-  async function showRunningAgents(ctx: ExtensionCommandContext) {
-    const { active: agents } = splitAgentRecords(manager.listAgents(), ctx.cwd);
-    if (agents.length === 0) {
-      ctx.ui.notify("No agents.", "info");
-      return;
+  async function showAgentConversations(ctx: ExtensionCommandContext) {
+    while (true) {
+      const selection = await withModal(() => showAgentTreeMenu(
+        ctx,
+        () => ({
+          agents: manager.listAgents(),
+          workflowRoots: getWorkflowRoots(),
+          sessionId: ctx.sessionManager?.getSessionId?.(),
+          resolveViewMode: record => resolveAgentViewMode(record, ctx.cwd),
+        }),
+        agentTreeMenuState,
+      ));
+      if (selection === undefined) return;
+
+      if (selection.kind === "workflow") {
+        await withModal(async () => {
+          await openWorkflowFromFleet(selection.id, workflowMenuDeps);
+        });
+        continue;
+      }
+
+      const record = manager.getRecord(selection.id);
+      const mode = record === undefined ? undefined : resolveAgentViewMode(record, ctx.cwd);
+      if (record === undefined || mode === undefined) {
+        ctx.ui.notify("No conversation available for that agent.", "info");
+        continue;
+      }
+      await viewAgentConversation(ctx, record, mode);
     }
-
-    const pairs = agents.map((record) => {
-      const dn = getDisplayName(record.type);
-      const dur = formatDuration(record.startedAt, record.completedAt);
-      return { record, label: `${dn} (${record.description}) · ${record.toolUses} tools · ${record.status} · ${dur}` };
-    });
-    makeUniqueAgentOptionLabels(pairs);
-
-    const record = await selectAgentFromReadOnlyList(ctx, "Running agents", pairs, runningAgentSelection);
-    if (!record) return;
-
-    await viewAgentConversation(ctx, record, "live");
-    // Back-navigation: re-show the list at the previously selected agent.
-    await showRunningAgents(ctx);
   }
 
   async function showAgentHistory(ctx: ExtensionCommandContext, scope: "this-session" | "all-sessions" = "all-sessions") {
@@ -2019,7 +2146,6 @@ Terse command-style prompts produce shallow, generic work.
       return;
     }
 
-    const { ConversationViewer, VIEWPORT_HEIGHT_PCT, createStaticConversationSource } = await import("./ui/conversation-viewer.js");
     const session = mode === "live"
       ? record.session
       : (() => {
@@ -2093,7 +2219,6 @@ Terse command-style prompts produce shallow, generic work.
       const content = readFileSync(file.path, "utf-8");
       const edited = await withModal(() => ctx.ui.editor(`Edit ${name}`, content));
       if (edited !== undefined && edited !== content) {
-        const { writeFileSync } = await import("node:fs");
         writeFileSync(file.path, edited, "utf-8");
         reloadCustomAgents();
         ctx.ui.notify(`Updated ${file.path}`, "info");
@@ -2164,7 +2289,6 @@ Terse command-style prompts produce shallow, generic work.
 
     const content = `---\n${fmFields.join("\n")}\n---\n\n${cfg.systemPrompt}\n`;
 
-    const { writeFileSync } = await import("node:fs");
     writeFileSync(targetPath, content, "utf-8");
     reloadCustomAgents();
     ctx.ui.notify(`Ejected ${name} to ${targetPath}`, "info");
@@ -2181,7 +2305,6 @@ Terse command-style prompts produce shallow, generic work.
         return;
       }
       const updated = content.replace(/^---\n/, "---\nenabled: false\n");
-      const { writeFileSync } = await import("node:fs");
       writeFileSync(file.path, updated, "utf-8");
       reloadCustomAgents();
       ctx.ui.notify(`Disabled ${name} (${file.path})`, "info");
@@ -2199,7 +2322,6 @@ Terse command-style prompts produce shallow, generic work.
     mkdirSync(targetDir, { recursive: true });
 
     const targetPath = join(targetDir, `${name}.md`);
-    const { writeFileSync } = await import("node:fs");
     writeFileSync(targetPath, "---\nenabled: false\n---\n", "utf-8");
     reloadCustomAgents();
     ctx.ui.notify(`Disabled ${name} (${targetPath})`, "info");
@@ -2212,7 +2334,6 @@ Terse command-style prompts produce shallow, generic work.
 
     const content = readFileSync(file.path, "utf-8");
     const updated = content.replace(/^(---\n)enabled: false\n/, "$1");
-    const { writeFileSync } = await import("node:fs");
 
     // If the file was just a stub ("---\n---\n"), delete it to restore the built-in default
     if (updated.trim() === "---\n---" || updated.trim() === "---\n---\n") {
@@ -2283,8 +2404,8 @@ extensions: <true (inherit all MCP/extension tools), false (none), or comma-sepa
 skills: <true (inherit all), false (none), or comma-separated skill names to preload into prompt. Default: true>
 disallowed_tools: <comma-separated tool names to block, even if otherwise available. Omit for none>
 inherit_context: <true to fork parent conversation into agent so it sees chat history. Default: false>
-run_in_background: <accepted for compatibility; has no effect>
-output_transcript: <false to write no transcript file or path for this agent. Independent of persist_session. Default: true>
+run_in_background: <optional default mode: true detaches and returns an ID; false blocks and returns the result inline. Omit for false/blocking. An explicit Agent tool-call value overrides this default>
+output_transcript: <false to omit this agent's optional temporary .output mirror. Durable .pi-subagents history is always written. Default: true>
 isolated: <true for no extension/MCP tools, only built-in tools. Default: false>
 memory: <"user" (global), "project" (per-project), or "local" (gitignored per-project) for persistent memory. Omit for none>
 isolation: <"worktree" to run in isolated git worktree. Omit for normal>
@@ -2300,7 +2421,7 @@ Guidelines for choosing settings:
 - Use prompt_mode: replace for fully custom agents with their own personality/instructions
 - Set inherit_context: true if the agent needs to know what was discussed in the parent conversation
 - Set isolated: true if the agent should NOT have access to MCP servers or other extensions
-- Set output_transcript: false to skip writing this agent's transcript; this alone doesn't keep the run off disk (persist_session, isolation: worktree commits, and memory still write) — set those too if that's the goal
+- Set output_transcript: false to skip only this agent's optional temporary .output mirror; durable .pi-subagents history still records the run. This alone doesn't keep the run off disk (persist_session, isolation: worktree commits, and memory still write) — set those too if that's the goal
 - Only include frontmatter fields that differ from defaults — omit fields where the default is fine
 
 Write the file using the write tool. Only write the file, nothing else.`;
@@ -2409,7 +2530,6 @@ ${systemPrompt}
       if (!overwrite) return;
     }
 
-    const { writeFileSync } = await import("node:fs");
     writeFileSync(targetPath, content, "utf-8");
     reloadCustomAgents();
     ctx.ui.notify(`Created ${targetPath}`, "info");
@@ -2501,8 +2621,8 @@ ${systemPrompt}
         },
         {
           id: "outputTranscript",
-          label: "Output transcript",
-          description: "Write each subagent's .output transcript by default. A custom agent's output_transcript frontmatter overrides this.",
+          label: "Optional output mirror",
+          description: "Write each subagent's temporary .output mirror by default. Durable .pi-subagents history is always written; output_transcript frontmatter overrides this mirror setting.",
           currentValue: getOutputTranscriptDefault() ? "on" : "off",
           values: ["on", "off"],
         },
@@ -2577,7 +2697,7 @@ ${systemPrompt}
       } else if (id === "outputTranscript") {
         const enabled = value === "on";
         setOutputTranscript(enabled);
-        notifyApplied(ctx, `Output transcript ${enabled ? "enabled" : "disabled"} by default`);
+        notifyApplied(ctx, `Optional .output mirror ${enabled ? "enabled" : "disabled"} by default`);
       } else if (id === "toolDescriptionMode") {
         setToolDescriptionMode(value as ToolDescriptionMode);
         notifyApplied(ctx, `Tool description set to ${value}. Takes effect on next pi session.`);
@@ -2676,13 +2796,8 @@ ${systemPrompt}
   }
 
   pi.registerCommand("agents", {
-    description: "Manage agents, or re-focus the list with /agents re-focus",
-    getArgumentCompletions: (prefix) => completeAgentsArguments(prefix),
-    handler: async (args, ctx) => {
-      if (isRefocusArgument(args)) {
-        refocusAgentsList(ctx);
-        return;
-      }
+    description: "Manage agents",
+    handler: async (_args, ctx) => {
       await showAgentsMenu(ctx);
     },
   });

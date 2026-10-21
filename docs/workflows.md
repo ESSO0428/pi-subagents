@@ -68,11 +68,11 @@ A **card in the transcript**, updating as the run goes:
   ⎿  auditing 6 route files
 ```
 
-A **`workflow` row in FleetView**, above the agents, carrying its agent counts where a description would go. `⏎` on it opens the inspector rather than a conversation overlay.
+A **workflow root in the shared Agent Tree**, above the run's agents, carries its agent counts where a description would go. It is a grouping-only row, never an `AgentManager` record; `⏎` on it opens the inspector rather than a conversation overlay. The root is expanded by default, while an explicit collapse remains authoritative as children appear. The run's real agents and nested descendants appear beneath it in visible preorder and remain individually selectable and openable. The row stays in the roster after the run settles — a finished run is the state you most want to open.
 
 Each row names the model the child *actually* ran on — read back from its session once pi has resolved its defaults, not the string the script asked for — so a fuzzy `model: "haiku"` reads as the model it resolved to, and an `agent()` that named no model still says what it inherited.
 
-The **inspector**, at `/agents → Workflows` — two panes, two levels: phases on the left, that phase's agents on the right, and `⏎` to descend into one agent's prompt, activity and outcome. The detail pane has room for the canonical `provider/model-id` and the thinking level, including a level pi clamped (`thinking: low (asked max)`). The full key table is in [the README](../README.md#commands); the four that change the run rather than the view are:
+The **secondary inspector**, at `/agents → Workflows` — two panes, two levels: phases on the left, that phase's agents on the right, and `⏎` to descend into one agent's prompt, activity and outcome. It is the run-progress/control surface; the shared Agent Tree remains the primary observability and navigation surface for real agents. The detail pane has room for the canonical `provider/model-id` and the thinking level, including a level pi clamped (`thinking: low (asked max)`). The full key table is in [the README](../README.md#commands); the four that change the run rather than the view are:
 
 | Key | |
 |---|---|
@@ -91,7 +91,7 @@ The fifth key only shows you something:
 
 Because it changes nothing, `c` works at both levels and on an agent that has already settled — which is the usual case, since reading what a child did is most of why the inspector gets opened. The dialog hides itself while the conversation is up and comes back when you close it. A row with no child behind it yet (queued, or replayed from the resume journal) has no conversation to open and does not offer the key.
 
-A run's own agents are not listed separately in the fleet list, the widget, the `/agents` menus or `@handle` resolution — they belong to the run, which reports for them. `c` in the inspector is the one way in to a child's conversation.
+A run's agents are real Agent Tree rows, not progress/task replacements. The run parents them to its own id, so they nest under the workflow root and can be walked to with `↑`/`↓` and opened with `⏎` while they work — the same shape as a nested subtree, and the reason the run is observable rather than opaque. The same projection is used by `/agents → Agent conversations this session`: `⏎` on a child opens that child's own Agent View, while `⏎` on the workflow root opens the secondary inspector. The run row reports the totals (`1/1 agents`); it does not stand in for its children.
 
 ### 4. Edit and re-run
 
@@ -243,12 +243,28 @@ Spawns one subagent and resolves to its final text — or, with `schema`, to a v
 | `effort` | string | `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Omitted, the agent definition's own `thinking` decides, then the parent's |
 | `isolation` | `"worktree"` | Run in a throwaway git worktree. Only when agents write files in parallel and would collide — it costs setup time and disk per agent |
 | `gate` | string | A shell command run after the agent finishes; a non-zero exit fails the agent and its output becomes the error |
+| `run_in_background` | boolean | Detach this `agent()` call instead of waiting for it. The call resolves immediately with the child's id while the agent keeps working. Defaults to `false` — a script that awaits the agent gets its answer, which is what almost every script wants. Reach for it when a fan-out should keep several children moving and collect the answers once, with `waitForAgent` |
 | `resume` | string | Continue the child that ran under that label instead of starting fresh |
 | `schema` | object | A JSON Schema with an object root. Resolves to the validated object instead of text |
 
 Any other key is rejected **by name** at the call. Note that this checks option *keys*, not option *values* — an `agentType` that names no known agent falls back to `general-purpose` silently.
 
-Combination rules: `resume` cannot be combined with `agentType`, `model`, `effort`, `isolation`, `gate` or `schema` — a resumed child keeps the agent type, model and tree it was started with, and its session predates the `StructuredOutput` tool.
+Combination rules: `resume` cannot be combined with `agentType`, `model`, `effort`, `isolation`, `gate` or `schema` — a resumed child keeps the agent type, model and tree it was started with, and its session predates the `StructuredOutput` tool. `run_in_background` cannot be combined with `gate`: a gate exists to decide whether the result is acceptable, and a detached call has no result to judge yet.
+
+### `waitForAgent(agentId)`
+
+Collects the result of an agent launched with `run_in_background: true`. It blocks until that child finishes and resolves to its final text — the same value the blocking `agent()` call would have returned — or throws if the id names no agent.
+
+Detaching without collecting is how a run ends while its children are still working, so a fan-out that wants its answers assembled waits at the end:
+
+```js
+const ids = await parallel(items.map(item => () =>
+  agent(`Review ${item}`, { run_in_background: true }),
+));
+const reviews = await parallel(ids.map(id => () => waitForAgent(id)));
+```
+
+A detached launch is **not** reported as a finished agent: until it is collected the run counts it as still running, so the header line never claims a child is done while it is still working.
 
 ### `pipeline()` and `parallel()`
 

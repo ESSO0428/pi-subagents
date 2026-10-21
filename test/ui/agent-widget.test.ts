@@ -1,4 +1,3 @@
-import { Editor } from "@earendil-works/pi-tui";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../../src/agent-manager.js";
 import type { AgentRecord } from "../../src/types.js";
@@ -17,6 +16,16 @@ const theme: Theme = {
 };
 
 const managers: AgentManager[] = [];
+
+function createEditorComponent() {
+  return {
+    getText: () => "",
+    setText: () => {},
+    handleInput: () => {},
+    render: () => [],
+    invalidate: () => {},
+  };
+}
 
 afterEach(() => {
   for (const manager of managers.splice(0)) manager.dispose();
@@ -86,7 +95,7 @@ function createNavigableWidgetHarness(
   const tui = {
     terminal: { columns: 120, rows: overrides.rows ?? 24 },
     requestRender: vi.fn(),
-    focusedComponent: Object.create(Editor.prototype) as Editor,
+    focusedComponent: createEditorComponent(),
   };
   let factory: ((tui: any, theme: Theme) => { render(): string[]; invalidate(): void }) | undefined;
   const ui = {
@@ -190,7 +199,35 @@ describe("AgentWidget live records", () => {
     expect(getWidgetLineBudget(100)).toBe(MAX_WIDGET_LINES);
   });
 
-  it("does not request a render when a live snapshot is unchanged", () => {
+  it("keeps the agents widget above the editor", () => {
+    const running = makeRecord({ id: "running", status: "running", completedAt: undefined });
+    const { widget, ui } = createWidgetHarness([running]);
+
+    expect(ui.setWidget).toHaveBeenCalledWith(
+      "agents",
+      expect.any(Function),
+      { placement: "aboveEditor" },
+    );
+    widget.dispose();
+  });
+
+  it("forces a redraw for event-driven state changes", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(10_000);
+    try {
+      const running = makeRecord({ id: "running", status: "running", completedAt: undefined });
+      const { widget, tui } = createWidgetHarness([running]);
+
+      running.description = "changed description";
+      widget.update();
+      expect(tui.requestRender).toHaveBeenCalledWith(true);
+      widget.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not redraw when render keys are unchanged", () => {
     vi.useFakeTimers();
     vi.setSystemTime(10_000);
     try {
@@ -198,11 +235,24 @@ describe("AgentWidget live records", () => {
       const { widget, tui } = createWidgetHarness([running]);
 
       widget.update();
-      expect(tui.requestRender).not.toHaveBeenCalled();
 
-      running.description = "changed description";
-      widget.update();
-      expect(tui.requestRender).toHaveBeenCalledTimes(1);
+      expect(tui.requestRender).not.toHaveBeenCalled();
+      widget.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("uses incremental rendering for spinner-only updates", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(10_000);
+    try {
+      const running = makeRecord({ id: "running", status: "running", completedAt: undefined });
+      const { widget, tui } = createWidgetHarness([running]);
+
+      widget.update(true);
+
+      expect(tui.requestRender).toHaveBeenCalledWith(false);
       widget.dispose();
     } finally {
       vi.useRealTimers();
@@ -328,20 +378,20 @@ describe("AgentWidget live records", () => {
     harness.input("\u001b[B");
     for (let index = 0; index < queued.length; index++) harness.input("\u001b[B");
     harness.render();
-    const selectedId = (harness.widget as any).selectedAgentId;
+    const selectedKey = (harness.widget as any).selectedNodeKey;
     const viewportStart = (harness.widget as any).viewportStart;
-    expect(selectedId).toBe("queued-7");
+    expect(selectedKey).toBe("agent:queued-7");
     expect(viewportStart).toBeGreaterThan(0);
 
     // A non-navigation key exits without discarding either piece of state.
     expect(harness.input("j")).toBeUndefined();
     expect((harness.widget as any).navigationActive).toBe(false);
-    expect((harness.widget as any).selectedAgentId).toBe(selectedId);
+    expect((harness.widget as any).selectedNodeKey).toBe(selectedKey);
     expect((harness.widget as any).viewportStart).toBe(viewportStart);
 
     harness.input("\u001b[B");
     expect((harness.widget as any).navigationActive).toBe(true);
-    expect((harness.widget as any).selectedAgentId).toBe(selectedId);
+    expect((harness.widget as any).selectedNodeKey).toBe(selectedKey);
     expect((harness.widget as any).viewportStart).toBe(viewportStart);
     expect(harness.render().join("\n")).toContain("queued target 7");
     harness.widget.dispose();
@@ -358,16 +408,16 @@ describe("AgentWidget live records", () => {
 
     harness.input("\u001b[B");
     harness.input("\u001b[B");
-    expect((harness.widget as any).selectedAgentId).toBe("selected");
+    expect((harness.widget as any).selectedNodeKey).toBe("agent:selected");
 
     records.splice(1, 1);
     harness.widget.update();
-    expect((harness.widget as any).selectedAgentId).toBe("next");
+    expect((harness.widget as any).selectedNodeKey).toBe("agent:next");
 
     harness.input("\u001b[B");
     records.splice(2, 1);
     harness.widget.update();
-    expect((harness.widget as any).selectedAgentId).toBe("next");
+    expect((harness.widget as any).selectedNodeKey).toBe("agent:next");
     harness.widget.dispose();
   });
 
@@ -462,11 +512,88 @@ describe("AgentWidget live records", () => {
 
     harness.input("\u001b[B");
     harness.input("\u001b[B");
-    expect((harness.widget as unknown as { selectedAgentId?: string }).selectedAgentId).toBe("child");
+    expect((harness.widget as unknown as { selectedNodeKey?: string }).selectedNodeKey).toBe("agent:child");
     const selectedChild = harness.render().find(line => line.includes("child"));
     expect(selectedChild).toMatch(/^ {3}└─/);
     harness.input("\r");
     expect(opened).toEqual(["child"]);
+    harness.widget.dispose();
+  });
+
+  it("expands by default and navigates collapse state with left and right", () => {
+    const records = [
+      makeRecord({ id: "parent", description: "parent", status: "running", completedAt: undefined }),
+      makeRecord({ id: "child", description: "child", status: "running", completedAt: undefined, parentAgentId: "parent" }),
+      makeRecord({ id: "sibling", description: "sibling", status: "queued", completedAt: undefined }),
+    ];
+    const harness = createNavigableWidgetHarness(records);
+
+    expect(harness.render().find(line => line.includes("parent"))).toContain("▾");
+    expect(harness.render().join("\n")).toContain("child");
+
+    harness.input("\u001b[B");
+    expect((harness.widget as any).selectedNodeKey).toBe("agent:parent");
+    expect(harness.input("\u001b[D")).toEqual({ consume: true });
+    expect(harness.render().find(line => line.includes("parent"))).toContain("▸");
+    expect(harness.render().join("\n")).not.toContain("child");
+
+    harness.input("\u001b[B");
+    expect((harness.widget as any).selectedNodeKey).toBe("agent:sibling");
+    harness.input("\u001b[A");
+    expect((harness.widget as any).selectedNodeKey).toBe("agent:parent");
+    expect(harness.input("\u001b[C")).toEqual({ consume: true });
+    expect(harness.render().join("\n")).toContain("child");
+
+    harness.input("\u001b[B");
+    expect((harness.widget as any).selectedNodeKey).toBe("agent:child");
+    harness.input("\u001b[D");
+    expect((harness.widget as any).selectedNodeKey).toBe("agent:parent");
+    harness.widget.dispose();
+  });
+
+  it("keeps newly added descendants hidden under a collapsed row", () => {
+    const records = [
+      makeRecord({ id: "parent", description: "parent", status: "running", completedAt: undefined }),
+      makeRecord({ id: "first", description: "first child", status: "running", completedAt: undefined, parentAgentId: "parent" }),
+    ];
+    const harness = createNavigableWidgetHarness(records);
+
+    harness.input("\u001b[B");
+    harness.input("\u001b[D");
+    records.push(makeRecord({
+      id: "new",
+      description: "new child",
+      status: "running",
+      completedAt: undefined,
+      parentAgentId: "parent",
+    }));
+    harness.widget.update();
+
+    const collapsed = harness.render().join("\n");
+    expect(collapsed).not.toContain("first child");
+    expect(collapsed).not.toContain("new child");
+    expect((harness.widget as any).collapsedKeys).toEqual(new Set(["agent:parent"]));
+    harness.widget.dispose();
+  });
+
+  it("scopes collapse state to the current session", () => {
+    let sessionId = "s1";
+    const records = [
+      makeRecord({ id: "parent", description: "parent", status: "running", completedAt: undefined, sessionId }),
+      makeRecord({ id: "child", description: "child", status: "running", completedAt: undefined, parentAgentId: "parent", sessionId }),
+    ];
+    const harness = createNavigableWidgetHarness(records, { getSessionId: () => sessionId });
+
+    harness.input("\u001b[B");
+    harness.input("\u001b[D");
+    expect(harness.render().join("\n")).not.toContain("child");
+
+    sessionId = "s2";
+    for (const record of records) record.sessionId = sessionId;
+    harness.widget.update();
+
+    expect((harness.widget as any).collapsedKeys.size).toBe(0);
+    expect(harness.render().join("\n")).toContain("child");
     harness.widget.dispose();
   });
 
@@ -511,12 +638,12 @@ describe("AgentWidget live records", () => {
 
     harness.input("\u001b[B");
     harness.input("j");
-    expect((harness.widget as any).selectedAgentId).toBe("selected");
+    expect((harness.widget as any).selectedNodeKey).toBe("agent:selected");
 
     records.length = 0;
     harness.widget.update();
     expect((harness.widget as any).navigationActive).toBe(false);
-    expect((harness.widget as any).selectedAgentId).toBeUndefined();
+    expect((harness.widget as any).selectedNodeKey).toBeUndefined();
     expect((harness.widget as any).viewportStart).toBe(0);
 
     records.push(record);
@@ -531,12 +658,12 @@ describe("AgentWidget live records", () => {
     };
     harness.widget.setUICtx(nextUi);
     expect((harness.widget as any).navigationActive).toBe(false);
-    expect((harness.widget as any).selectedAgentId).toBeUndefined();
+    expect((harness.widget as any).selectedNodeKey).toBeUndefined();
     expect((harness.widget as any).viewportStart).toBe(0);
 
     harness.widget.dispose();
     expect((harness.widget as any).navigationActive).toBe(false);
-    expect((harness.widget as any).selectedAgentId).toBeUndefined();
+    expect((harness.widget as any).selectedNodeKey).toBeUndefined();
     expect((harness.widget as any).viewportStart).toBe(0);
   });
 
@@ -563,7 +690,7 @@ describe("AgentWidget live records", () => {
     expect(harness.input("\r")).toBeUndefined();
     expect((harness.widget as any).navigationActive).toBe(false);
 
-    (harness.tui as any).focusedComponent = Object.create(Editor.prototype) as Editor;
+    (harness.tui as any).focusedComponent = createEditorComponent();
     expect(harness.input("\u001b[B")).toEqual({ consume: true });
 
     harness.widget.dispose();
@@ -637,6 +764,24 @@ describe("AgentWidget live records", () => {
     harness.widget.dispose();
   });
 
+  it("keeps owned descendants visible in background mode", () => {
+    const records = [
+      makeRecord({ id: "foreground", description: "foreground root", status: "running", completedAt: undefined, isBackground: false }),
+      makeRecord({
+        id: "owned",
+        description: "owned child",
+        status: "running",
+        completedAt: undefined,
+        parentAgentId: "foreground",
+        isBackground: false,
+      }),
+    ];
+    const output = renderWidget(records, 24, new Map(), "background").render().join("\n");
+
+    expect(output).not.toContain("foreground root");
+    expect(output).toContain("owned child");
+  });
+
   it("falls back to showing everything when the session id is unknown", () => {
     const records = [makeRecord({ id: "a", description: "alpha", status: "running", completedAt: undefined })];
     const harness = createNavigableWidgetHarness(records, { getSessionId: () => undefined });
@@ -650,7 +795,8 @@ describe("re-registration recovery", () => {
     const harness = createNavigableWidgetHarness(records);
     harness.widget.update();
 
-    expect(harness.render().join("\n")).toContain("`/agents re-focus` re-focus agents select");
+    expect(harness.render().join("\n")).toContain("Agents  ↑↓ select · ←→ fold · enter view · esc back");
+    expect(harness.render().join("\n")).not.toMatch(/\/agents (?:re-focus|refocus|re-register)/);
 
     let registrations = 0;
     const ui = (harness.widget as unknown as { uiCtx: { setWidget: (k: string, c: unknown) => void } }).uiCtx;

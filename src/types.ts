@@ -47,7 +47,7 @@ export interface AgentConfig {
   maxTurns?: number;
   /** Persist this subagent as a normal pi session instead of keeping it in memory only. */
   persistSession?: boolean;
-  /** Write the subagent's .output transcript. Defaults to true; false suppresses only that transcript. */
+  /** Write the optional temporary `.output` mirror. Defaults to true; false suppresses only that mirror. Durable `.pi-subagents` history is always written. */
   outputTranscript?: boolean;
   /** Optional session directory used when persistSession is true. Omitted = pi's normal session location. */
   sessionDir?: string;
@@ -57,7 +57,7 @@ export interface AgentConfig {
   promptMode: "replace" | "append";
   /** Default for spawn: fork parent conversation. undefined = caller decides. */
   inheritContext?: boolean;
-  /** Compatibility field; Agent calls always run detached regardless of this value. */
+  /** Default execution mode for Agent calls; an explicit tool-call value overrides it. */
   runInBackground?: boolean;
   /** Default for spawn: no extension tools. undefined = caller decides. */
   isolated?: boolean;
@@ -84,6 +84,19 @@ export type JoinMode = 'async' | 'group' | 'smart';
  */
 export type WidgetMode = 'all' | 'background' | 'off';
 
+/** A workflow run projected as a grouping-only root in the shared agent tree. */
+export interface WorkflowTreeRoot {
+  id: string;
+  name: string;
+  description: string;
+  status: "running" | "completed" | "failed" | "killed" | "paused";
+  startedAt: number;
+  completedAt?: number;
+  doneCount: number;
+  agentCount: number;
+  tokens: number;
+}
+
 export interface AgentRecord {
   id: string;
   type: SubagentType;
@@ -109,15 +122,13 @@ export interface AgentRecord {
   worktreeResult?: { hasChanges: boolean; branch?: string };
   /** The tool_use_id from the original Agent tool call. */
   toolCallId?: string;
-  /** Explicit nonblocking completion wait group for this background agent. */
-  waitGroupId?: string;
-  /** Path to the streaming output transcript file. */
+  /** Absolute path to the optional temporary `.output` mirror while live. */
   outputFile?: string;
-  /** Absolute path to the durable project-local transcript while live. */
+  /** Absolute path to the mandatory durable project-local transcript while live. */
   historyFile?: string;
   /** Project-relative durable transcript path persisted in the parent session. */
   transcriptPath?: string;
-  /** Cleanup function for the output file stream subscription. */
+  /** Cleanup function for the durable-history/optional-output stream subscription. */
   outputCleanup?: () => void;
   /**
    * Lifetime usage breakdown, accumulated via `message_end` events. Survives
@@ -150,7 +161,7 @@ export interface AgentRecord {
   parentDescription?: string;
   /** Effective inherited nesting cap for this branch. */
   maxSubagentDepth?: number;
-  /** Root session id used for nested output transcripts. */
+  /** Root session id used for nested optional `.output` mirrors. */
   rootSessionId?: string;
   /** Most recent live activity, including nested rows not tracked by the root UI callback. */
   liveActivity?: {
@@ -175,7 +186,7 @@ export interface AgentInvocation {
   maxTurns?: number;
   isolated?: boolean;
   inheritContext?: boolean;
-  /** Effective detached execution mode; retained for persisted UI compatibility. */
+  /** Effective execution mode; retained for persisted UI compatibility. */
   runInBackground?: boolean;
   isolation?: IsolationMode;
 }
@@ -195,10 +206,6 @@ export interface NotificationDetails {
   resultPreview: string;
   /** Additional agents in a group notification. */
   others?: NotificationDetails[];
-  /** Stable ID for an explicit wait-group notification. */
-  groupId?: string;
-  /** Human-readable summary for an explicit wait-group notification. */
-  groupSummary?: string;
 }
 
 export interface EnvInfo {

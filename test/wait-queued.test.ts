@@ -1,8 +1,6 @@
 /**
- * wait-queued.test.ts — get_subagent_result(wait:true) is compatibility-only.
- *
- * Completion is delivered by detached-agent notifications / wait groups. The
- * result tool must never block the parent agent while a child is running.
+ * wait-queued.test.ts — get_subagent_result supports immediate checks and
+ * cancellable blocking joins.
  */
 import { describe, expect, it, vi } from "vitest";
 
@@ -49,6 +47,7 @@ const flush = async () => {
   await new Promise((r) => setImmediate(r));
   await new Promise((r) => setImmediate(r));
 };
+const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function spawnBackground(tools: Map<string, any>): Promise<{ id: string; queued: boolean }> {
   const r = await tools.get("Agent").execute(
@@ -62,8 +61,8 @@ async function spawnBackground(tools: Map<string, any>): Promise<{ id: string; q
   return { id, queued: textOf(r).includes("queued in background") };
 }
 
-describe("get_subagent_result wait:true compatibility", () => {
-  it("returns immediately for a running agent and preserves the completion notification", async () => {
+describe("get_subagent_result wait semantics", () => {
+  it.each([undefined, false])("returns immediately without consuming a running result (wait=%s)", async (wait) => {
     const { pi, tools, lifecycle } = makePi();
     subagentsExtension(pi);
 
@@ -81,22 +80,103 @@ describe("get_subagent_result wait:true compatibility", () => {
     );
 
     const { id } = await spawnBackground(tools);
+    const params = wait === undefined ? { agent_id: id } : { agent_id: id, wait };
     const result = await tools
       .get("get_subagent_result")
-      .execute("tc-nonblocking", { agent_id: id, wait: true }, undefined, undefined, ctx());
+      .execute("tc-nonblocking", params, undefined, undefined, ctx());
 
     expect(textOf(result)).toContain("Status: running");
-    expect(textOf(result)).toContain("wait:true is deprecated and no longer blocks");
+    expect(textOf(result)).not.toContain("THE-RESULT-PAYLOAD");
 
     resolveRun?.();
     await flush();
-    await new Promise((r) => setTimeout(r, 350));
+    await delay(250);
     expect(pi.sendMessage).toHaveBeenCalledTimes(1);
 
     const completedResult = await tools
       .get("get_subagent_result")
       .execute("tc-completed", { agent_id: id }, undefined, undefined, ctx());
     expect(textOf(completedResult)).toContain("THE-RESULT-PAYLOAD");
+
+    await lifecycle.get("session_shutdown")?.();
+  });
+
+  it("wait:true blocks until terminal and consumes the result", async () => {
+    const { pi, tools, lifecycle } = makePi();
+    subagentsExtension(pi);
+
+    let resolveRun: (() => void) | undefined;
+    vi.mocked(runAgent).mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveRun = () => resolve({
+            responseText: "THE-RESULT-PAYLOAD",
+            session: { dispose: vi.fn() } as any,
+            aborted: false,
+            steered: false,
+          });
+        }) as any,
+    );
+
+    const { id } = await spawnBackground(tools);
+    let settled = false;
+    const resultPromise = tools
+      .get("get_subagent_result")
+      .execute("tc-blocking", { agent_id: id, wait: true }, undefined, undefined, ctx())
+      .then((result: any) => {
+        settled = true;
+        return result;
+      });
+
+    await flush();
+    expect(settled).toBe(false);
+
+    resolveRun?.();
+    const result = await resultPromise;
+    expect(textOf(result)).toContain("Status: completed");
+    expect(textOf(result)).toContain("THE-RESULT-PAYLOAD");
+
+    await delay(250);
+    expect(pi.sendMessage).not.toHaveBeenCalled();
+    await lifecycle.get("session_shutdown")?.();
+  });
+
+  it("cancellation stops only the wait and preserves the child and notification", async () => {
+    const { pi, tools, lifecycle } = makePi();
+    subagentsExtension(pi);
+
+    let resolveRun: (() => void) | undefined;
+    vi.mocked(runAgent).mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveRun = () => resolve({
+            responseText: "THE-RESULT-PAYLOAD",
+            session: { dispose: vi.fn() } as any,
+            aborted: false,
+            steered: false,
+          });
+        }) as any,
+    );
+
+    const { id } = await spawnBackground(tools);
+    const controller = new AbortController();
+    const resultPromise = tools
+      .get("get_subagent_result")
+      .execute("tc-cancel", { agent_id: id, wait: true }, controller.signal, undefined, ctx());
+
+    await flush();
+    controller.abort();
+    await expect(resultPromise).rejects.toMatchObject({ name: "AbortError" });
+
+    const status = await tools
+      .get("get_subagent_result")
+      .execute("tc-status", { agent_id: id, wait: false }, undefined, undefined, ctx());
+    expect(textOf(status)).toContain("Status: running");
+
+    resolveRun?.();
+    await flush();
+    await delay(250);
+    expect(pi.sendMessage).toHaveBeenCalledTimes(1);
 
     await lifecycle.get("session_shutdown")?.();
   });

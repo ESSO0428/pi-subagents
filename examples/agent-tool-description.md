@@ -14,11 +14,10 @@ If the target is already known, use a direct tool — `read` for a known path, `
 ## Usage notes
 
 - Always include a short (3-5 word) description summarizing what the agent will do (shown in UI).
-- Every Agent call is detached and returns an agent ID immediately. run_in_background is accepted for compatibility but has no effect. When you launch multiple agents for independent work, send them in a single message with multiple tool uses so they run concurrently.
-- Results arrive via the completion notification; call get_subagent_result once per completed task ID with wait omitted or false to render the native expandable result. Agent results are not returned inline — never poll or sleep waiting for them.
-- For nonblocking grouped notification, set wait: true. Omit wait_group for a one-agent implicit group, or create an explicit group with subagent_wait_group and seal it (or set wait_group_done: true on the final Agent call).
+- Agent calls block by default and return results inline. Set `run_in_background: true` to detach; detached completions arrive via notification, and `get_subagent_result` retrieves the result. When you launch multiple agents for independent work, send them in a single message with multiple tool uses so they run concurrently.
+- For a cancellable wait on a detached agent, call `get_subagent_result({ wait: true })`; completion notifications are joined internally, and there is no public wait-group API.
 - Trust but verify: an agent's summary describes what it intended to do, not necessarily what it did. When an agent writes or edits code, check the actual changes before reporting work as done.
-- Use resume with an agent ID to continue a previous agent's work; resume is detached and also returns immediately.
+- Use `resume` with an agent ID to continue a previous agent's work; it follows the same blocking/detached resolution as a new call rather than always detaching.
 - Use steer_subagent to send mid-run messages to a running agent.
 - Clearly tell the agent whether you expect it to write code or just to do research (search, file reads, etc.), since it is not aware of the user's intent.
 - If an agent's description says it should be used proactively, try to use it without the user having to ask for it first.

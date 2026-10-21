@@ -1,6 +1,6 @@
 # @esso0428/pi-subagents
 
-A [pi](https://pi.dev) extension that brings **Claude Code-style autonomous sub-agents** to pi. Spawn specialized agents that run in isolated sessions — each with its own tools, system prompt, model, and thinking level. Agent calls always detach, steer them mid-run, resume completed sessions, and define your own custom agent types.
+A [pi](https://pi.dev) extension that brings **Claude Code-style autonomous sub-agents** to pi. Spawn specialized agents that run in isolated sessions — each with its own tools, system prompt, model, and thinking level. Agent calls block by default, can detach explicitly, support mid-run steering and session resume, and let you define your own custom agent types.
 
 > **Fork of [`@tintinweb/pi-subagents`](https://github.com/tintinweb/pi-subagents) integrating `npm:pi-subagents`-style JSON agent overrides — configure agents via `settings.json` without writing `.md` files.**
 
@@ -13,11 +13,12 @@ https://github.com/user-attachments/assets/8685261b-9338-4fea-8dfe-1c590d5df543
 ## Features
 
 - **Claude Code look & feel** — same tool names, calling conventions, and UI patterns (`Agent`, `get_subagent_result`, `steer_subagent`) — feels native
-- **Parallel background agents** — spawn multiple agents that run concurrently with automatic queuing (configurable concurrency limit, default 4) and smart group join (consolidated notifications)
+- **Parallel detached agents** — spawn multiple agents that run concurrently with automatic queuing (configurable concurrency limit, default 4) and internal automatic join (consolidated notifications)
 - **Agents panel UI** — persistent above-editor widget with animated spinners, live tool activity, token counts, colored status icons, and one focus-gated navigator. It shows every agent by default; press `↓` at an empty prompt to activate the panel, `↑`/`↓` to select, `Enter` to open a live or read-only history viewer, and `Esc` to return. Long rosters reserve a right-hand track/thumb scrollbar and show `↑ N more` or `↓ N more` at the clipped edge. Configure via `/agents → Settings → Widget`: `all`, `background`, or `off`
 - **Conversation viewer** — select any agent in `/agents` to open a live-scrolling overlay of its full conversation (auto-follows new content, scroll up to pause). The main viewer reserves a right-hand scrollbar rail for the transcript and exposes a `[preview]` header action for the focused tool. Steer a running agent inline by pressing `e` to open a Pi-native composer, typing, then `Enter` to send (`Esc` or an empty submit returns); the follow-up appears as a muted/gray USER message and redirects the agent after its current tool. `Alt+Up` (`a-up`/`alt+up`) recalls submitted follow-up drafts. Read-only tool previews replace the viewer in place, use the larger viewport with the same right-hand track/thumb scrollbar and top/bottom hidden-line affordances, and return with `Esc`, `q`, or the close control. Stop a still-running agent by pressing `x` (then `x` again to confirm) — both work for background agents too
+- **Durable Agent View history** — every spawned agent writes mandatory project-local history under `.pi-subagents/`, keeping the conversation view reopenable after completion, cleanup, or reload
 - **Custom agent types** — define agents in `.pi/agents/<name>.md` or `.agents/agents/<name>.md` (project) or globally, with YAML frontmatter: custom system prompts, model selection, thinking levels, tool restrictions
-- **Nested subagents** — opt-in, default-off delegation: an agent whose frontmatter sets `allowed_subagents` gets its own ownership-scoped `Agent`, a blocking `wait_for_nested_agent`, and a scoped `steer_subagent`, depth-capped from the main session (default 2). Unlike upstream, nested children are **not** hidden — the agents roster renders them as an indented subtree you can navigate into. The allowlist is a privilege boundary, so it is set by hand in the agent file and never enabled automatically
+- **Nested subagents** — opt-in, default-off delegation: an agent whose frontmatter sets `allowed_subagents` gets ownership-scoped `Agent`, `get_subagent_result`, and `steer_subagent` tools with the same blocking/detached modes as the main agent, depth-capped from the main session (default 2). Unlike upstream, nested children are **not** hidden — the agents roster renders them as an indented subtree you can navigate into. The allowlist is a privilege boundary, so it is set by hand in the agent file and never enabled automatically
 - **Mid-run steering** — inject messages into running agents to redirect their work without restarting
 - **Session resume** — pick up where an agent left off, preserving full conversation context
 - **Durable interruption recovery** — catchable shutdowns preserve running/queued metadata and partial transcripts so interrupted agents remain indexed after reload; abrupt `SIGKILL` termination cannot be checkpointed
@@ -47,54 +48,50 @@ Or load directly for development:
 pi -e ./src/index.ts
 ```
 
+### Task tracking integration
+
+For TaskExecute-based task tracking, install the downstream compatibility fork:
+
+```bash
+pi install npm:@esso0428/pi-tasks
+```
+
+`@esso0428/pi-tasks@0.9.2` is a narrow downstream compatibility fork of [`@tintinweb/pi-tasks`](https://github.com/tintinweb/pi-tasks), not a wholesale replacement. It provides tighter integration with `@esso0428/pi-subagents`, initially focusing on corrected tool descriptions, prompt guidance, and compatibility rather than new task features or optimization. `TaskExecute` remains detached; this integration does not provide a TaskExecute resume API.
+
 ## Quick Start
 
-The parent agent spawns sub-agents using the `Agent` tool:
+The parent agent spawns sub-agents using the `Agent` tool. Calls are **blocking by default** and return the completed result inline:
 
 ```
 Agent({
   subagent_type: "Explore",
   prompt: "Find all files that handle authentication",
   description: "Find auth files",
-  run_in_background: true, // accepted for compatibility; has no effect
 })
 ```
 
-Agent calls always return an ID immediately and notify you on completion. Results arrive via the completion notification; call `get_subagent_result` with the ID to retrieve the result. `run_in_background` is retained for compatibility but has no effect.
-
-### Wait groups
-
-Use `wait: true` to suppress an individual completion notification and receive one grouped notification instead:
+Set `run_in_background: true` when you explicitly want a detached call. It returns an agent ID immediately; completion arrives through the notification path, and the result can be retrieved with `get_subagent_result`:
 
 ```
-const group = subagent_wait_group({
-  action: "create",
-  summary: "Compare notification group API designs",
-})
-
 Agent({
   subagent_type: "Explore",
-  prompt: "Design a group-handle API",
-  description: "Design group handle",
-  wait: true,
-  wait_group: group.group_id,
-})
-
-Agent({
-  subagent_type: "Plan",
-  prompt: "Design a batch API",
-  description: "Design batch API",
-  wait: true,
-  wait_group: group.group_id,
-  wait_group_done: true,
+  prompt: "Find all files that handle authentication",
+  description: "Find auth files",
+  run_in_background: true,
 })
 ```
 
-`subagent_wait_group` supports `create`, `update`, and `seal`. A sealed group sends one notification after every member reaches a terminal state (`completed`, `steered`, `error`, `stopped`, or `aborted`). If `wait: true` is used without `wait_group`, the extension creates and seals a one-agent implicit group. After a completion notification, call `get_subagent_result` once per completed task ID with `wait` omitted or `false` to render native expandable result cards without blocking.
+`run_in_background: false` explicitly selects blocking mode. When the field is omitted, the effective mode is resolved as **tool-call value → agent frontmatter default → blocking**. The same resolution applies when resuming an agent. A blocking result is consumed inline and does not produce a completion follow-up or Goal wake; a detached result remains available for a later join.
+
+Use `get_subagent_result({ agent_id, wait: true })` to join a detached agent. This is a cancellable wait that consumes the terminal result on success and cancels its pending completion notification. With `wait: false` or an omitted `wait`, the call returns immediately: a queued or running status check does not consume the result, while retrieving a terminal result consumes it and cancels its pending notification. Cancelling the join only cancels the result-tool wait — the child keeps running and can still notify normally.
+
+Nested agents use the same `Agent`, `get_subagent_result`, and `steer_subagent` interface. Nested result, resume, and steering requests are ownership-scoped and fail closed for foreign IDs. There is no public wait-group API: detached completions are joined automatically within the parent turn, according to the configured join mode below.
+
+Direct `Agent` calls use the blocking/detached mode described above. Scheduled agents, cross-extension RPC spawns, and `TaskExecute` remain upstream-style detached operations; the direct `Agent` default does not turn those paths into blocking calls.
 
 ### Scheduling
 
-Add a `schedule` field to register the agent to fire later instead of running now:
+Add a `schedule` field to register the agent to fire later instead of running now. Scheduled agents always run detached, regardless of the direct `Agent` default:
 
 ```
 Agent({
@@ -112,7 +109,7 @@ Schedule formats:
 - **One-shot relative** — `"+10m"`, `"+2h"`, `"+1d"`. Fires once at that future time.
 - **One-shot absolute** — full ISO timestamp, e.g. `"2026-12-25T09:00:00.000Z"`.
 
-When a schedule fires, the spawn runs in background and its completion notification arrives in the conversation through the same `subagent-notification` followUp path as a manually-spawned background agent — your parent agent reasons about the result the same way.
+When a schedule fires, the spawn runs detached and its completion notification arrives in the conversation through the same `subagent-notification` followUp path as a manually-spawned detached agent — your parent agent reasons about the result the same way. Scheduling does not opt into the direct blocking `Agent` mode.
 
 Schedules are **session-scoped**: they reset on `/new` and restore on `/resume`. List and cancel via `/agents → Scheduled jobs` (creation is the `Agent` tool's job — there is no parallel manual-create wizard). Storage at `<cwd>/.pi/subagent-schedules/<sessionId>.json` with PID-based file locking for cross-instance safety.
 
@@ -120,7 +117,7 @@ Schedules are **session-scoped**: they reset on `/new` and restore on `/resume`.
 
 Restrictions:
 - `schedule` cannot be combined with `inherit_context` (no parent conversation exists at fire time) or `resume` (schedules create fresh agents).
-- `run_in_background` is accepted for compatibility and has no effect; scheduled agents always run detached.
+- `run_in_background` does not change a scheduled fire; scheduled agents always run detached.
 - Scheduled fires bypass the `maxConcurrent` queue so a 5-minute interval cannot be deferred behind long-running manual agents.
 - **Headless `pi -p` doesn't wait for scheduled subagents.**
 
@@ -157,6 +154,12 @@ While agents are running or have openable history, the single Agents panel rende
 
 At an **empty prompt**, press `↓` to activate the panel. The selected row is marked `●`; `↑`/`↓` move through the full bounded roster, `Enter` opens a running agent live or a terminal agent's read-only history. A queued or interrupted agent remains selectable, and an interrupted agent's partial transcript can be opened read-only after reload. The widget remembers the selected agent and bounded viewport when you return from the prompt or a viewer; if that record disappears, it falls back to the nearest valid row. `Esc` returns to the prompt. `↑` while the first row is selected also returns to the prompt. Pressing `↑` at an inactive prompt, typing in a non-empty prompt, or using `j`/`k`/`←` behaves normally; the panel only captures the focus-gated arrow sequence described above. Disable it entirely via `/agents → Settings → Widget → off`.
 
+### Shared Agent Tree
+
+The Agents widget and `/agents → Agent conversations this session` use the same shared Agent Tree projection. The `/agents` entry is current-session scoped, and the widget's existing `all`/`background`/`off` filter remains in force. It renders eligible agents in visible preorder; workflow-owned rows appear under a synthetic workflow root, followed by real workflow agents and their nested descendants. Workflow roots are grouping-only descriptors and never enter `AgentManager`; real workflow agents remain first-class rows, visible, selectable, and openable in their own Agent Views. Terminal agents with durable history remain openable as read-only views.
+
+Roots are expanded by default, and an explicit collapse remains authoritative when children appear later. `↑`/`↓` move through visible rows only, so collapsed descendants are skipped. `←`/`→` collapse or expand the selected branch and otherwise navigate the hierarchy. `Enter` on a workflow root opens the existing `/agents → Workflows` inspector; `Enter` on a real agent opens its Agent View. The Workflows inspector is a secondary run-progress/control surface, not a replacement for the shared Agent Tree or the real agents it contains.
+
 Individual agent results render Claude Code-style in the conversation:
 
 | State | Example |
@@ -170,7 +173,11 @@ Individual agent results render Claude Code-style in the conversation:
 
 Completed results can be expanded (ctrl+o in pi) to show the full agent output inline. The viewer's tool preview is read-only; its scrollbar and `j`/`k`/wheel/page/top/bottom controls never modify the agent transcript.
 
-By default, agents stream their full conversation to a per-subagent transcript — a JSON-lines file at `<os-tmpdir>/pi-subagents-<uid>/<cwd>/<session>/tasks/<agent-id>.output` (owner-only `0700`, cleared on reboot). Set `output_transcript: false` on a custom agent to write no transcript path or file for it, or set `outputTranscript: false` in `subagents.json` to make transcripts opt-in for the whole project (frontmatter overrides the project default). This governs **only** the transcript: it is independent of `persist_session` (the pi session on disk), and it does not affect `isolation: worktree` (which commits the agent's work to a git branch) or `memory:` (durable files) — set those accordingly if the goal is to keep a run off disk entirely. Background agent completion notifications render as styled boxes:
+Every spawned agent writes its full conversation to mandatory project-local history at `<cwd>/.pi-subagents/agent-transcripts/<agent-id>.jsonl`. This durable history keeps the Agent View/conversation viewer reopenable after completion, cleanup, or reload. The extension creates an ignored `.pi-subagents/` directory for these artifacts.
+
+The optional OS-temp `.output` mirror is separate: it is written at `<os-tmpdir>/pi-subagents-<uid>/<cwd>/<session>/tasks/<agent-id>.output` (owner-only `0700`, cleared on reboot) when enabled. Set `output_transcript: false` on a custom agent, or `outputTranscript: false` in `subagents.json`, to omit only this mirror; frontmatter overrides the project default. These controls affect only transcript files. They are independent of `persist_session` (the pi session on disk), `isolation: worktree` (which commits the agent's work to a git branch), and `memory:` (durable files).
+
+Writing or omitting either transcript file does **not** alter `Agent` or `TaskExecute` results, `get_subagent_result` results, notifications, join/wait behavior, or what the main agent sees. Background agent completion notifications render as styled boxes:
 
 ```
 ✓ Find auth files completed
@@ -179,7 +186,7 @@ By default, agents stream their full conversation to a per-subagent transcript �
   transcript: .pi/output/agent-abc123.jsonl
 ```
 
-Group completions render each agent as a separate block. The LLM receives structured `<task-notification>` XML for parsing, while the user sees the themed visual.
+Automatically joined completions render each agent as a separate block. The LLM receives structured `<task-notification>` XML for parsing, while the user sees the themed visual.
 
 ## Default Agent Types
 
@@ -247,21 +254,21 @@ All fields are optional — sensible defaults for everything.
 | `skills` | `true` | Inherit skills from parent. Can be a comma-separated list of skill names to preload (see [Skill Preloading](#skill-preloading) for discovery locations) |
 | `memory` | — | Persistent agent memory scope: `project`, `local`, or `user`. Auto-detects read-only agents |
 | `disallowed_tools` | — | Comma-separated tools to deny even if extensions provide them |
-| `allowed_subagents` | none | Opt in to scoped nested `Agent`, `wait_for_nested_agent`, and `steer_subagent` tools. Omitted / empty / `none` / `false` = no nesting; `all` (or `"*"` / `true`) = any enabled agent; comma-separated list = only those agent types |
+| `allowed_subagents` | none | Opt in to scoped nested `Agent`, `get_subagent_result`, and `steer_subagent` tools. Omitted / empty / `none` / `false` = no nesting; `all` (or `"*"` / `true`) = any enabled agent; comma-separated list = only those agent types |
 | `isolation` | — | Set to `worktree` to run in an isolated git worktree |
 | `model` | inherit parent | Model — `provider/modelId` or fuzzy name (`"haiku"`, `"sonnet"`). Resolved tolerantly (`.`/`-` and a trailing date stamp are interchangeable) and falls back to the same model under another provider if the named one doesn't have it |
 | `thinking` | inherit | off, minimal, low, medium, high, xhigh, max — actual availability depends on your pi version and model; pi clamps unsupported levels down |
 | `max_turns` | unlimited | Max agentic turns before graceful shutdown. `0` or omit for unlimited |
-| `persist_session` | `false` | Persist this subagent as a normal pi session instead of keeping the session in memory only. The subagent's `.output` transcript is still written either way unless `output_transcript: false` |
-| `output_transcript` | `true` (or `subagents.json` `outputTranscript`) | Write this subagent's `.output` transcript; when set, overrides the `subagents.json` `outputTranscript` default. Set `false` to write no transcript file or path. Governs only the transcript — independent of `persist_session`, `isolation: worktree`, and `memory:` |
+| `persist_session` | `false` | Persist this subagent as a normal pi session instead of keeping the session in memory only. The optional OS-temp `.output` mirror is controlled separately by `output_transcript` |
+| `output_transcript` | `true` (or `subagents.json` `outputTranscript`) | Write this subagent's optional OS-temp `.output` mirror; when set, overrides the `subagents.json` `outputTranscript` default. Set `false` to omit only the mirror; mandatory `.pi-subagents` history is still written and keeps Agent View reopenable |
 | `session_dir` | pi default | Optional session directory when `persist_session: true`; omitted uses pi's normal session location, and relative paths resolve from the agent cwd |
 | `prompt_mode` | `replace` | `replace`: body is the full system prompt (no AGENTS.md / CLAUDE.md inheritance). `append`: body appended to parent's prompt (agent acts as a "parent twin" — inherits parent's AGENTS.md / CLAUDE.md) |
 | `inherit_context` | `false` | Fork parent conversation into agent |
-| `run_in_background` | `false` | Compatibility parameter; has no effect because Agent calls always detach |
+| `run_in_background` | `false` | Invocation mode default: omitted means blocking; `true` selects detached mode. An explicit tool-call value overrides this frontmatter default |
 | `isolated` | `false` | Hermetic specialist mode: forces `extensions: false` + `skills: false` + drops `ext:` selectors. Only built-in tools. Distinct from `isolation: worktree` (filesystem) |
 | `enabled` | `true` | Set to `false` to disable an agent (useful for hiding a default agent per-project) |
 
-Frontmatter is authoritative. If an agent file sets `model`, `thinking`, `max_turns`, `inherit_context`, `isolated`, or `isolation`, those values are locked for that agent. `run_in_background` is accepted for compatibility but has no effect. `Agent` tool parameters only fill fields the agent config leaves unspecified.
+Frontmatter and `agentOverrides` are authoritative for fields they specify: `model`, `thinking`, `max_turns`, `inherit_context`, `isolated`, and `isolation`. `run_in_background` is different: they supply its default, while an explicit tool-call value overrides it; if neither sets it, blocking is the default. The corresponding `Agent` tool parameters otherwise fill only fields the selected agent's frontmatter or `agentOverrides` leaves unspecified.
 
 **Forgiving `model:` resolution.** A `model:` pin is matched against pi's model registry tolerantly, so cosmetic id variations don't silently drop the agent back to the parent's model: `.` and `-` are treated as equivalent in version numbers (`claude-haiku-4.5` ≡ `claude-haiku-4-5`), a trailing `-YYYYMMDD` date stamp is optional (`anthropic/claude-haiku-4-5-20251001` matches an undated registry id and vice-versa), and a `provider/modelId` whose named provider doesn't carry that model retries the bare id against every provider. Precedence is **exact → fuzzy under the named provider → same model under any provider → unavailable**, so an exact match always wins and dated snapshots aren't conflated. If nothing resolves, the pin can't run and the agent inherits the parent model — `/agents → Agent types` flags this case as `(unavailable, fallback: inherit)` and shows the resolved target `(→ provider/id)` when resolution lands on a different provider or version than configured. (This is distinct from [Model Scope](#model-scope) enforcement, which matches the `enabledModels` allowlist by *exact* entry.)
 
@@ -329,21 +336,22 @@ set, so choose it as carefully as you would `tools:`. It is set by hand in the
 agent file and is never enabled automatically; no skill or tool description
 teaches a model to grant itself delegation.
 
-A nested child receives an ownership-scoped `Agent`, a `wait_for_nested_agent`
-that always blocks until that child finishes, and a `steer_subagent` scoped to
-its own children. Result, resume, and steer are ownership-checked, so a parent
-cannot read, steer, or resume a foreign child. `maxSubagentDepth` caps how deep
-nesting goes (default 2: main session 0, its subagents 1, nested children 2);
-an agent already at the cap receives no nested tools at all — not even
-`wait_for_nested_agent` — since it can never own a child. Change it project-wide
-via `maxSubagentDepth` in `subagents.json` or `/agents` → Settings → Nested
-depth. Nested children occupy no concurrency slot: their parent already holds
-one, and queueing a child behind its own parent would deadlock.
+A nested child receives ownership-scoped `Agent`, `get_subagent_result`, and
+`steer_subagent` tools. Nested `Agent` calls use the same mode resolution as
+top-level calls: they block by default, and `run_in_background: true` selects
+detached execution. Result, resume, and steer are ownership-checked, so a
+parent cannot read, steer, or resume a foreign child. `maxSubagentDepth` caps
+how deep nesting goes (default 2: main session 0, its subagents 1, nested
+children 2); an agent already at the cap receives no nested tools at all, since
+it can never own a child. Change it project-wide via `maxSubagentDepth` in
+`subagents.json` or `/agents` → Settings → Nested depth. Nested children occupy
+no concurrency slot: their parent already holds one, and queueing a child
+behind its own parent would deadlock.
 
 Nested children consume **no** concurrency slot and are never reported to the
 main session as top-level agents — their completion surfaces inside the parent,
 and their token usage folds into every ancestor's total. Each still writes its
-own durable transcript.
+own mandatory `.pi-subagents` history.
 
 ### How nested children are shown
 
@@ -504,35 +512,35 @@ produce a warning instead of crashing.
 
 ## Tools
 
-### `Agent
+### `Agent`
 
-Launch a sub-agent.
+Launch a sub-agent. Calls block by default; set `run_in_background: true` for an explicit detached call.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `prompt` | string | yes | The task for the agent |
 | `description` | string | yes | Short 3-5 word summary (shown in UI) |
 | `subagent_type` | string | yes | Agent type (built-in or custom) |
-| `model` | string | no | Model — `provider/modelId` or fuzzy name (`"haiku"`, `"sonnet"`). Resolved tolerantly (`.`/`-` and a trailing date stamp interchangeable) with provider fallback |
-| `thinking` | string | no | Thinking level: off, minimal, low, medium, high, xhigh, max (availability depends on pi version and model) |
-| `max_turns` | number | no | Max agentic turns. Omit for unlimited (default) |
-| `run_in_background` | boolean | no | Compatibility parameter; has no effect because Agent calls never block |
-| `resume` | string | no | Agent ID to resume a previous session |
-| `isolated` | boolean | no | No extension/MCP tools |
-| `isolation` | `"worktree"` | no | Run in an isolated git worktree |
-| `inherit_context` | boolean | no | Fork parent conversation into agent |
+| `model` | string | no | Optional model — used only when the selected agent's frontmatter or `agentOverrides` leaves `model` unspecified. Accepts `provider/modelId` or a fuzzy name (`"haiku"`, `"sonnet"`); resolution is tolerant (`.`/`-` and a trailing date stamp are interchangeable) with provider fallback |
+| `thinking` | string | no | Thinking level: off, minimal, low, medium, high, xhigh, max — used only when the selected agent's frontmatter or `agentOverrides` leaves `thinking` unspecified (availability depends on pi version and model) |
+| `max_turns` | number | no | Max agentic turns — used only when the selected agent's frontmatter or `agentOverrides` leaves `max_turns` unspecified. Omit for unlimited |
+| `run_in_background` | boolean | no | `true` returns an ID immediately and runs detached; an explicit tool-call value overrides the selected agent's frontmatter or `agentOverrides` default, while omission uses that default (blocking if neither is set) |
+| `resume` | string | no | Agent ID to resume a previous session; the same blocking/detached mode resolution applies |
+| `isolated` | boolean | no | No extension/MCP tools — used only when the selected agent's frontmatter or `agentOverrides` leaves `isolated` unspecified |
+| `isolation` | `"worktree"` | no | Run in an isolated git worktree — used only when the selected agent's frontmatter or `agentOverrides` leaves `isolation` unspecified |
+| `inherit_context` | boolean | no | Fork parent conversation into agent — used only when the selected agent's frontmatter or `agentOverrides` leaves `inherit_context` unspecified |
 
 ### `get_subagent_result`
 
-Check status and retrieve results from a background agent.
+Check status and retrieve results from a detached agent.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `agent_id` | string | yes | Agent ID to check |
-| `wait` | boolean | no | Deprecated compatibility flag; never blocks |
+| `wait` | boolean | no | `true` cancellably joins until terminal; omitted or `false` returns immediately. Retrieving a terminal result consumes it and cancels its pending notification |
 | `verbose` | boolean | no | Include full conversation log |
 
-`get_subagent_result` never blocks. If an agent is still running or queued, the tool returns the current status immediately. After a background or wait-group completion notification, call it with `wait` omitted or `false` to retrieve the final output through Pi's native expandable tool-result UI.
+With `wait` omitted or `false`, `get_subagent_result` returns immediately. A queued or running status check does not consume the result; retrieving any terminal result consumes it and cancels its pending detached notification. With `wait: true`, the tool cancellably waits through queued and running states, then retrieves and consumes the terminal result with the same notification cancellation. Cancelling the wait does not stop the child or consume its result. Completion notifications are automatically joined internally; there are no public wait-group handles.
 
 ### `steer_subagent`
 
@@ -552,13 +560,17 @@ Send a steering message to a running agent. The message interrupts after the cur
 The `/agents` command opens an interactive menu:
 
 ```
-Running agents (2) — 1 running, 1 done     ← only shown when agents exist
-Agent types (6)                             ← unified list: defaults + custom
-Create new agent                            ← manual wizard or AI-generated
-Settings                                    ← max concurrency, max turns, grace turns, join mode
+Agent conversations this session
+Agent history all sessions
+Agent types
+Scheduled jobs
+Workflows
+Create new agent
+Settings
 ```
 
-- **Running agents** — select one to open its live conversation viewer. While it's still running, press `Enter` to open the steering composer, then `Enter` again to send a message that redirects the agent (same mechanism as the `steer_subagent` tool; `Esc` or an empty submit returns), or press `x` (then `x` again to confirm) to stop/abort it. A stopped agent reports its partial output flagged as incomplete, not as a completion.
+- **Agent conversations this session** — opens the shared Agent Tree for the current session. See [Shared Agent Tree](#shared-agent-tree) for navigation and behavior.
+- **Agent history all sessions** — browse durable agent histories from all sessions.
 - **Agent types** — unified list with source indicators: `•` (project), `◦` (global), `✕` (disabled). Each row shows the agent's model, and the highlighted agent's full description appears below the list. The model column flags `(unavailable, fallback: inherit)` when a configured model can't be resolved (it would silently inherit the parent model), and shows `(→ provider/id)` when it resolves to a different provider or version than configured. Select an agent to manage it:
   - **Default agents** (no override): Eject (export as `.md`), Disable
   - **Default agents** (ejected/overridden): Edit, Disable, Reset to default, Delete
@@ -566,6 +578,8 @@ Settings                                    ← max concurrency, max turns, grac
   - **Disabled agents**: Enable, Edit, Delete
 - **Eject** — writes the embedded default config as a `.md` file to project or personal location, so you can customize it
 - **Disable/Enable** — toggle agent availability. Disabled agents stay visible in the list (marked `✕`) and can be re-enabled
+- **Scheduled jobs** — view and manage scheduled agents.
+- **Workflows** — inspect and control workflow runs.
 - **Create new agent** — choose project/personal location, then manual wizard (step-by-step prompts for name, tools, model, thinking, system prompt) or AI-generated (describe what the agent should do and a sub-agent writes the `.md` file). Any name is allowed, including default agent names (overrides them)
 - **Settings** — configure max concurrency, default max turns, grace turns, and join mode at runtime
 
@@ -586,19 +600,21 @@ Instead of hard-aborting at the turn limit, agents get a graceful shutdown:
 
 ## Concurrency
 
-Agent tool calls bypass the configurable background concurrency queue (default: 4), preserving immediate detached execution. Other programmatic background spawns may still be queued; the widget shows queued agents as a collapsed count.
+The configurable `maxConcurrent` limit (default: 4) applies to work submitted to the manager queue. Direct detached `Agent` calls and scheduled calls bypass that queue. Owned nested/workflow children do not consume the top-level pool; workflows have their own cap. Cross-extension/RPC top-level spawns remain subject to the manager queue unless the caller opts out. Blocking calls wait inline and do not produce detached completion notifications.
 
-## Join Strategies
+## Automatic Join
 
-When background agents complete, they notify the main agent. The **join mode** controls how these notifications are delivered. It applies only to background agents.
+Detached completions are joined internally at parent-turn boundaries. The **join mode** controls how these notifications are delivered and applies only to detached agents; blocking results are already inline and are never added to the outbox or joined.
 
 | Mode | Behavior |
 |------|----------|
-| `smart` (default) | 2+ background agents spawned in the same turn are auto-grouped into a single consolidated notification. Solo agents notify individually. |
-| `async` | Each agent sends its own notification on completion (original behavior). Best when results need incremental processing. |
-| `group` | Force grouping even when spawning a single agent. Useful when you know more agents will follow. |
+| `smart` (default) | 2+ detached agents spawned in the same parent turn are automatically grouped into a single consolidated notification. Solo agents notify individually. |
+| `async` | Each detached agent sends its own notification on completion (compatibility alias for ungrouped delivery). Best when results need incremental processing. |
+| `group` | Force automatic grouping even when spawning a single detached agent. Useful when more agents will follow. |
 
-**Timeout behavior:** When agents are grouped, a 30-second timeout starts after the first agent completes. If not all agents finish in time, a partial notification is sent with completed results and remaining agents continue with a shorter 15-second re-batch window for stragglers.
+**Timeout behavior:** When detached agents are automatically grouped, a 30-second timeout starts after the first agent completes. If not all agents finish in time, a partial notification is sent with completed results and remaining agents continue with a shorter 15-second re-batch window for stragglers. Group membership is internal and no group ID is exposed.
+
+There is no public create/update/seal wait-group API. Use blocking `Agent` calls when the result is needed inline, or explicitly detach and join with `get_subagent_result({ wait: true })`.
 
 **Configuration:**
 - Configure join mode in `/agents` → Settings → Join mode
@@ -634,7 +650,7 @@ Runtime tuning values set via `/agents` → Settings (max concurrency, default m
 
 **Disable defaults** (`disableDefaultAgents`, default `false`): when on, the three built-in agents (general-purpose, Explore, Plan) are not registered — only your project/global custom agents are advertised and spawnable. User-defined agents are unaffected, including ones that override a default by name. The Agent tool's type list updates on the next pi session (the tool schema is registered at startup).
 
-**Output transcript** (`outputTranscript`, default `true`): the project/global default for writing each subagent's `.output` transcript. Toggle via `/agents → Settings → Output transcript`, or set `false` in `subagents.json` to make transcripts opt-in project-wide — useful when run transcripts shouldn't sit on disk for backup or DLP tooling to pick up. A custom agent's `output_transcript` frontmatter overrides this per agent. Applied live at spawn time. Governs only the transcript, not `persist_session`, worktree commits, or memory files.
+**Output transcript** (`outputTranscript`, default `true`): the project/global default for writing each subagent's optional OS-temp `.output` mirror. Toggle via `/agents → Settings → Output transcript`, or set `false` in `subagents.json` to omit only that mirror project-wide — useful when temporary run artifacts should not sit on disk for backup or DLP tooling to pick up. A custom agent's `output_transcript` frontmatter overrides this per agent. Applied live at spawn time. Mandatory project-local `.pi-subagents` history is always written and remains available to reopen Agent View. This setting does not alter `Agent`/`TaskExecute` results, `get_subagent_result`, notifications, join/wait behavior, or what the main agent sees; it also does not affect `persist_session`, worktree commits, or memory files.
 
 **Tool description** (`toolDescriptionMode`, default `"full"`): which Agent tool description the LLM sees. `"full"` is the rich Claude Code-style prompt (~1,400 tokens with the default agents); `"compact"` is ~75% smaller — one-line agent type list, terse usage notes — for small/local models where tool-spec tokens are expensive. Per-option details stay in the parameter descriptions in every mode (the parameter schema is never customizable). Applies on the next pi session.
 
@@ -742,7 +758,7 @@ pi.events.emit("subagents:rpc:spawn", {
 
 `options.model` accepts either a `Model` object (e.g. `ctx.model`) or a `"provider/modelId"` string — strings are resolved against `ctx.modelRegistry` at the RPC boundary, so cross-extension callers can forward serializable values without losing auth context.
 
-`options.cwd` (absolute path to an existing directory — anything else returns an error envelope; `null` means unset) runs the agent in a different working directory than the parent session. Its tools operate there and the prompt's environment block describes it, but **`.pi` config still loads from the parent session's project** — the target directory's `.pi` extensions never execute, and its agents/skills/settings are not picked up. Combined with `isolation: "worktree"`, the worktree is created *from* the target directory's repo, the agent works at the equivalent subdirectory inside the copy (a monorepo-package cwd stays scoped to that package), and the resulting `pi-agent-*` branch lands in that repo — the completion message names it. On session end, worktree registrations are pruned in every repo that received one; only a hard crash can leave a stale entry (then: `git worktree prune` in the target repo). Agents with `memory:` keep reading/writing the parent project's memory.
+`options.cwd` (absolute path to an existing directory — anything else returns an error envelope; `null` means unset) runs the agent in a different working directory than the parent session. Its tools operate there and the prompt's environment block describes it, but **`.pi` config still loads from the parent session's project** — the target directory's `.pi` extensions never execute, and its agents/skills/settings are not picked up. RPC spawns remain detached and ID-first; they do not inherit the direct `Agent` tool's blocking default. Combined with `isolation: "worktree"`, the worktree is created *from* the target directory's repo, the agent works at the equivalent subdirectory inside the copy (a monorepo-package cwd stays scoped to that package), and the resulting `pi-agent-*` branch lands in that repo — the completion message names it. On session end, worktree registrations are pruned in every repo that received one; only a hard crash can leave a stale entry (then: `git worktree prune` in the target repo). Agents with `memory:` keep reading/writing the parent project's memory.
 
 ### Stop
 

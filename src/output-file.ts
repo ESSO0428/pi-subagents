@@ -1,8 +1,9 @@
 /**
- * output-file.ts — Streaming JSONL output file for agent transcripts.
+ * output-file.ts — Streaming JSONL files for agent transcripts.
  *
- * Creates a per-agent output file that streams conversation turns as JSONL,
- * matching Claude Code's task output file format.
+ * Streams conversation turns as JSONL to the optional temporary `.output`
+ * mirror and/or the mandatory project-local `.pi-subagents` history, matching
+ * Claude Code's task output file format.
  */
 
 import { appendFileSync, chmodSync, mkdirSync, writeFileSync } from "node:fs";
@@ -55,8 +56,11 @@ export function writeInitialEntry(path: string, agentId: string, prompt: string,
 }
 
 /**
- * Subscribe to session events and flush new messages to the output file on each turn_end.
- * Returns a cleanup function that does a final flush and unsubscribes.
+ * Subscribe to session events and flush new messages to the supplied transcript
+ * files on each turn_end. The first message is the initial prompt already
+ * written by the manager; `startAt` is used when resuming a session whose prior
+ * messages are already persisted. Returns a cleanup function that does a final
+ * flush and unsubscribes.
  */
 export function streamToOutputFile(
   session: AgentSession,
@@ -64,8 +68,9 @@ export function streamToOutputFile(
   agentId: string,
   cwd: string,
   historyPath?: string,
+  startAt = 1,
 ): () => void {
-  let writtenCount = 1; // initial user prompt already written
+  let writtenCount = startAt;
 
   const flush = () => {
     const messages = session.messages;
@@ -80,7 +85,8 @@ export function streamToOutputFile(
         cwd,
       };
       const entryJson = JSON.stringify(entry) + "\n";
-      for (const target of historyPath && historyPath !== path ? [path, historyPath] : [path]) {
+      const targets = historyPath && historyPath !== path ? [path, historyPath] : [path];
+      for (const target of targets) {
         try {
           appendFileSync(target, entryJson, "utf-8");
         } catch { /* ignore write errors */ }

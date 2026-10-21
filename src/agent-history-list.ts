@@ -12,6 +12,8 @@ export type AgentHistoryStatus =
   | "aborted"
   | "error";
 
+export type AgentViewMode = "live" | "history";
+
 const TERMINAL_STATUSES: ReadonlySet<string> = new Set<AgentHistoryStatus>([
   "completed",
   "steered",
@@ -36,6 +38,16 @@ export function canOpenAgentHistory(record: AgentRecord, cwd: string | undefined
   if (!isTerminalAgentStatus(record.status)) return false;
   return record.session !== undefined
     || (cwd !== undefined && hasAgentHistory(cwd, record.transcriptPath));
+}
+
+/** Resolve the conversation surface a real agent can open, if any. */
+export function resolveAgentViewMode(
+  record: AgentRecord,
+  cwd: string | undefined,
+): AgentViewMode | undefined {
+  if (canOpenActiveAgent(record)) return "live";
+  if (canOpenAgentHistory(record, cwd)) return "history";
+  return undefined;
 }
 
 /** Split records into openable active and terminal-history buckets. */
@@ -78,29 +90,41 @@ export function formatAgentHistoryOption(record: AgentRecord, now: number): stri
   return option.length <= LABEL_LIMIT ? option : `${option.slice(0, LABEL_LIMIT - 1)}…`;
 }
 
-/** Build the visible status-section labels for the agents menu. */
+/** Count real agents admitted to the current-session tree projection. */
+export function countSessionAgentConversations(
+  records: readonly AgentRecord[],
+  cwd: string | undefined,
+  sessionId: string | undefined,
+): number {
+  if (sessionId === undefined) return 0;
+  return records.filter(record => {
+    if (record.sessionId !== sessionId) return false;
+    if (record.status === "running" || record.status === "queued") return true;
+    return canOpenAgentHistory(record, cwd);
+  }).length;
+}
+
+/** Build the visible conversation/history labels for the agents menu. */
 export function buildAgentStatusMenuEntries(
   records: readonly AgentRecord[],
   cwd: string | undefined,
   sessionId?: string,
   /** Recovered legacy records, already filtered to the openable ones. */
   legacy: readonly AgentRecord[] = [],
+  /** A workflow root keeps the current-session tree reachable before its first child starts. */
+  hasWorkflowRoots = false,
 ): string[] {
-  const { active, history } = splitAgentRecords(records, cwd);
-  // This-session history is what you almost always want, so it is the default
-  // entry. Project-wide history stays one keystroke away for the occasional
-  // "which agent was that, two sessions ago" lookup. Records restored from a
-  // branch or checkpoint are stamped with the current session, so an inherited
-  // agent counts as present here rather than disappearing into the other bucket.
-  const inSession = sessionId ? history.filter((record) => record.sessionId === sessionId) : [];
+  const { history } = splitAgentRecords(records, cwd);
+  const inSession = countSessionAgentConversations(records, cwd, sessionId);
   // Legacy records are merged into this list when it opens, so the count has to
   // include the ones the in-memory set does not already carry — otherwise the
   // menu advertises fewer entries than the list actually shows.
   const inMemory = new Set(history.map((record) => record.id));
   const allSessions = history.length + legacy.filter((record) => !inMemory.has(record.id)).length;
   return [
-    ...(active.length > 0 ? [`Running agents (${active.length})`] : []),
-    ...(inSession.length > 0 ? [`Agent history this session (${inSession.length})`] : []),
+    ...(inSession > 0 || hasWorkflowRoots
+      ? [`Agent conversations this session (${inSession})`]
+      : []),
     ...(allSessions > 0 ? [`Agent history all sessions (${allSessions})`] : []),
   ];
 }

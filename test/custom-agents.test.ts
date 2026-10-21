@@ -99,7 +99,7 @@ Workspace prompt.`);
     expect(result.get("dupe")?.systemPrompt).toBe("Workspace prompt.");
   });
 
-  it("loads a basic agent with all frontmatter fields", () => {
+  it("loads a basic agent with all frontmatter fields, including the optional .output mirror switch", () => {
     writeAgent("auditor", `---
 description: Security Auditor
 tools: read, grep, find
@@ -128,6 +128,8 @@ You are a security auditor.`);
     expect(agent.thinking).toBe("high");
     expect(agent.maxTurns).toBe(30);
     expect(agent.persistSession).toBe(true);
+    // Parsed unchanged: this controls only the optional OS-temp .output mirror.
+    // Mandatory .pi-subagents history is independent of this field.
     expect(agent.outputTranscript).toBe(false);
     expect(agent.sessionDir).toBe(".seams/pi-sessions/seam-plan-reviewer");
     expect(agent.promptMode).toBe("replace");
@@ -155,6 +157,7 @@ Just a prompt.`);
     expect(agent.thinking).toBeUndefined();
     expect(agent.maxTurns).toBeUndefined();
     expect(agent.persistSession).toBeUndefined();
+    // No per-agent mirror override; mandatory history is not opt-in.
     expect(agent.outputTranscript).toBeUndefined();
     expect(agent.sessionDir).toBeUndefined();
     expect(agent.promptMode).toBe("replace");

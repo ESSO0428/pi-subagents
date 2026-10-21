@@ -81,13 +81,13 @@ describe("nested tools reach a real child session", () => {
     const names = ((captured.config?.customTools ?? []) as { name: string }[]).map((tool) => tool.name);
 
     expect(names).toContain("Agent");
-    expect(names).toContain("wait_for_nested_agent");
+    expect(names).toContain("get_subagent_result");
     expect(names).toContain("steer_subagent");
 
     // pi filters custom tools by excludedToolNames; the nested trio must not be
     // in it, or they would be dropped when the registry is built.
     const excluded = (captured.config?.excludeTools ?? []) as string[];
-    for (const tool of ["Agent", "wait_for_nested_agent", "steer_subagent"]) {
+    for (const tool of ["Agent", "get_subagent_result", "steer_subagent"]) {
       expect(excluded).not.toContain(tool);
     }
 

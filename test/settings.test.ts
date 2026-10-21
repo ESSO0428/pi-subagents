@@ -121,7 +121,9 @@ describe("settings persistence", () => {
     expect(loadSettings(projectDir)).toEqual({}); // invalid value dropped
   });
 
-  it("round-trips outputTranscript; drops non-boolean", () => {
+  it("round-trips outputTranscript for the optional .output mirror; drops non-boolean", () => {
+    // This field remains a boolean setting for the optional OS-temp mirror;
+    // mandatory .pi-subagents history is independent of it.
     saveSettings({ outputTranscript: false }, projectDir);
     expect(loadSettings(projectDir)).toEqual({ outputTranscript: false });
     saveSettings({ outputTranscript: true }, projectDir);
@@ -445,7 +447,7 @@ describe("settings persistence", () => {
       expect(appliers.setToolDescriptionMode).toHaveBeenCalledWith("full");
     });
 
-    it("applies outputTranscript (both true and false)", () => {
+    it("applies outputTranscript for the optional .output mirror (both true and false)", () => {
       applySettings({ outputTranscript: false }, appliers);
       expect(appliers.setOutputTranscript).toHaveBeenCalledWith(false);
       applySettings({ outputTranscript: true }, appliers);

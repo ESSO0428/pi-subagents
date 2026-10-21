@@ -78,7 +78,7 @@ describe("status note reaches the parent through the real handlers", () => {
 
     const spawn = await tools.get("Agent").execute(
       "tc1",
-      { prompt: "go", description: "d", subagent_type: "general-purpose" },
+      { prompt: "go", description: "d", subagent_type: "general-purpose", run_in_background: true },
       undefined, undefined, ctx(),
     );
     const id = textOf(spawn).match(/Agent ID: (\S+)/)?.[1];

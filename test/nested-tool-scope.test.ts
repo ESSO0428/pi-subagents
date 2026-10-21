@@ -2,8 +2,8 @@ import { describe, expect, it, vi } from "vitest";
 import { installExtensionToolScope } from "../src/agent-runner.js";
 
 /**
- * The scoped nested `Agent` and `steer_subagent` deliberately share their names
- * with EXCLUDED_TOOL_NAMES, so `inScope()` deletes them along with every other
+ * The scoped nested orchestration tools deliberately share their names with
+ * EXCLUDED_TOOL_NAMES, so `inScope()` deletes them along with every other
  * orchestration tool. Without a re-admission they are dropped from the active
  * set by the first renarrow and `beforeToolCall` then rejects them, which is
  * what makes an opt-in nested agent see no nested tools at all.
@@ -33,25 +33,23 @@ describe("installExtensionToolScope re-admits injected tools", () => {
   } as never;
 
   it("keeps an injected nested Agent and steer_subagent active", () => {
-    const all = ["read", "bash", "Agent", "get_subagent_result", "steer_subagent", "subagent_wait_group", "wait_for_nested_agent"];
+    const all = ["read", "bash", "Agent", "get_subagent_result", "steer_subagent", "subagent_wait_group"];
     const active = [...all];
     const harness = fakeSession(all, active);
 
     installExtensionToolScope(harness.session, {
       loader,
-      toolNames: ["read", "bash", "Agent", "get_subagent_result", "steer_subagent", "subagent_wait_group", "wait_for_nested_agent"],
+      toolNames: ["read", "bash", "Agent", "get_subagent_result", "steer_subagent", "subagent_wait_group"],
       disallowedSet: undefined,
       extNames: new Set(),
       narrowing: new Map(),
-      readmitToolNames: new Set(["Agent", "steer_subagent", "wait_for_nested_agent"]),
+      readmitToolNames: new Set(["Agent", "get_subagent_result", "steer_subagent"]),
     });
 
     expect(active).toContain("Agent");
+    expect(active).toContain("get_subagent_result");
     expect(active).toContain("steer_subagent");
-    expect(active).toContain("wait_for_nested_agent");
-    // The global orchestration tools stay denied.
-    expect(active).not.toContain("get_subagent_result");
-    expect(active).not.toContain("subagent_wait_group");
+    // All three names are re-admitted as the injected, ownership-scoped tools.
   });
 
   it("still honours disallowed_tools over an opt-in nested tool of the same name", () => {

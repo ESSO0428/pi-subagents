@@ -51,6 +51,33 @@ describe("nested delegation policy", () => {
     for (const manager of cleanupManagers.splice(0)) manager.dispose();
   });
 
+  it("documents config precedence in the nested Agent schema", () => {
+    const manager = {
+      spawn: vi.fn(),
+      spawnAndWait: vi.fn(),
+      getRecord: () => undefined,
+      resume: vi.fn(),
+      reportNestedIssue: vi.fn(),
+    };
+    const [agent] = createNestedSubagentTools({
+      manager,
+      pi,
+      parentAgentId: "parent",
+      depth: 1,
+      maxSubagentDepth: 2,
+      allowedSubagents: "all",
+      configCwd: "/tmp",
+    });
+    const properties = agent.parameters.properties;
+    expect(agent.description).toContain("only fill fields left unspecified by the selected agent's frontmatter or agentOverrides");
+    for (const name of ["model", "thinking", "max_turns", "inherit_context", "isolated", "isolation"]) {
+      expect(properties[name].description).toContain("frontmatter or agentOverrides");
+    }
+    expect(properties.model.description).not.toContain("override");
+    expect(properties.thinking.description).not.toContain("override");
+    expect(properties.run_in_background.description).toContain("explicit tool-call value overrides");
+  });
+
   it("parses allowlists without granting omitted or false values", () => {
     cwd = mkdtempSync(join(tmpdir(), "nested-policy-"));
     writeAgent(cwd, "omitted", "");
@@ -164,6 +191,98 @@ describe("nested delegation policy", () => {
     // spawn is one of the parent's own tool calls, and whether it waits or detaches
     // is the parent agent's choice. The child therefore keeps running.
     expect(manager.getRecord(childId)?.status).toBe("running");
+  });
+
+  it("uses the shared mode resolver for fresh and resumed nested agents", async () => {
+    cwd = mkdtempSync(join(tmpdir(), "nested-modes-"));
+    writeAgent(cwd, "blocking", "");
+    writeAgent(cwd, "detached", "run_in_background: true\n");
+    registerAgents(loadCustomAgents(cwd));
+
+    const completed = (id: string): AgentRecord => record({
+      id,
+      type: id,
+      parentAgentId: "parent",
+      status: "completed",
+      result: `${id} result`,
+    });
+    const spawn = vi.fn(() => "detached-id");
+    const spawnAndWait = vi.fn(async (..._args: unknown[]) => ({ id: "blocking-id", record: completed("blocking") }));
+    const getRecord = vi.fn((id: string) => id === "resume-id" ? completed("detached") : undefined);
+    const resume = vi.fn(async () => completed("resume-id"));
+    const manager = { spawn, spawnAndWait, getRecord, resume, reportNestedIssue: vi.fn() };
+    const [agent] = createNestedSubagentTools({
+      manager,
+      pi,
+      parentAgentId: "parent",
+      depth: 1,
+      maxSubagentDepth: 2,
+      allowedSubagents: "all",
+      configCwd: cwd,
+    });
+    const toolCtx = { cwd, model: undefined, modelRegistry: { find: () => undefined } } as never;
+
+    await agent.execute("plain", { subagent_type: "blocking", description: "blocking", prompt: "work" }, undefined, undefined, toolCtx);
+    expect(spawnAndWait).toHaveBeenCalledTimes(1);
+    expect(spawn).not.toHaveBeenCalled();
+
+    await agent.execute("frontmatter", { subagent_type: "detached", description: "detached", prompt: "work" }, undefined, undefined, toolCtx);
+    expect(spawn).toHaveBeenCalledTimes(1);
+
+    await agent.execute("override-false", { subagent_type: "detached", description: "blocking", prompt: "work", run_in_background: false }, undefined, undefined, toolCtx);
+    expect(spawnAndWait).toHaveBeenCalledTimes(2);
+
+    await agent.execute("override-true", { subagent_type: "blocking", description: "detached", prompt: "work", run_in_background: true }, undefined, undefined, toolCtx);
+    expect(spawn).toHaveBeenCalledTimes(2);
+
+    await agent.execute("resume", { resume: "resume-id", subagent_type: "detached", description: "resume", prompt: "continue" }, undefined, undefined, toolCtx);
+    expect(resume).toHaveBeenCalledWith("resume-id", "continue", expect.objectContaining({ isBackground: true }));
+    await agent.execute("resume-blocking", { resume: "resume-id", subagent_type: "detached", description: "resume", prompt: "continue", run_in_background: false }, undefined, undefined, toolCtx);
+    expect(resume).toHaveBeenLastCalledWith("resume-id", "continue", expect.objectContaining({ isBackground: false }));
+  });
+
+  it("checks and waits only for owned nested results, consuming terminal retrieval", async () => {
+    let resolveChild!: (value: string) => void;
+    const childPromise = new Promise<string>(resolve => { resolveChild = resolve; });
+    const child = record({ id: "child", parentAgentId: "parent", promise: childPromise });
+    const foreign = record({ id: "foreign", parentAgentId: "other", status: "completed", result: "secret" });
+    const manager = {
+      spawn: vi.fn(),
+      spawnAndWait: vi.fn(),
+      getRecord: (id: string) => id === "child" ? child : id === "foreign" ? foreign : undefined,
+      resume: vi.fn(),
+      reportNestedIssue: vi.fn(),
+    };
+    const [, result] = createNestedSubagentTools({
+      manager,
+      pi,
+      parentAgentId: "parent",
+      depth: 1,
+      maxSubagentDepth: 2,
+      allowedSubagents: "all",
+      configCwd: "/tmp",
+    });
+
+    const immediate = await result.execute("check", { agent_id: "child" }, undefined, undefined, undefined);
+    expect(immediate.content[0]).toMatchObject({ type: "text", text: "Agent child is running." });
+    expect(child.resultConsumed).not.toBe(true);
+
+    const controller = new AbortController();
+    const waiting = result.execute("wait", { agent_id: "child", wait: true }, controller.signal, undefined, undefined);
+    controller.abort();
+    await expect(waiting).rejects.toThrow(/aborted/i);
+    expect(child.status).toBe("running");
+    expect(child.resultConsumed).not.toBe(true);
+
+    child.status = "completed";
+    child.result = "child result";
+    resolveChild("child result");
+    const fetched = await result.execute("fetch", { agent_id: "child", wait: true }, undefined, undefined, undefined);
+    expect(fetched.content[0]).toMatchObject({ type: "text", text: "child result" });
+    expect(child.resultConsumed).toBe(true);
+
+    const denied = await result.execute("foreign", { agent_id: "foreign" }, undefined, undefined, undefined);
+    expect(denied.isError).toBe(true);
   });
 
   /**

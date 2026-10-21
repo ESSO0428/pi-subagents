@@ -5,8 +5,17 @@
  * Uses the callback form of setWidget for themed rendering.
  */
 
-import { Editor, isKeyRelease, Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import type { EditorComponent } from "@earendil-works/pi-tui";
+import { isKeyRelease, Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { AgentManager } from "../agent-manager.js";
+import {
+  type AgentTreeKey,
+  type AgentTreeProjection,
+  type AgentTreeRow,
+  navigateAgentTree,
+  projectAgentTree,
+  type WorkflowTreeRoot,
+} from "../agent-tree.js";
 import { getConfig } from "../agent-types.js";
 import type { AgentInvocation, AgentRecord, SubagentType, WidgetMode } from "../types.js";
 import { getLifetimeTotal, getSessionContextPercent, type LifetimeUsage, type SessionLike } from "../usage.js";
@@ -33,6 +42,16 @@ export const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", 
 
 /** Statuses that indicate an error/non-success outcome (used for linger behavior and icon rendering). */
 export const ERROR_STATUSES = new Set(["error", "aborted", "steered", "stopped"]);
+
+type RequiredEditorComponent = Pick<EditorComponent, "getText" | "setText" | "handleInput" | "render" | "invalidate">;
+
+/** Check the runtime contract shared by Pi editors and editor wrappers. */
+function isEditorComponent(value: unknown): value is RequiredEditorComponent {
+  if (value === null || typeof value !== "object") return false;
+  const component = value as Partial<Record<keyof RequiredEditorComponent, unknown>>;
+  return (["getText", "setText", "handleInput", "render", "invalidate"] as const)
+    .every(method => typeof component[method] === "function");
+}
 
 /** Tool name → human-readable action for activity descriptions. */
 const TOOL_DISPLAY: Record<string, string> = {
@@ -64,7 +83,12 @@ export type AgentWidgetOptions = {
    * Nested children carry their parent's session id, so trees stay intact.
    */
   getSessionId?: () => string | undefined;
+  /** Workflow grouping roots for the current session; never conversations. */
+  getWorkflowRoots?: () => WorkflowTreeRoot[];
+  /** Open a root's inspector. Separate from `onOpen`, which opens a transcript. */
+  onOpenWorkflow?: (id: string) => void | Promise<void>;
 };
+
 /** @deprecated Use AgentWidgetOpenMode. */
 export type AgentOpenMode = AgentWidgetOpenMode;
 /** @deprecated Use AgentWidgetOpenCallback. */
@@ -96,16 +120,6 @@ export interface AgentActivity {
   /** Lifetime usage breakdown — see LifetimeUsage docs. */
   lifetimeUsage: LifetimeUsage;
 }
-
-/** Metadata attached to Agent tool results for custom rendering. */
-type WidgetRow = {
-  record: AgentRecord;
-  depth: number;
-  ancestorContinues: boolean[];
-  isLast: boolean;
-  /** True when the row's parent is gone, so it keeps its original indent. */
-  orphaned: boolean;
-};
 
 export interface AgentDetails {
   displayName: string;
@@ -195,6 +209,14 @@ export function formatDuration(startedAt: number, completedAt?: number): string 
 /** Get display name for any agent type (built-in or custom). */
 export function getDisplayName(type: SubagentType): string {
   return getConfig(type).displayName;
+}
+
+function rowTypeName(type: SubagentType): string {
+  return getDisplayName(type);
+}
+
+function rowModeLabel(type: SubagentType): string | undefined {
+  return getPromptModeLabel(type);
 }
 
 /** Short label for prompt mode: "twin" for append, nothing for replace (the default). */
@@ -290,8 +312,12 @@ export class AgentWidget {
   private navigationActive = false;
   /** Depth of AgentWidget-owned modals currently holding the keyboard. */
   private modalDepth = 0;
-  /** Stable identity of the selected row, so roster changes do not jump selection. */
-  private selectedAgentId: string | undefined;
+  /** Stable shared-tree key of the selected row, so roster changes do not jump selection. */
+  private selectedNodeKey: AgentTreeKey | undefined;
+  /** User-collapsed rows for the current session. Rows default to expanded. */
+  private collapsedKeys = new Set<AgentTreeKey>();
+  private treeSessionId: string | undefined;
+  private treeSessionInitialized = false;
   /** Last logical roster index of the selected row, used when it disappears. */
   private selectedRosterIndex = 0;
   /** First logical row currently represented by the bounded viewport. */
@@ -318,30 +344,43 @@ export class AgentWidget {
     },
   ) {}
 
-  /**
-   * Agents eligible for the widget, per the current `WidgetMode`:
-   *   - `off`: none (the widget's existing empty-state path hides it entirely).
-   *   - `background`: drop only agents *known* to be foreground
-   *     (`isBackground === false`); keep everything else — background, queued,
-   *     scheduled, or RPC-spawned (`undefined`). Keying off the `isBackground`
-   *     record flag rather than the UI-only `invocation` snapshot (which only the
-   *     Agent-tool path sets), and excluding rather than allow-listing, means
-   *     only proven-foreground runs drop out — nothing else silently vanishes.
-   *   - `all`: every agent.
-   */
-  private widgetAgents() {
-    if (this.mode() === "off") return [];
-    // Scope to this session before the mode filter. Restored records from other
-    // sessions are still openable through `/agents` history; they just do not
-    // clutter the roster sitting under the editor.
+  private resetNavigationState(): void {
+    this.navigationActive = false;
+    this.selectedNodeKey = undefined;
+    this.selectedRosterIndex = 0;
+    this.viewportStart = 0;
+  }
+
+  /** Keep collapse and selection state confined to the session that created it. */
+  private currentSessionId(): string | undefined {
     const sessionId = this.options.getSessionId?.();
-    const all = sessionId
-      ? this.manager.listAgents().filter(record => record.sessionId === sessionId)
-      : this.manager.listAgents();
-    switch (this.mode()) {
-      case "background": return all.filter(a => a.parentAgentId !== undefined || a.isBackground !== false);
-      default: return all;
+    if (!this.treeSessionInitialized) {
+      this.treeSessionId = sessionId;
+      this.treeSessionInitialized = true;
+    } else if (sessionId !== this.treeSessionId) {
+      this.treeSessionId = sessionId;
+      this.collapsedKeys.clear();
+      this.resetNavigationState();
     }
+    return sessionId;
+  }
+
+  /** Shared projection is the widget's only hierarchy and visibility source. */
+  private treeProjection(
+    collapsedKeys: ReadonlySet<AgentTreeKey> = this.collapsedKeys,
+  ): AgentTreeProjection {
+    return projectAgentTree({
+      agents: this.manager.listAgents(),
+      workflowRoots: this.options.getWorkflowRoots?.() ?? [],
+      sessionId: this.currentSessionId(),
+      mode: this.mode(),
+      collapsedKeys,
+      canOpenTerminalAgent: this.options.canOpenHistory,
+    });
+  }
+
+  private rowStatus(row: AgentTreeRow): string {
+    return row.node.kind === "workflow" ? row.node.root.status : row.node.record.status;
   }
 
   /** Set the UI context (grabbed from first tool execution). */
@@ -357,10 +396,10 @@ export class AgentWidget {
     this.tui = undefined;
     this.lastStatusText = undefined;
     this.lastRenderKey = undefined;
-    this.navigationActive = false;
-    this.selectedAgentId = undefined;
-    this.selectedRosterIndex = 0;
-    this.viewportStart = 0;
+    this.resetNavigationState();
+    this.collapsedKeys.clear();
+    this.treeSessionId = undefined;
+    this.treeSessionInitialized = false;
     // Print/RPC tests and lightweight embedders may provide only the widget
     // surface; real interactive contexts always implement this hook.
     if (typeof ctx.onTerminalInput === "function") {
@@ -376,14 +415,7 @@ export class AgentWidget {
     return true;
   }
 
-  /**
-   * Drop the registration so the next `update()` calls `setWidget` again.
-   *
-   * Named "re-focus" for users: the panel stopped responding and this is the
-   * lever for bringing it back. It does not move keyboard focus — nothing in
-   * pi's extension API can — so the caller reports what actually happened rather
-   * than implying focus moved.
-   */
+  /** Drop the registration so the next `update()` calls `setWidget` again. */
   reRegister(): void {
     this.widgetRegistered = false;
     this.tui = undefined;
@@ -398,7 +430,7 @@ export class AgentWidget {
 
   /** Keep the spinner/elapsed-time timer alive only while a visible agent runs. */
   ensureTimer() {
-    if (!this.uiCtx || !this.widgetAgents().some(a => a.status === "running")) return;
+    if (!this.uiCtx || !this.treeProjection(new Set()).rows.some(row => this.rowStatus(row) === "running")) return;
     if (!this.widgetInterval) {
       this.widgetInterval = setInterval(() => this.update(true), 250);
     }
@@ -419,72 +451,9 @@ export class AgentWidget {
    */
   markFinished(_agentId: string) {}
 
-  /**
-   * Records represented by selectable rows in the above-editor widget.
-   *
-   * Keep this order as the single source of truth for both rendering and key
-   * navigation. `listAgents()` is newest-first; active rows come first so the
-   * panel exposes currently useful work before terminal history.
-   */
-  private rosterRows(): WidgetRow[] {
-    const agents = this.widgetAgents();
-    const visible = agents.filter(record =>
-      record.status === "running" || record.status === "queued"
-      || (record.completedAt !== undefined && this.options.canOpenHistory(record)),
-    );
-    const rank = (record: AgentRecord): number =>
-      record.status === "running" ? 0 : record.status === "queued" ? 1 : 2;
-    const order = new Map(agents.map((record, index) => [record.id, index]));
-    const compare = (a: AgentRecord, b: AgentRecord) => rank(a) - rank(b)
-      || (order.get(a.id) ?? 0) - (order.get(b.id) ?? 0);
-    const visibleIds = new Set(visible.map(record => record.id));
-    const children = new Map<string, AgentRecord[]>();
-    const roots: AgentRecord[] = [];
-    const orphans: AgentRecord[] = [];
-    for (const record of visible) {
-      const parent = record.parentAgentId;
-      if (parent && visibleIds.has(parent)) {
-        const siblings = children.get(parent) ?? [];
-        siblings.push(record);
-        children.set(parent, siblings);
-      } else if (parent) {
-        // The parent record is gone. Keep the row at its original depth so the
-        // subtree does not silently flatten into a top-level agent, and mark it
-        // so the render can say why it sits there alone.
-        orphans.push(record);
-      } else {
-        roots.push(record);
-      }
-    }
-    roots.sort(compare);
-    for (const siblings of children.values()) siblings.sort(compare);
-
-    const rows: WidgetRow[] = [];
-    const visit = (
-      record: AgentRecord,
-      depth: number,
-      ancestorContinues: boolean[],
-      isLast: boolean,
-      orphaned = false,
-    ) => {
-      rows.push({ record, depth, ancestorContinues, isLast, orphaned });
-      const nested = children.get(record.id) ?? [];
-      nested.forEach((child, index) => {
-        visit(child, depth + 1, [...ancestorContinues, !isLast], index === nested.length - 1);
-      });
-    };
-    roots.forEach((record, index) => {
-      visit(record, 0, [], index === roots.length - 1);
-    });
-    orphans.sort(compare);
-    orphans.forEach((record, index) => {
-      visit(record, Math.max(1, record.depth ?? 1), new Array(Math.max(0, (record.depth ?? 1) - 1)).fill(true), index === orphans.length - 1, true);
-    });
-    return rows;
-  }
-
-  private roster(): AgentRecord[] {
-    return this.rosterRows().map(row => row.record);
+  /** Visible, selectable rows in shared-tree preorder. */
+  private rosterRows(): readonly AgentTreeRow[] {
+    return this.treeProjection().rows;
   }
 
   /**
@@ -498,42 +467,29 @@ export class AgentWidget {
   }
 
   /**
-   * True when pi's prompt editor owns the keyboard.
+   * True when Pi's prompt editor owns the keyboard.
    *
-   * Both halves of this are load-bearing, and both were arrived at the hard way.
-   *
-   * A terminal-input listener runs BEFORE the focused component, and pi swaps
+   * A terminal-input listener runs before the focused component, and Pi swaps
    * the prompt editor out for every dialog while `getEditorText()` keeps
    * reporting the detached — empty — editor. Without this guard the widget eats
-   * ↑/↓/enter/escape from `/settings`, from other extensions' pickers, and from
-   * pi's own menus (upstream issue #123). Only the prompt editor may claim keys.
+   * ↑/↓/enter/escape from `/settings`, other extensions' pickers, and Pi's own
+   * menus. The modal-depth guard covers dialogs opened by this extension; the
+   * structural EditorComponent contract covers Pi's editor and wrappers such as
+   * tmux cursor-focus without relying on a shared module identity. Dialogs and
+   * overlays that lack the editor text methods, such as SettingsList and the
+   * autoresearch dashboard, are rejected.
    *
    * `focused == null` errs toward the editor so list activation keeps working.
-   * `focused instanceof Editor` is deliberately NOT replaced with a structural
-   * probe: pi's own `/settings` focuses `SettingsList`, a pi-tui class instance,
-   * so no shape test separates it from the editor, and another extension can
-   * wrap the editor through `setEditorComponent()` (pi-tmux-cursor-focus does
-   * exactly that whenever pi runs under tmux), so class identity is the only
-   * test that can.
-   *
-   * That leaves one known failure mode, which is why this is conservative
-   * rather than clever: if this extension resolves its own copy of
-   * `@earendil-works/pi-tui` at a different version than the host's, the two
-   * `Editor` classes are unrelated objects, the check is always false, and
-   * roster ↑/↓ stays inert. Inert is the safe failure — it breaks this one
-   * feature instead of every other menu in the host. Aligning the peer so the
-   * check works is a dependency-graph change in the host project, not something
-   * to paper over here.
    */
   private editorHasFocus(): boolean {
     if (this.modalDepth > 0) return false;
     const focused = (this.tui as { focusedComponent?: unknown } | undefined)?.focusedComponent;
-    return focused == null || focused instanceof Editor;
+    return focused == null || isEditorComponent(focused);
   }
 
-  private selectedIndexOf(records: readonly AgentRecord[]): number {
-    if (!this.selectedAgentId) return -1;
-    return records.findIndex(record => record.id === this.selectedAgentId);
+  private selectedIndexOf(rows: readonly AgentTreeRow[]): number {
+    if (!this.selectedNodeKey) return -1;
+    return rows.findIndex(row => row.key === this.selectedNodeKey);
   }
 
   private deactivate(): void {
@@ -546,51 +502,77 @@ export class AgentWidget {
   }
 
   /** Resume navigation from the retained row, or select the first row. */
-  private activate(records: readonly AgentRecord[]): void {
+  private activate(rows: readonly AgentTreeRow[]): void {
     this.navigationActive = true;
-    const selectedIndex = this.selectedIndexOf(records);
+    const selectedIndex = this.selectedIndexOf(rows);
     if (selectedIndex >= 0) {
       this.selectedRosterIndex = selectedIndex;
     } else {
       // The previously selected row may have been cleaned up while navigation
       // was inactive. Resume at its old logical position, clamped to the new
       // roster, rather than jumping back to the first row.
-      const fallbackIndex = Math.max(0, Math.min(this.selectedRosterIndex, records.length - 1));
-      this.selectedAgentId = records[fallbackIndex].id;
+      const fallbackIndex = Math.max(0, Math.min(this.selectedRosterIndex, rows.length - 1));
+      this.selectedNodeKey = rows[fallbackIndex].key;
       this.selectedRosterIndex = fallbackIndex;
-      this.viewportStart = Math.min(this.viewportStart, Math.max(0, records.length - 1));
+      this.viewportStart = Math.min(this.viewportStart, Math.max(0, rows.length - 1));
     }
     this.update();
   }
 
   /** Move the selected row, activating only from an empty focused editor. */
   private moveSelection(direction: -1 | 1): boolean {
-    const records = this.roster();
+    const projection = this.treeProjection();
+    const rows = projection.rows;
     const ui = this.uiCtx;
-    if (records.length === 0 || !ui) return false;
+    if (rows.length === 0 || !ui) return false;
 
     if (!this.navigationActive) {
       if (direction !== 1 || !this.editorHasFocus() || (ui.getEditorText?.() ?? "") !== "") return false;
-      this.activate(records);
+      this.activate(rows);
       return true;
     }
 
-    const currentIndex = Math.max(0, this.selectedIndexOf(records));
+    const currentIndex = Math.max(0, this.selectedIndexOf(rows));
     if (direction === -1 && currentIndex === 0) {
       this.deactivate();
       return true;
     }
-    const nextIndex = Math.max(0, Math.min(records.length - 1, currentIndex + direction));
-    this.selectedAgentId = records[nextIndex].id;
-    this.selectedRosterIndex = nextIndex;
+    const navigation = navigateAgentTree(
+      projection,
+      this.selectedNodeKey,
+      this.collapsedKeys,
+      direction === -1 ? "up" : "down",
+    );
+    this.selectedNodeKey = navigation.selectedKey;
+    this.selectedRosterIndex = Math.max(0, this.selectedIndexOf(rows));
     this.update();
     return true;
   }
 
+  /** Collapse, expand, or move to a parent while tree navigation is active. */
+  private moveHorizontal(direction: "left" | "right"): void {
+    const projection = this.treeProjection();
+    const navigation = navigateAgentTree(
+      projection,
+      this.selectedNodeKey,
+      this.collapsedKeys,
+      direction,
+    );
+    this.selectedNodeKey = navigation.selectedKey;
+    this.collapsedKeys = new Set(navigation.collapsedKeys);
+    this.selectedRosterIndex = Math.max(0, this.selectedIndexOf(this.treeProjection().rows));
+    this.update();
+  }
+
   private openSelected(): void {
-    const record = this.roster().find(candidate => candidate.id === this.selectedAgentId);
+    const row = this.rosterRows().find(candidate => candidate.key === this.selectedNodeKey);
     this.deactivate();
-    if (!record) return;
+    if (!row) return;
+    if (row.node.kind === "workflow") {
+      void this.options.onOpenWorkflow?.(row.node.root.id);
+      return;
+    }
+    const record = row.node.record;
     const mode: AgentWidgetOpenMode = record.status === "running" || record.status === "queued" ? "live" : "history";
     void this.options.onOpen(record, mode);
   }
@@ -604,11 +586,11 @@ export class AgentWidget {
     }
 
     if (!this.navigationActive) {
-      const records = this.roster();
-      if (!matchesKey(data, "down") || (this.uiCtx.getEditorText?.() ?? "") !== "" || records.length === 0) {
+      const rows = this.rosterRows();
+      if (!matchesKey(data, "down") || (this.uiCtx.getEditorText?.() ?? "") !== "" || rows.length === 0) {
         return undefined;
       }
-      this.activate(records);
+      this.activate(rows);
       return { consume: true };
     }
 
@@ -618,21 +600,28 @@ export class AgentWidget {
     }
     if (matchesKey(data, "up")) return this.moveSelection(-1) ? { consume: true } : undefined;
     if (matchesKey(data, "down")) return this.moveSelection(1) ? { consume: true } : undefined;
+    if (matchesKey(data, "left")) {
+      this.moveHorizontal("left");
+      return { consume: true };
+    }
+    if (matchesKey(data, "right")) {
+      this.moveHorizontal("right");
+      return { consume: true };
+    }
     if (matchesKey(data, Key.enter)) {
       this.openSelected();
       return { consume: true };
     }
 
-    // Only ↑/↓ navigate. Other keys, including j/k/←/→, flow to the editor
-    // and leave navigation mode.
+    // Non-navigation keys flow to the editor and leave navigation mode.
     this.deactivate();
     return undefined;
   }
 
   /** Render a finished agent line. */
   private renderFinishedLine(a: AgentRecord, theme: Theme): string {
-    const name = getDisplayName(a.type);
-    const modeLabel = getPromptModeLabel(a.type);
+    const name = rowTypeName(a.type);
+    const modeLabel = rowModeLabel(a.type);
     const duration = formatMs((a.completedAt ?? Date.now()) - a.startedAt);
 
     let icon: string;
@@ -678,21 +667,17 @@ export class AgentWidget {
    * reading live state each time instead of capturing it in a closure.
    */
   private renderWidget(tui: any, theme: Theme): string[] {
-    const allAgents = this.widgetAgents();
-    const running = allAgents.filter(a => a.status === "running");
-    const queued = allAgents.filter(a => a.status === "queued");
-    const finished = allAgents.filter(a =>
-      a.status !== "running" && a.status !== "queued" && a.completedAt !== undefined
-      && this.options.canOpenHistory(a),
-    );
+    const projection = this.treeProjection();
+    const allRows = this.treeProjection(new Set()).rows;
+    const hasActive = allRows.some(row => {
+      const status = this.rowStatus(row);
+      return status === "running" || status === "queued" || status === "paused";
+    });
 
-    const selectedId = this.navigationActive ? this.selectedAgentId : undefined;
-    const hasActive = running.length > 0 || queued.length > 0;
-    const hasFinished = finished.length > 0;
+    // Nothing to show — return empty (widget will be unregistered by update()).
+    if (projection.rows.length === 0) return [];
 
-    // Nothing to show — return empty (widget will be unregistered by update())
-    if (!hasActive && !hasFinished) return [];
-
+    const selectedKey = this.navigationActive ? this.selectedNodeKey : undefined;
     const w = tui.terminal.columns;
     const maxLines = getWidgetLineBudget(tui.terminal.rows);
     if (maxLines === 0) return [];
@@ -701,27 +686,61 @@ export class AgentWidget {
     const headingIcon = hasActive ? "●" : "○";
     const frame = SPINNER[this.widgetFrame % SPINNER.length];
 
-    // Build sections separately for overflow-aware assembly.
-    // Each running agent = 2 lines (header + activity), finished = 1 line, queued = 1 line.
-
-    const rosterRows = this.rosterRows();
-    const ancestorPrefix = (row: WidgetRow): string => row.ancestorContinues
+    const ancestorPrefix = (row: AgentTreeRow): string => row.ancestorContinues
       .map(continues => continues ? "│  " : "   ")
       .join("");
-    const orphanNote = (row: WidgetRow): string =>
-      row.orphaned ? theme.fg("dim", ` · parent ${row.record.parentDescription ?? row.record.parentAgentId} is gone`) : "";
-    const rowPrefix = (row: WidgetRow): string => ancestorPrefix(row) + (row.isLast ? "└─ " : "├─ ");
-    const detailPrefix = (row: WidgetRow): string => ancestorPrefix(row) + "│    ";
-    const renderedRows: { record: AgentRecord; lines: string[]; depth: number }[] = [];
+    const orphanNote = (row: AgentTreeRow): string => {
+      if (!row.orphaned || row.node.kind !== "agent") return "";
+      if (row.cycle) return theme.fg("dim", " · parent cycle");
+      const record = row.node.record;
+      return theme.fg("dim", ` · parent ${record.parentDescription ?? record.parentAgentId} is gone`);
+    };
+    const rowPrefix = (row: AgentTreeRow): string => ancestorPrefix(row) + (row.isLast ? "└─ " : "├─ ");
+    const detailPrefix = (row: AgentTreeRow): string => ancestorPrefix(row) + "│    ";
+    const renderedRows: { row: AgentTreeRow; lines: string[]; depth: number }[] = [];
 
-    for (const row of rosterRows) {
-      const a = row.record;
+    for (const row of projection.rows) {
       const note = orphanNote(row);
-      const marker = a.id === selectedId ? theme.fg("accent", "●") : theme.fg("dim", "○");
+      const marker = row.key === selectedKey ? theme.fg("accent", "●") : theme.fg("dim", "○");
+      const disclosure = row.hasChildren
+        ? theme.fg("dim", row.expanded ? "▾" : "▸")
+        : " ";
       const prefix = theme.fg("dim", rowPrefix(row));
+
+      if (row.node.kind === "workflow") {
+        const root = row.node.root;
+        const statusColor = root.status === "completed"
+          ? "success"
+          : root.status === "failed" ? "error" : root.status === "paused" ? "warning" : "dim";
+        const icon = root.status === "running"
+          ? theme.fg("accent", frame)
+          : root.status === "completed"
+          ? theme.fg("success", "✓")
+          : root.status === "failed"
+          ? theme.fg("error", "✗")
+          : root.status === "killed"
+          ? theme.fg("dim", "■")
+          : theme.fg("warning", "Ⅱ");
+        const elapsed = formatMs((root.completedAt ?? Date.now()) - root.startedAt);
+        const progress = `${root.doneCount}/${root.agentCount} done`;
+        renderedRows.push({
+          row,
+          depth: row.depth,
+          lines: [truncate(
+            prefix
+            + `${marker} ${disclosure} ${icon} ${theme.bold("workflow")}  `
+            + `${theme.fg("muted", truncateLine(root.description || root.name))} ${theme.fg("dim", "·")} `
+            + `${theme.fg(statusColor, root.status)} ${theme.fg("dim", "·")} `
+            + `${theme.fg("dim", `${progress} · ${formatTokens(root.tokens)} · ${elapsed}`)}`,
+          )],
+        });
+        continue;
+      }
+
+      const a = row.node.record;
       if (a.status === "running") {
-        const name = getDisplayName(a.type);
-        const modeLabel = getPromptModeLabel(a.type);
+        const name = rowTypeName(a.type);
+        const modeLabel = rowModeLabel(a.type);
         const modeTag = modeLabel ? ` ${theme.fg("dim", `(${modeLabel})`)}` : "";
         const elapsed = formatMs(Date.now() - a.startedAt);
         const activityState = this.agentActivity.get(a.id);
@@ -741,24 +760,24 @@ export class AgentWidget {
           ? `nested blocked: ${a.nestedIssue}`
           : live ? describeActivity(live.activeTools, live.responseText) : "thinking…";
         renderedRows.push({
-          record: a,
+          row,
           depth: row.depth,
           lines: [
-            truncate(prefix + `${marker} ${theme.fg("accent", frame)} ${theme.bold(name)}${modeTag}  ${theme.fg("muted", truncateLine(a.description))} ${theme.fg("dim", "·")} ${fgPreservingNestedStyles(theme, "dim", statsText)}${note}`),
+            truncate(prefix + `${marker} ${disclosure} ${theme.fg("accent", frame)} ${theme.bold(name)}${modeTag}  ${theme.fg("muted", truncateLine(a.description))} ${theme.fg("dim", "·")} ${fgPreservingNestedStyles(theme, "dim", statsText)}${note}`),
             truncate(theme.fg("dim", detailPrefix(row)) + theme.fg("dim", `⎿  ${activity}`)),
           ],
         });
       } else if (a.status === "queued") {
         renderedRows.push({
-          record: a,
+          row,
           depth: row.depth,
-          lines: [truncate(prefix + `${marker} ${theme.fg("muted", "◦")} ${theme.fg("dim", `${getDisplayName(a.type)}  ${truncateLine(a.description)} · queued`)}${note}`)],
+          lines: [truncate(prefix + `${marker} ${disclosure} ${theme.fg("muted", "◦")} ${theme.fg("dim", `${rowTypeName(a.type)}  ${truncateLine(a.description)} · queued`)}${note}`)],
         });
       } else {
         renderedRows.push({
-          record: a,
+          row,
           depth: row.depth,
-          lines: [truncate(prefix + `${marker} ` + this.renderFinishedLine(a, theme) + note)],
+          lines: [truncate(prefix + `${marker} ${disclosure} ` + this.renderFinishedLine(a, theme) + note)],
         });
       }
     }
@@ -769,7 +788,7 @@ export class AgentWidget {
     const rows = renderedRows;
     const totalBody = rows.reduce((total, row) => total + row.lines.length, 0);
 
-    const heading = "Agents  ↑↓ select · enter view · esc back · `/agents re-focus` re-focus agents select";
+    const heading = "Agents  ↑↓ select · ←→ fold · enter view · esc back";
     const lines: string[] = [truncate(theme.fg(headingColor, headingIcon) + " " + theme.fg(headingColor, heading))];
 
     if (maxLines === 1) {
@@ -800,8 +819,8 @@ export class AgentWidget {
       };
 
       let start = Math.max(0, Math.min(this.viewportStart, Math.max(0, rows.length - 1)));
-      const selectedIndex = this.navigationActive && selectedId
-        ? rows.findIndex(row => row.record.id === selectedId)
+      const selectedIndex = this.navigationActive && selectedKey
+        ? rows.findIndex(row => row.row.key === selectedKey)
         : -1;
       if (selectedIndex >= 0) {
         if (selectedIndex < start) start = selectedIndex;
@@ -843,9 +862,12 @@ export class AgentWidget {
       const hidden = hiddenBefore + hiddenAfter;
       const hiddenRows = rows.filter((_row, index) => index < start || index >= end);
       const categoryCounts: string[] = [
-        ["running", hiddenRows.filter(row => row.record.status === "running").length] as [string, number],
-        ["queued", hiddenRows.filter(row => row.record.status === "queued").length] as [string, number],
-        ["finished", hiddenRows.filter(row => row.record.status !== "running" && row.record.status !== "queued").length] as [string, number],
+        ["running", hiddenRows.filter(row => this.rowStatus(row.row) === "running").length] as [string, number],
+        ["queued", hiddenRows.filter(row => this.rowStatus(row.row) === "queued").length] as [string, number],
+        ["finished", hiddenRows.filter(row => {
+          const status = this.rowStatus(row.row);
+          return status !== "running" && status !== "queued";
+        }).length] as [string, number],
       ].filter(([, count]) => count > 0).map(([label, count]) => `${count} ${label}`);
       const direction = [
         ...(hiddenBefore > 0 ? [`↑ ${hiddenBefore} more`] : []),
@@ -898,8 +920,10 @@ export class AgentWidget {
   }
 
   /** Build a render-relevant snapshot without capturing mutable records. */
-  private renderKey(allAgents: ReturnType<AgentManager["listAgents"]>): string {
-    const activities = allAgents.map(a => {
+  private renderKey(projection: AgentTreeProjection): string {
+    const activities = projection.rows.map(row => {
+      if (row.node.kind !== "agent") return undefined;
+      const a = row.node.record;
       const activity = this.agentActivity.get(a.id);
       return activity ? {
         id: a.id,
@@ -914,25 +938,55 @@ export class AgentWidget {
     });
     return JSON.stringify({
       frame: this.widgetFrame,
-      agents: allAgents.map(a => ({
-        id: a.id,
-        type: a.type,
-        description: a.description,
-        status: a.status,
-        toolUses: a.toolUses,
-        startedAt: a.startedAt,
-        completedAt: a.completedAt,
-        error: a.error,
-        lifetimeUsage: a.lifetimeUsage,
-        compactionCount: a.compactionCount,
-        isBackground: a.isBackground,
-        hasSession: a.session !== undefined,
-        transcriptPath: a.transcriptPath,
-        openableHistory: this.options.canOpenHistory(a),
-      })),
+      rows: projection.rows.map(row => {
+        const hierarchy = {
+          key: row.key,
+          depth: row.depth,
+          parentKey: row.parentKey,
+          ancestorContinues: row.ancestorContinues,
+          isLast: row.isLast,
+          hasChildren: row.hasChildren,
+          expanded: row.expanded,
+          orphaned: row.orphaned,
+          cycle: row.cycle,
+        };
+        if (row.node.kind === "workflow") {
+          return { ...hierarchy, kind: "workflow", ...row.node.root };
+        }
+        const a = row.node.record;
+        return {
+          ...hierarchy,
+          kind: "agent",
+          id: a.id,
+          type: a.type,
+          description: a.description,
+          status: a.status,
+          toolUses: a.toolUses,
+          startedAt: a.startedAt,
+          completedAt: a.completedAt,
+          error: a.error,
+          lifetimeUsage: a.lifetimeUsage,
+          compactionCount: a.compactionCount,
+          isBackground: a.isBackground,
+          parentAgentId: a.parentAgentId,
+          parentDescription: a.parentDescription,
+          nestedIssue: a.nestedIssue,
+          liveActivity: a.liveActivity ? {
+            activeTools: [...a.liveActivity.activeTools.entries()],
+            responseText: a.liveActivity.responseText,
+            turnCount: a.liveActivity.turnCount,
+            maxTurns: a.liveActivity.maxTurns,
+            contextPercent: getSessionContextPercent(a.liveActivity.session),
+          } : undefined,
+          hasSession: a.session !== undefined,
+          transcriptPath: a.transcriptPath,
+          openableHistory: this.options.canOpenHistory(a),
+        };
+      }),
       activities,
+      collapsedKeys: [...this.collapsedKeys].sort(),
       navigationActive: this.navigationActive,
-      selectedAgentId: this.selectedAgentId,
+      selectedNodeKey: this.selectedNodeKey,
       viewportStart: this.viewportStart,
     });
   }
@@ -940,21 +994,22 @@ export class AgentWidget {
   /** Force an immediate widget update. `advanceSpinner` is reserved for the timer. */
   update(advanceSpinner = false) {
     if (!this.uiCtx) return;
-    const allAgents = this.widgetAgents();
-    const roster = this.roster();
+    const projection = this.treeProjection();
+    const allRows = this.treeProjection(new Set()).rows;
 
-    // Lightweight existence checks — full categorization happens in renderWidget()
     let runningCount = 0;
     let queuedCount = 0;
-    for (const a of roster) {
-      if (a.status === "running") runningCount++;
-      else if (a.status === "queued") queuedCount++;
+    let hasRunning = false;
+    for (const row of allRows) {
+      const status = this.rowStatus(row);
+      if (status === "running") hasRunning = true;
+      if (row.node.kind !== "agent") continue;
+      if (status === "running") runningCount++;
+      else if (status === "queued") queuedCount++;
     }
-    const hasFinished = roster.some(a => a.status !== "running" && a.status !== "queued");
-    const hasActive = runningCount > 0 || queuedCount > 0;
 
-    // Nothing to show — clear widget
-    if (!hasActive && !hasFinished) {
+    // Nothing to show — clear widget.
+    if (projection.rows.length === 0) {
       if (this.widgetRegistered) {
         this.uiCtx.setWidget("agents", undefined);
         this.widgetRegistered = false;
@@ -965,52 +1020,44 @@ export class AgentWidget {
         this.lastStatusText = undefined;
       }
       this.lastRenderKey = undefined;
-      this.navigationActive = false;
-      this.selectedAgentId = undefined;
-      this.selectedRosterIndex = 0;
-      this.viewportStart = 0;
+      this.resetNavigationState();
       this.syncTimer(false);
       return;
     }
 
-    // Status bar — only call setStatus when the text actually changes
+    // Status bar counts real agents, not grouping-only workflow roots.
     let newStatusText: string | undefined;
-    if (hasActive) {
+    const activeAgentCount = runningCount + queuedCount;
+    if (activeAgentCount > 0) {
       const statusParts: string[] = [];
       if (runningCount > 0) statusParts.push(`${runningCount} running`);
       if (queuedCount > 0) statusParts.push(`${queuedCount} queued`);
-      const total = runningCount + queuedCount;
-      newStatusText = `${statusParts.join(", ")} agent${total === 1 ? "" : "s"}`;
+      newStatusText = `${statusParts.join(", ")} agent${activeAgentCount === 1 ? "" : "s"}`;
     }
     if (newStatusText !== this.lastStatusText) {
       this.uiCtx.setStatus("subagents", newStatusText);
       this.lastStatusText = newStatusText;
     }
 
-    // Spinner animation is driven only by the timer while a visible running
-    // agent exists. Event-driven updates refresh changed stats without making
-    // an otherwise idle widget advance.
-    if (advanceSpinner && runningCount > 0) this.widgetFrame++;
-    this.syncTimer(runningCount > 0);
+    // Event-driven updates refresh hierarchy/layout with a forced redraw.
+    // Timer ticks only advance running spinners and remain incremental.
+    if (advanceSpinner && hasRunning) this.widgetFrame++;
+    this.syncTimer(hasRunning);
+    const roster = projection.rows;
     const selectedIndex = this.selectedIndexOf(roster);
     if (selectedIndex >= 0) {
       this.selectedRosterIndex = selectedIndex;
     } else if (this.navigationActive) {
       if (roster.length === 0) {
-        this.navigationActive = false;
-        this.selectedAgentId = undefined;
-        this.selectedRosterIndex = 0;
-        this.viewportStart = 0;
+        this.resetNavigationState();
       } else {
-        // Keep the selection near the row that disappeared. Both the saved
-        // logical index and viewport are clamped as the roster shrinks.
         const fallbackIndex = Math.max(0, Math.min(this.selectedRosterIndex, roster.length - 1));
-        this.selectedAgentId = roster[fallbackIndex].id;
+        this.selectedNodeKey = roster[fallbackIndex].key;
         this.selectedRosterIndex = fallbackIndex;
         this.viewportStart = Math.min(this.viewportStart, roster.length - 1);
       }
     }
-    const renderKey = this.renderKey(allAgents);
+    const renderKey = this.renderKey(projection);
 
     // Register widget callback once; subsequent updates use requestRender()
     // which re-invokes render() without replacing the component (avoids layout thrashing).
@@ -1031,7 +1078,10 @@ export class AgentWidget {
     } else if (renderKey !== this.lastRenderKey) {
       // Widget already registered — request a re-render only when visible state
       // changed (or the spinner timer advanced).
-      this.tui?.requestRender();
+      // Event-driven updates can change surrounding layout state, so force a
+      // full redraw. Timer ticks only advance the spinner and use incremental
+      // rendering to keep animation lightweight.
+      this.tui?.requestRender(!advanceSpinner);
     }
     this.lastRenderKey = renderKey;
   }
@@ -1051,10 +1101,10 @@ export class AgentWidget {
     this.tui = undefined;
     this.lastStatusText = undefined;
     this.lastRenderKey = undefined;
-    this.navigationActive = false;
-    this.selectedAgentId = undefined;
-    this.selectedRosterIndex = 0;
-    this.viewportStart = 0;
+    this.resetNavigationState();
+    this.collapsedKeys.clear();
+    this.treeSessionId = undefined;
+    this.treeSessionInitialized = false;
     this.uiCtx = undefined;
   }
 }

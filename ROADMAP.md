@@ -1,6 +1,6 @@
 # pi-subagents 路線圖
 
-只記錄**尚未完成**的工作。完成的項目直接移除，不保留完成記錄；功能的完整歷史以 [`CHANGELOG.md`](CHANGELOG.md) 為準。最終狀態是空檔案。
+除下方「Fork 永久不變量」外，只記錄**尚未完成**的工作。完成的項目直接移除，不保留完成記錄；功能的完整歷史以 [`CHANGELOG.md`](CHANGELOG.md) 為準。最終狀態只保留永久不變量。
 
 上游 fork 為 `upstream` remote（`git show upstream/master:<path>`）。後續只做 feature port，不做 large upstream merge。
 
@@ -11,6 +11,10 @@
 - UI 功能必須有人工操作紀錄（terminal 尺寸、操作步驟、畫面結果、可見延遲）。不要把「測試通過」單獨當成 latency acceptance
 - v0.17.6 的 ConversationViewer baseline（scrollbar rail、`[preview]`/`[Esc]`、`w` preview、in-place read-only Tool Output、鍵盤與 wheel scroll）不可被改寫
 - 資源安全政策不因功能恢復而撤回：Vitest / E2E / build 在此裝置需明確授權
+
+## Fork 永久不變量
+
+- Workflow root 僅作分組；workflow 擁有的真實 `AgentRecord` 與其 nested descendants 必須在 AgentWidget 與 `/agents` 皆可見、可選、可開啟 Agent View。不得因 upstream 採用 workflow-only progress surface，就恢復隱藏、攤平或以抽象 task panel 取代真實 agents 的呈現。
 
 ## 未來：讓模型知道 nested 怎麼用
 
@@ -32,18 +36,11 @@
 - `pipeline()` stage 之間無 barrier；`parallel()` 是 barrier
 - `agent({ gate: "npm test" })` 以執行指令驗證 child；`agent({ resume: "<label>" })` 接續 child
 - live card + `/agents → Workflows` 兩欄 inspector
-- workflow 自己擁有的 agents 不列於任何 top-level surface，由 run 負責回報
 - 若 `docs/workflows.md`（現有 30 KB）在交付時仍描述尚未實作的行為，需一併收斂
 
 ### 引導機制（不可省略）
 
 上游不靠被動技能，靠**工具描述中的選擇準則**。`SubagentWorkflow` 的 `promptGuidelines` 明寫「何時用 Workflow、何時用 Agent」以及「優先 `pipeline` 而非 `parallel`」。沒有這段引導，模型不會主動選工具。任何功能恢復都必須同時交付引導文字。
-
-## pi-tui 版本分裂（需使用者決策）
-
-本 extension 宣告 peer `@earendil-works/pi-tui >=0.80.8`，但在 `~/.pi/agent/npm` 實際解析到 `0.74.2`，pi host 使用 `1.0.0`。後果是 `agent-widget.ts` 的 `focused instanceof Editor` 恆 false，roster `↑`/`↓` 在此環境 inert。
-
-阻擋者：`@nklisch/pi-mcp-adapter`（`^0.74.0`）與 `@aliou/pi-utils-ui`（`>=0.74.0 <1`）。inert 是刻意的安全失效——改用結構式探針會讓 widget 從其他擴充套件的對話框搶走方向鍵（曾發生，見 0.17.23/0.17.28）。根治需調整 host 端相依圖。
 
 ## 未來：`/workflow` 使用者指令
 

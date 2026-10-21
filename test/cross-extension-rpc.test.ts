@@ -1,5 +1,15 @@
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { AgentManager } from "../src/agent-manager.js";
+import { readAgentRecoveryCheckpoints } from "../src/agent-recovery.js";
 import { type EventBus, PROTOCOL_VERSION, type RpcDeps, registerRpcHandlers, type SpawnCapable } from "../src/cross-extension-rpc.js";
+
+vi.mock("../src/agent-runner.js", () => ({
+  runAgent: vi.fn(() => new Promise(() => {})),
+  resumeAgent: vi.fn(),
+}));
 
 /** Simple in-process event bus for testing. */
 function createEventBus(): EventBus {
@@ -26,7 +36,13 @@ describe("cross-extension RPC", () => {
     events = createEventBus();
     manager = { spawn: vi.fn().mockReturnValue("agent-42"), abort: vi.fn().mockReturnValue(true) };
     ctx = { session: true };
-    deps = { events, pi: { events }, getCtx: () => ctx, manager };
+    deps = {
+      events,
+      pi: { events },
+      getCtx: () => ctx,
+      manager,
+      getOutputTranscript: () => false,
+    };
   });
 
   // --- ping ---
@@ -158,6 +174,88 @@ describe("cross-extension RPC", () => {
     });
   });
 
+  describe("RPC transcript recovery", () => {
+    it("checkpoints the transcript locator before an RPC session starts", async () => {
+      const cwd = mkdtempSync(join(tmpdir(), "pi-rpc-recovery-"));
+      const rpcEvents = createEventBus();
+      const rpcManager = new AgentManager(undefined, 1);
+      const context = {
+        cwd,
+        sessionManager: { getSessionId: () => "session-rpc" },
+      };
+      const handle = registerRpcHandlers({
+        events: rpcEvents,
+        pi: { events: rpcEvents },
+        getCtx: () => context,
+        manager: rpcManager as unknown as SpawnCapable,
+        getOutputTranscript: () => true,
+      });
+      const reply = vi.fn();
+      rpcEvents.on("subagents:rpc:spawn:reply:req-rpc-history", reply);
+
+      try {
+        rpcEvents.emit("subagents:rpc:spawn", {
+          requestId: "req-rpc-history",
+          type: "rpc-test-agent",
+          prompt: "recover this TaskExecute run",
+          options: { description: "RPC recovery", isBackground: true },
+        });
+        await vi.waitFor(() => expect(reply).toHaveBeenCalled());
+
+        const checkpoint = readAgentRecoveryCheckpoints(cwd)[0];
+        expect(checkpoint?.transcriptPath).toMatch(/^\.pi-subagents\/agent-transcripts\/[^/]+\.jsonl$/);
+        expect(readFileSync(join(cwd, checkpoint!.transcriptPath!), "utf8"))
+          .toContain("recover this TaskExecute run");
+      } finally {
+        handle.unsubPing();
+        handle.unsubSpawn();
+        handle.unsubStop();
+        rpcManager.dispose();
+        rmSync(cwd, { recursive: true, force: true });
+      }
+    });
+
+    it("retains durable history when project output is disabled", async () => {
+      const cwd = mkdtempSync(join(tmpdir(), "pi-rpc-no-transcript-"));
+      const rpcEvents = createEventBus();
+      const rpcManager = new AgentManager(undefined, 1);
+      const context = {
+        cwd,
+        sessionManager: { getSessionId: () => "session-rpc" },
+      };
+      const handle = registerRpcHandlers({
+        events: rpcEvents,
+        pi: { events: rpcEvents },
+        getCtx: () => context,
+        manager: rpcManager as unknown as SpawnCapable,
+        getOutputTranscript: () => false,
+      });
+      const reply = vi.fn();
+      rpcEvents.on("subagents:rpc:spawn:reply:req-rpc-no-history", reply);
+
+      try {
+        rpcEvents.emit("subagents:rpc:spawn", {
+          requestId: "req-rpc-no-history",
+          type: "rpc-test-agent",
+          prompt: "do not persist this transcript",
+          options: { description: "RPC no transcript", isBackground: true },
+        });
+        await vi.waitFor(() => expect(reply).toHaveBeenCalled());
+
+        const checkpoint = readAgentRecoveryCheckpoints(cwd)[0];
+        expect(checkpoint?.transcriptPath).toMatch(/^\.pi-subagents\/agent-transcripts\/[^/]+\.jsonl$/);
+        expect(readFileSync(join(cwd, checkpoint!.transcriptPath!), "utf8"))
+          .toContain("do not persist this transcript");
+      } finally {
+        handle.unsubPing();
+        handle.unsubSpawn();
+        handle.unsubStop();
+        rpcManager.dispose();
+        rmSync(cwd, { recursive: true, force: true });
+      }
+    });
+  });
+
   // --- stop ---
 
   describe("stop RPC", () => {
@@ -248,7 +346,13 @@ describe("cross-extension RPC", () => {
 
     beforeEach(() => {
       ctx = { session: true, modelRegistry: registry };
-      deps = { events, pi: { events }, getCtx: () => ctx, manager };
+      deps = {
+        events,
+        pi: { events },
+        getCtx: () => ctx,
+        manager,
+        getOutputTranscript: () => false,
+      };
     });
 
     it("resolves a string model to a Model instance before manager.spawn", async () => {

@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -8,12 +8,17 @@ vi.mock("../src/agent-runner.js", async () => {
   return { ...actual, runAgent: vi.fn() };
 });
 
-vi.mock("../src/output-file.js", () => ({
-  createOutputFilePath: vi.fn(() => "/tmp/fake-subagent.output"),
-  writeInitialEntry: vi.fn(),
-  streamToOutputFile: vi.fn(() => vi.fn()),
-}));
+vi.mock("../src/output-file.js", async () => {
+  const actual = await vi.importActual<typeof import("../src/output-file.js")>("../src/output-file.js");
+  return {
+    ...actual,
+    createOutputFilePath: vi.fn((cwd: string, agentId: string) => join(cwd, `${agentId}.output`)),
+    writeInitialEntry: vi.fn(actual.writeInitialEntry),
+    streamToOutputFile: vi.fn(actual.streamToOutputFile),
+  };
+});
 
+import { readAgentRecoveryCheckpoints } from "../src/agent-recovery.js";
 import { runAgent } from "../src/agent-runner.js";
 import subagentsExtension from "../src/index.js";
 import { createOutputFilePath, streamToOutputFile, writeInitialEntry } from "../src/output-file.js";
@@ -52,7 +57,24 @@ function makeCtx(cwd: string) {
   } as any;
 }
 
-describe("output_transcript agent wiring", () => {
+function expectDurableHistory(cwd: string, prompt: string): void {
+  const checkpoints = readAgentRecoveryCheckpoints(cwd);
+  expect(checkpoints).toHaveLength(1);
+  const transcriptPath = checkpoints[0]?.transcriptPath;
+  expect(transcriptPath).toMatch(/^\.pi-subagents\/agent-transcripts\/[^/]+\.jsonl$/);
+  expect(transcriptPath).toBeTruthy();
+  const historyPath = join(cwd, transcriptPath!);
+  expect(existsSync(historyPath)).toBe(true);
+  const entries = readFileSync(historyPath, "utf8").trim().split("\n").map(line => JSON.parse(line));
+  expect(entries).toHaveLength(1);
+  expect(entries[0].message).toMatchObject({ role: "user", content: prompt });
+}
+
+function expectNoTemporaryOutputFile(cwd: string): void {
+  expect(readdirSync(cwd).filter(name => name.endsWith(".output"))).toEqual([]);
+}
+
+describe("optional .output mirror wiring", () => {
   let cwd: string;
   let agentDir: string;
   let previousCwd: string;
@@ -90,7 +112,7 @@ describe("output_transcript agent wiring", () => {
     vi.clearAllMocks();
   });
 
-  it("creates no transcript when a custom agent sets output_transcript false", async () => {
+  it("keeps durable history while a custom agent disables the optional .output mirror", async () => {
     writeFileSync(join(agentDir, "agents", "sensitive.md"), `---\ndescription: Sensitive in-memory agent\noutput_transcript: false\n---\n\nKeep data in memory.`);
     const { pi, tools, lifecycle } = makePi();
     subagentsExtension(pi);
@@ -104,12 +126,14 @@ describe("output_transcript agent wiring", () => {
     );
 
     expect(createOutputFilePath).not.toHaveBeenCalled();
-    expect(writeInitialEntry).not.toHaveBeenCalled();
-    expect(streamToOutputFile).not.toHaveBeenCalled();
+    expect(writeInitialEntry).toHaveBeenCalledOnce();
+    expect(streamToOutputFile).toHaveBeenCalledOnce();
+    expectDurableHistory(cwd, "process sensitive data");
+    expectNoTemporaryOutputFile(cwd);
     await lifecycle.get("session_shutdown")?.({}, makeCtx(cwd));
   });
 
-  it("also suppresses the background transcript", async () => {
+  it("also keeps durable history for a background agent without the optional mirror", async () => {
     writeFileSync(join(agentDir, "agents", "sensitive.md"), `---\ndescription: Sensitive in-memory agent\noutput_transcript: false\nrun_in_background: true\n---\n\nKeep data in memory.`);
     const { pi, tools, lifecycle } = makePi();
     subagentsExtension(pi);
@@ -123,12 +147,14 @@ describe("output_transcript agent wiring", () => {
     );
 
     expect(createOutputFilePath).not.toHaveBeenCalled();
-    expect(writeInitialEntry).not.toHaveBeenCalled();
-    expect(streamToOutputFile).not.toHaveBeenCalled();
+    expect(writeInitialEntry).toHaveBeenCalledOnce();
+    expect(streamToOutputFile).toHaveBeenCalledOnce();
+    expectDurableHistory(cwd, "process sensitive data");
+    expectNoTemporaryOutputFile(cwd);
     await lifecycle.get("session_shutdown")?.({}, makeCtx(cwd));
   });
 
-  it("keeps transcript creation as the default", async () => {
+  it("keeps the optional .output mirror enabled by default", async () => {
     const { pi, tools, lifecycle } = makePi();
     subagentsExtension(pi);
 
@@ -143,7 +169,8 @@ describe("output_transcript agent wiring", () => {
     expect(createOutputFilePath).toHaveBeenCalledOnce();
     expect(writeInitialEntry).toHaveBeenCalledTimes(2);
     expect(streamToOutputFile).toHaveBeenCalledOnce();
-    expect(streamToOutputFile.mock.calls[0]).toHaveLength(5);
+    expect(streamToOutputFile.mock.calls[0]).toHaveLength(6);
+    expect(streamToOutputFile.mock.calls[0]?.[5]).toBe(1);
     await lifecycle.get("session_shutdown")?.({}, makeCtx(cwd));
   });
 
@@ -168,7 +195,7 @@ describe("output_transcript agent wiring", () => {
     await lifecycle.get("session_shutdown")?.({}, makeCtx(cwd));
   });
 
-  it("suppresses the transcript project-wide when subagents.json sets outputTranscript false", async () => {
+  it("suppresses only the optional .output mirror project-wide when outputTranscript is false", async () => {
     // A plain default agent (no frontmatter) inherits the project default.
     writeFileSync(join(cwd, ".pi", "subagents.json"), JSON.stringify({ schedulingEnabled: false, outputTranscript: false }));
     const { pi, tools, lifecycle } = makePi();
@@ -183,15 +210,18 @@ describe("output_transcript agent wiring", () => {
     );
 
     expect(createOutputFilePath).not.toHaveBeenCalled();
-    expect(writeInitialEntry).not.toHaveBeenCalled();
-    expect(streamToOutputFile).not.toHaveBeenCalled();
+    expect(writeInitialEntry).toHaveBeenCalledOnce();
+    expect(streamToOutputFile).toHaveBeenCalledOnce();
+    expectDurableHistory(cwd, "ordinary work");
+    expectNoTemporaryOutputFile(cwd);
     await lifecycle.get("session_shutdown")?.({}, makeCtx(cwd));
   });
 
-  it("lets agent frontmatter output_transcript true override a project outputTranscript false", async () => {
+  it("lets agent frontmatter output_transcript true enable the mirror over a project default of false", async () => {
     writeFileSync(join(cwd, ".pi", "subagents.json"), JSON.stringify({ schedulingEnabled: false, outputTranscript: false }));
     writeFileSync(join(agentDir, "agents", "audited.md"), `---\ndescription: Always keeps a transcript\noutput_transcript: true\n---\n\nWrite a transcript regardless of the project default.`);
     const { pi, tools, lifecycle } = makePi();
+
     subagentsExtension(pi);
 
     await tools.get("Agent").execute(
@@ -205,7 +235,8 @@ describe("output_transcript agent wiring", () => {
     expect(createOutputFilePath).toHaveBeenCalledOnce();
     expect(writeInitialEntry).toHaveBeenCalledTimes(2);
     expect(streamToOutputFile).toHaveBeenCalledOnce();
-    expect(streamToOutputFile.mock.calls[0]).toHaveLength(5);
+    expect(streamToOutputFile.mock.calls[0]).toHaveLength(6);
+    expect(streamToOutputFile.mock.calls[0]?.[5]).toBe(1);
     await lifecycle.get("session_shutdown")?.({}, makeCtx(cwd));
   });
 });

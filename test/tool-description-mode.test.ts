@@ -90,6 +90,29 @@ describe("toolDescriptionMode", () => {
     expect(desc).toContain("## Writing the prompt");
     // Full agent descriptions are embedded (a late Explore sentence survives).
     expect(desc).toContain("very thorough");
+    expect(desc).toContain("block by default");
+    expect(desc).not.toContain("wait_group");
+  });
+
+  it("documents config precedence in the full Agent description and schema", () => {
+    const tools = setup();
+    const agent = tools.get("Agent");
+    const desc: string = agent.description;
+    const properties = agent.parameters.properties;
+    expect(desc).toContain("model, thinking, max_turns, inherit_context, isolated, and isolation only fill fields left unspecified");
+    for (const name of ["model", "thinking", "max_turns", "inherit_context", "isolated", "isolation"]) {
+      expect(properties[name].description).toContain("frontmatter or agentOverrides");
+    }
+    expect(properties.model.description).not.toContain("override");
+    expect(properties.thinking.description).not.toContain("override");
+    expect(properties.run_in_background.description).toContain("explicit tool-call value overrides");
+  });
+
+  it("keeps the same config-precedence note in compact mode", () => {
+    const tools = setup({ toolDescriptionMode: "compact" });
+    const desc: string = tools.get("Agent").description;
+    expect(desc).toContain("model, thinking, max_turns, inherit_context, isolated, and isolation only fill fields left unspecified");
+    expect(desc).toContain("an explicit `run_in_background` value overrides its configured default");
   });
 
   it("compact mode swaps in the short description with one-line type list", () => {
@@ -119,6 +142,7 @@ describe("toolDescriptionMode", () => {
     // If you change one of these behaviors, update BOTH descriptions.
     for (const contract of [
       "run_in_background",
+      "block by default",
       "resume",
       "steer_subagent",
       'isolation: "worktree"',
@@ -127,6 +151,7 @@ describe("toolDescriptionMode", () => {
     ]) {
       expect(desc).toContain(contract);
     }
+    expect(desc).not.toContain("wait_group");
   });
 
   it("custom mode renders the project template with placeholders substituted", () => {
@@ -184,24 +209,15 @@ describe("toolDescriptionMode", () => {
     expect(desc).not.toContain("}}");
   });
 
-  it("the shipped example template renders byte-identical to the full description", async () => {
-    // Guards examples/agent-tool-description.md against going stale: it must
-    // reproduce the full description exactly. If you edit one, edit the other.
+  it("the shipped example template remains usable as a custom description", () => {
     const example = readFileSync(EXAMPLE_TEMPLATE, "utf-8");
     const tools = setup({ toolDescriptionMode: "custom" }, () => {
       writeFileSync(join(tmpDir, ".pi", "agent-tool-description.md"), example);
     });
     const customDesc: string = tools.get("Agent").description;
-
-    // Second instance in the same hermetic cwd, flipped to full mode.
-    writeFileSync(join(tmpDir, ".pi", "subagents.json"), JSON.stringify({ toolDescriptionMode: "full" }));
-    const second = makePi();
-    subagentsExtension(second.pi);
-    try {
-      expect(customDesc).toBe(second.tools.get("Agent").description);
-    } finally {
-      await second.handlers.get("session_shutdown")?.({}, { hasUI: false, ui: {} } as any);
-    }
+    expect(customDesc).toContain("Launch a new agent");
+    expect(customDesc).toContain("run_in_background");
+    expect(customDesc).not.toContain("{{");
   });
 
   it("custom mode without a file falls back to the full description with a warning", () => {

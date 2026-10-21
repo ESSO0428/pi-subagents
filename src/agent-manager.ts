@@ -7,11 +7,11 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { statSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
 import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { readAgentHistory } from "./agent-history.js";
+import { agentHistoryLocator, createAgentHistoryPath, readAgentHistory } from "./agent-history.js";
 import {
   type AgentRecoveryCheckpoint,
   type AgentRecoveryStatus,
@@ -21,6 +21,7 @@ import {
 } from "./agent-recovery.js";
 import { resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
 import type { NestedSpawnOptions } from "./nested-tools.js";
+import { streamToOutputFile, writeInitialEntry } from "./output-file.js";
 import type { AgentInvocation, AgentRecord, IsolationMode, SubagentType, ThinkingLevel } from "./types.js";
 import { addUsage } from "./usage.js";
 import { cleanupWorktree, createWorktree, pruneWorktrees, } from "./worktree.js";
@@ -158,6 +159,13 @@ interface SpawnArgs {
   options: SpawnOptions;
 }
 
+export interface ResumeOptions {
+  /** Whether the resumed turn runs detached and produces a completion notification. */
+  isBackground?: boolean;
+  /** Abort only this resumed turn. */
+  signal?: AbortSignal;
+}
+
 export interface SpawnOptions extends Partial<Omit<NestedSpawnOptions, "description" | "signal" | "onAssistantUsage" | "onSessionCreated">> {
   /** Overrides the session stamp applied at spawn (used by restore paths). */
   sessionId?: string;
@@ -187,8 +195,6 @@ export interface SpawnOptions extends Partial<Omit<NestedSpawnOptions, "descript
   cwd?: string;
   /** Resolved invocation snapshot captured for UI display. */
   invocation?: AgentInvocation;
-  /** Explicit nonblocking completion wait group for this background agent. */
-  waitGroupId?: string;
   /** Parent abort signal — when aborted, the subagent is also stopped. */
   signal?: AbortSignal;
   /** Called on tool start/end with activity info (for streaming progress to UI). */
@@ -303,6 +309,38 @@ export class AgentManager {
     record.outputCleanup = undefined;
   }
 
+  /**
+   * Attach the project-local transcript before any caller can observe a spawn.
+   * The manager owns this invariant so queued, scheduled, RPC, workflow, and
+   * nested agents all get the same recoverable opening snapshot.
+   */
+  private attachDurableHistory(record: AgentRecord, prompt: string, cwd: string): void {
+    if (!record.historyFile) {
+      const historyFile = createAgentHistoryPath(cwd, record.id);
+      record.historyFile = historyFile;
+      record.transcriptPath = agentHistoryLocator(cwd, historyFile);
+      let shouldWriteInitial = !existsSync(historyFile);
+      if (!shouldWriteInitial) {
+        try {
+          shouldWriteInitial = statSync(historyFile).size === 0;
+        } catch {
+          shouldWriteInitial = true;
+        }
+      }
+      if (shouldWriteInitial) writeInitialEntry(historyFile, record.id, prompt, cwd);
+    }
+    this.recoveryCwds.set(record.id, cwd);
+    this.checkpoint(record);
+  }
+
+  /** Stream every session message to durable history and, when configured, `.output`. */
+  private attachTranscriptStream(record: AgentRecord, session: AgentSession, cwd: string, startAt = 1): void {
+    if (record.outputCleanup || !record.historyFile) return;
+    const outputPath = record.outputFile ?? record.historyFile;
+    const historyPath = record.outputFile ? record.historyFile : undefined;
+    record.outputCleanup = streamToOutputFile(session, outputPath, record.id, cwd, historyPath, startAt);
+  }
+
   /** Set the durable transcript locator and checkpoint the current state. */
   setTranscript(id: string, historyFile: string, transcriptPath: string, cwd?: string): void {
     const record = this.agents.get(id);
@@ -392,7 +430,6 @@ export class AgentManager {
       // have no inline surface — stay visible instead of vanishing.
       isBackground: options.isBackground,
       invocation: options.invocation,
-      waitGroupId: options.waitGroupId,
       depth: options.depth ?? 1,
       parentAgentId: options.parentAgentId,
       parentDescription: options.parentAgentId ? this.agents.get(options.parentAgentId)?.description : undefined,
@@ -409,12 +446,11 @@ export class AgentManager {
     };
     this.agents.set(id, record);
     this.recoveryCwds.set(id, ctx.cwd);
-    // Give callers a chance to create the durable transcript before the first
-    // checkpoint. This closes the small spawn→attach window in which a queued
-    // or running agent could be left recoverable only as metadata.
+    // Durable history is a manager invariant: it exists before queue/start and
+    // before the external callback can expose the id to another subsystem.
     try {
+      this.attachDurableHistory(record, prompt, ctx.cwd);
       options.onSpawned?.(id);
-      this.checkpoint(record);
     } catch (err) {
       this.agents.delete(id);
       this.recoveryCwds.delete(id);
@@ -571,6 +607,9 @@ export class AgentManager {
           }
           record.pendingSteers = undefined;
         }
+        // Subscribe before the external callback so history does not depend on
+        // any particular adapter's callback ordering or output setting.
+        this.attachTranscriptStream(record, session, ctx.cwd);
         options.onSessionCreated?.(session);
         this.checkpoint(record);
       },
@@ -599,11 +638,8 @@ export class AgentManager {
 
         detach();
 
-        // Final flush of streaming output file
-        if (record.outputCleanup) {
-          try { record.outputCleanup(); } catch { /* ignore */ }
-          record.outputCleanup = undefined;
-        }
+        // Flush durable history and optional `.output` before the terminal checkpoint.
+        this.flushOutput(record);
 
         // Clean up worktree if used
         if (record.worktree) {
@@ -644,11 +680,8 @@ export class AgentManager {
 
         detach();
 
-        // Final flush of streaming output file on error
-        if (record.outputCleanup) {
-          try { record.outputCleanup(); } catch { /* ignore */ }
-          record.outputCleanup = undefined;
-        }
+        // Flush durable history and optional `.output` before the terminal checkpoint.
+        this.flushOutput(record);
 
         // Best-effort worktree cleanup on error
         if (record.worktree) {
@@ -689,6 +722,7 @@ export class AgentManager {
         record.status = "error";
         record.error = err instanceof Error ? err.message : String(err);
         record.completedAt = Date.now();
+        this.flushOutput(record);
         this.checkpoint(record);
         this.onComplete?.(record);
       }
@@ -697,14 +731,29 @@ export class AgentManager {
 
   /**
    * Resume an existing agent session with a new prompt.
+   *
+   * The third argument remains compatible with the historical AbortSignal
+   * form. Callers may instead pass ResumeOptions directly, or pass the
+   * options as the fourth argument alongside a signal.
    */
   async resume(
     id: string,
     prompt: string,
-    signal?: AbortSignal,
+    signalOrOptions?: AbortSignal | ResumeOptions,
+    options?: ResumeOptions,
   ): Promise<AgentRecord | undefined> {
     const record = this.agents.get(id);
-    if (!record?.session) return undefined;
+    const session = record?.session;
+    if (!record || !session) return undefined;
+
+    const resumeOptions = options ?? (
+      signalOrOptions && "aborted" in signalOrOptions
+        ? { signal: signalOrOptions }
+        : signalOrOptions
+    ) ?? {};
+    const signal = resumeOptions.signal;
+    const isBackground = resumeOptions.isBackground ?? true;
+    const occupiesBackgroundPool = isBackground && record.parentAgentId === undefined;
 
     record.status = "running";
     record.startedAt = Date.now();
@@ -712,19 +761,25 @@ export class AgentManager {
     record.result = undefined;
     record.error = undefined;
     record.resultConsumed = false;
-    record.isBackground = true;
+    record.isBackground = isBackground;
+    if (occupiesBackgroundPool) {
+      this.runningBackground++;
+      this.runningBackgroundIds.add(id);
+    }
     this.onStart?.(record);
-    const resumedModel = record.session.model;
+    const resumedModel = session.model;
     record.invocation = {
       ...(record.invocation ?? {}),
       ...(resumedModel && { effectiveModelName: resumedModel.name ?? resumedModel.id }),
-      effectiveThinking: record.session.thinkingLevel,
-      runInBackground: true,
+      effectiveThinking: session.thinkingLevel,
+      runInBackground: isBackground,
     };
+    const cwd = this.recoveryCwds.get(id);
+    if (cwd) this.attachTranscriptStream(record, session, cwd, session.messages.length);
     this.checkpoint(record);
 
-    try {
-      const { text, failure } = await resumeAgent(record.session, prompt, {
+    const promise = Promise.resolve()
+      .then(() => resumeAgent(session, prompt, {
         onToolActivity: (activity) => {
           if (activity.type === "end") record.toolUses++;
         },
@@ -736,22 +791,36 @@ export class AgentManager {
           this.onCompact?.(record, info);
         },
         signal,
+      }))
+      .then(({ text, failure }) => {
+        // Same contract as the spawn path (#144): a failed final turn is an
+        // error, not a completion — but the resumed text stays available.
+        record.status = failure ? "error" : "completed";
+        if (failure) record.error = failure;
+        record.result = text;
+        record.completedAt = Date.now();
+        this.flushOutput(record);
+        this.checkpoint(record);
+        if (!isBackground) record.resultConsumed = true;
+        if (occupiesBackgroundPool) this.finishBackground(id);
+        try { this.onComplete?.(record); } catch { /* ignore completion side-effect errors */ }
+        if (occupiesBackgroundPool) this.drainQueue();
+        return text;
+      })
+      .catch((err) => {
+        record.status = "error";
+        record.error = err instanceof Error ? err.message : String(err);
+        record.completedAt = Date.now();
+        this.flushOutput(record);
+        this.checkpoint(record);
+        if (!isBackground) record.resultConsumed = true;
+        if (occupiesBackgroundPool) this.finishBackground(id);
+        try { this.onComplete?.(record); } catch { /* ignore completion side-effect errors */ }
+        if (occupiesBackgroundPool) this.drainQueue();
+        return "";
       });
-      // Same contract as the spawn path (#144): a failed final turn is an
-      // error, not a completion — but the resumed text stays available.
-      record.status = failure ? "error" : "completed";
-      if (failure) record.error = failure;
-      record.result = text;
-      record.completedAt = Date.now();
-      this.checkpoint(record);
-      try { this.onComplete?.(record); } catch { /* ignore completion side-effect errors */ }
-    } catch (err) {
-      record.status = "error";
-      record.error = err instanceof Error ? err.message : String(err);
-      record.completedAt = Date.now();
-      this.checkpoint(record);
-      try { this.onComplete?.(record); } catch { /* ignore completion side-effect errors */ }
-    }
+    record.promise = promise;
+    await promise;
 
     return record;
   }
@@ -882,10 +951,8 @@ export class AgentManager {
       this.queue = this.queue.filter(q => q.id !== id);
       record.status = "stopped";
       record.completedAt = Date.now();
+      this.flushOutput(record);
       this.checkpoint(record);
-      if (record.waitGroupId) {
-        try { this.onComplete?.(record); } catch { /* ignore completion side-effect errors */ }
-      }
       return true;
     }
 
@@ -902,6 +969,7 @@ export class AgentManager {
 
   /** Dispose a record's session and remove it from the map. */
   private removeRecord(id: string, record: AgentRecord): void {
+    this.flushOutput(record);
     record.session?.dispose?.();
     record.session = undefined;
     this.agents.delete(id);
@@ -917,10 +985,9 @@ export class AgentManager {
       // history again in this session does not silently lose its identity or
       // locator. Records without durable storage remain eligible for eviction.
       if (record.transcriptPath) {
+        this.flushOutput(record);
         try { record.session?.dispose?.(); } catch { /* ignore cleanup failures */ }
         record.session = undefined;
-        try { record.outputCleanup?.(); } catch { /* ignore cleanup failures */ }
-        record.outputCleanup = undefined;
         record.outputFile = undefined;
         record.historyFile = undefined;
         // The durable transcript is the source of truth after the TTL. Keep
@@ -963,10 +1030,8 @@ export class AgentManager {
       if (record) {
         record.status = "stopped";
         record.completedAt = Date.now();
+        this.flushOutput(record);
         this.checkpoint(record);
-        if (record.waitGroupId) {
-          try { this.onComplete?.(record); } catch { /* ignore completion side-effect errors */ }
-        }
         count++;
       }
     }
@@ -1007,6 +1072,10 @@ export class AgentManager {
     // Clear queue
     this.queue = [];
     for (const record of this.agents.values()) {
+      // Keep the latest openable partial transcript even when dispose() is
+      // called without the host's normal session_shutdown abortAll hook.
+      this.flushOutput(record);
+      this.checkpoint(record);
       record.session?.dispose();
     }
     this.agents.clear();

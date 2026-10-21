@@ -6,8 +6,10 @@ import {
   buildAgentStatusMenuEntries,
   canOpenActiveAgent,
   canOpenAgentHistory,
+  countSessionAgentConversations,
   formatAgentHistoryOption,
   isTerminalAgentStatus,
+  resolveAgentViewMode,
   splitAgentRecords,
 } from "../src/agent-history-list.js";
 
@@ -78,6 +80,13 @@ describe("agent history list helpers", () => {
     expect(canOpenActiveAgent(record({ status: "completed", session: {} }))).toBe(false);
   });
 
+  it("resolves only usable live or history Agent Views", () => {
+    expect(resolveAgentViewMode(record({ status: "running", session: {} }), undefined)).toBe("live");
+    expect(resolveAgentViewMode(record({ status: "completed", session: {} }), undefined)).toBe("history");
+    expect(resolveAgentViewMode(record({ status: "queued", session: undefined }), undefined)).toBeUndefined();
+    expect(resolveAgentViewMode(record({ status: "stopped", session: undefined }), undefined)).toBeUndefined();
+  });
+
   it("opens history only for an existing project-local transcript", () => {
     const cwd = mkdtempSync(join(tmpdir(), "pi-subagents-history-list-"));
     tempDirectories.push(cwd);
@@ -91,17 +100,25 @@ describe("agent history list helpers", () => {
     expect(canOpenAgentHistory(historical, undefined)).toBe(false);
   });
 
-  it("builds separate menu entries with openable records only", () => {
+  it("builds one current-session tree entry plus all-session history", () => {
     const entries = buildAgentStatusMenuEntries([
-      record({ status: "running", session: {} }),
-      record({ status: "queued", session: undefined }),
-      record({ status: "completed", session: {} }),
-      record({ status: "error", session: {} }),
-      record({ status: "stopped", session: undefined }),
-    ], undefined);
+      record({ id: "running", status: "running", session: {}, sessionId: "session-1" } as any),
+      record({ id: "queued", status: "queued", session: undefined, sessionId: "session-1" } as any),
+      record({ id: "completed", status: "completed", session: {}, sessionId: "session-1" } as any),
+      record({ id: "other", status: "error", session: {}, sessionId: "session-2" } as any),
+      record({ id: "closed", status: "stopped", session: undefined, sessionId: "session-1" } as any),
+    ], undefined, "session-1");
 
-    expect(entries).toEqual(["Running agents (1)", "Agent history all sessions (2)"]);
-    expect(buildAgentStatusMenuEntries([record({ status: "queued", session: undefined })], undefined)).toEqual([]);
+    expect(entries).toEqual([
+      "Agent conversations this session (3)",
+      "Agent history all sessions (2)",
+    ]);
+    expect(countSessionAgentConversations([
+      record({ status: "queued", sessionId: "session-1" } as any),
+    ], undefined, "session-1")).toBe(1);
+    expect(buildAgentStatusMenuEntries([], undefined, "session-1", [], true)).toEqual([
+      "Agent conversations this session (0)",
+    ]);
   });
 
   it("formats a bounded history option using the display name and duration", () => {

@@ -9,7 +9,9 @@
  *   error   → { success: false, error: string }
  */
 
+import { getAgentConfig } from "./agent-types.js";
 import { type ModelRegistry, resolveModel } from "./model-resolver.js";
+import { createOutputFilePath, writeInitialEntry } from "./output-file.js";
 
 /** Minimal event bus interface needed by the RPC handlers. */
 export interface EventBus {
@@ -26,9 +28,15 @@ export type RpcReply<T = void> =
 export const PROTOCOL_VERSION = 2;
 
 /** Minimal AgentManager interface needed by the spawn/stop RPCs. */
+interface RpcAgentRecord {
+  /** Optional temporary `.output` mirror path; durable history is manager-owned. */
+  outputFile?: string;
+}
+
 export interface SpawnCapable {
   spawn(pi: unknown, ctx: unknown, type: string, prompt: string, options: any): string;
   abort(id: string): boolean;
+  getRecord?: (id: string) => RpcAgentRecord | undefined;
 }
 
 export interface RpcDeps {
@@ -36,6 +44,8 @@ export interface RpcDeps {
   pi: unknown;                    // passed through to manager.spawn
   getCtx: () => unknown | undefined;  // returns current ExtensionContext
   manager: SpawnCapable;
+  /** Project-level optional `.output` mirror setting, after settings have been applied. */
+  getOutputTranscript?: () => boolean;
 }
 
 export interface RpcHandle {
@@ -106,6 +116,31 @@ export function registerRpcHandlers(deps: RpcDeps): RpcHandle {
           throw new Error(resolved);
         }
         normalizedOptions = { ...normalizedOptions, model: resolved };
+      }
+
+      const rpcCtx = ctx as {
+        cwd: string;
+        sessionManager?: { getSessionId?: () => string | undefined };
+      };
+      const outputTranscript = getAgentConfig(type)?.outputTranscript
+        ?? deps.getOutputTranscript?.()
+        ?? true;
+      const onSpawned = normalizedOptions.onSpawned as ((id: string) => void) | undefined;
+      const onSessionCreated = normalizedOptions.onSessionCreated as ((session: unknown) => void) | undefined;
+      if (outputTranscript || onSpawned || onSessionCreated) {
+        normalizedOptions = {
+          ...normalizedOptions,
+          onSpawned: (id: string) => {
+            const record = manager.getRecord?.(id);
+            const sessionId = rpcCtx.sessionManager?.getSessionId?.();
+            if (outputTranscript && record && sessionId && !record.outputFile) {
+              record.outputFile = createOutputFilePath(rpcCtx.cwd, id, sessionId);
+              writeInitialEntry(record.outputFile, id, prompt, rpcCtx.cwd);
+            }
+            onSpawned?.(id);
+          },
+          onSessionCreated,
+        };
       }
 
       return { id: manager.spawn(pi, ctx, type, prompt, normalizedOptions) };

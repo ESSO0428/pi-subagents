@@ -10,9 +10,14 @@ interface AgentInvocationParams {
   isolation?: IsolationMode;
 }
 
+interface AgentInvocationOptions {
+  defaultRunInBackground?: boolean;
+}
+
 export function resolveAgentInvocationConfig(
   agentConfig: AgentConfig | undefined,
   params: AgentInvocationParams,
+  opts?: AgentInvocationOptions,
 ): {
   modelInput?: string;
   modelFromParams: boolean;
@@ -29,7 +34,11 @@ export function resolveAgentInvocationConfig(
     thinking: (agentConfig?.thinking ?? params.thinking) as ThinkingLevel | undefined,
     maxTurns: agentConfig?.maxTurns ?? params.max_turns,
     inheritContext: agentConfig?.inheritContext ?? params.inherit_context ?? false,
-    runInBackground: agentConfig?.runInBackground ?? params.run_in_background ?? false,
+    runInBackground:
+      params.run_in_background
+      ?? agentConfig?.runInBackground
+      ?? opts?.defaultRunInBackground
+      ?? false,
     isolated: agentConfig?.isolated ?? params.isolated ?? false,
     isolation: agentConfig?.isolation ?? params.isolation,
   };
