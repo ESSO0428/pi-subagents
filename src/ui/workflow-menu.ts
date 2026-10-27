@@ -16,6 +16,7 @@
 
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import type { AgentRecord } from "../types.js";
+import type { WorkflowHistorySnapshot } from "../workflow/history.js";
 import { pauseWorkflowTask, resumeWorkflowTask, type WorkflowTask } from "../workflow/task.js";
 import { VIEWPORT_HEIGHT_PCT } from "./conversation-viewer.js";
 import { WorkflowDialog } from "./workflow-dialog.js";
@@ -28,6 +29,10 @@ export interface WorkflowMenuDeps {
    * crash.
    */
   tasks: ReadonlyMap<string, WorkflowTask>;
+  /** Terminal display-only snapshots loaded from the current artifact root. */
+  history?: ReadonlyMap<string, WorkflowHistorySnapshot>;
+  /** Re-filter history at the moment a menu action reads it. */
+  getHistory?(): ReadonlyMap<string, WorkflowHistorySnapshot>;
   /** The record behind an agent id, or undefined once it has been swept. */
   getRecord(id: string): AgentRecord | undefined;
   /** The conversation overlay `c` opens on an agent row. */
@@ -50,9 +55,56 @@ export interface WorkflowMenuDeps {
  * hints from the actions it is handed, so the footer advertises exactly what
  * works — see `WorkflowDialogActions`.
  */
+type WorkflowRun = WorkflowTask | WorkflowHistorySnapshot;
+
+function isLiveWorkflow(task: WorkflowRun): task is WorkflowTask {
+  return "type" in task && task.type === "local_workflow";
+}
+
+function workflowId(task: WorkflowRun): string {
+  return isLiveWorkflow(task) ? task.id : task.workflowId;
+}
+
+function currentHistory(deps: WorkflowMenuDeps): ReadonlyMap<string, WorkflowHistorySnapshot> {
+  return deps.getHistory?.() ?? deps.history ?? new Map();
+}
+
+function workflowSource(task: WorkflowRun) {
+  if (isLiveWorkflow(task)) {
+    return {
+      progress: task.workflowProgress,
+      task: {
+        status: task.status,
+        workflowName: task.workflowName,
+        startTime: task.startTime,
+        endTime: task.endTime,
+        totalPausedMs: task.totalPausedMs,
+        resultPreview: task.error === undefined ? (task.value === undefined ? "No output." : typeof task.value === "string" ? task.value : JSON.stringify(task.value)) : undefined,
+        errorPreview: task.error,
+      },
+      meta: task.meta,
+      agentCount: task.agentCount,
+    };
+  }
+  return {
+    progress: task.progress,
+    task: {
+      status: task.status,
+      workflowName: task.name,
+      startTime: task.startedAt,
+      endTime: task.completedAt,
+      resultPreview: task.resultPreview,
+      errorPreview: task.errorPreview,
+      restoredHistory: true,
+    },
+    meta: task.meta,
+    agentCount: task.agentCount,
+  };
+}
+
 export async function showWorkflowDialog(
   ctx: ExtensionCommandContext,
-  task: WorkflowTask,
+  task: WorkflowRun,
   deps: WorkflowMenuDeps,
 ): Promise<void> {
   // Overlaid on the same terms as the conversation viewer, because they are
@@ -74,70 +126,62 @@ export async function showWorkflowDialog(
         tui,
         // Re-read on every render: the run is in the background, so the
         // dialog has to follow it rather than snapshot it at open time.
-        () => ({
-          progress: task.workflowProgress,
-          task: {
-            status: task.status,
-            workflowName: task.workflowName,
-            startTime: task.startTime,
-            endTime: task.endTime,
-            totalPausedMs: task.totalPausedMs,
-          },
-          meta: task.meta,
-          agentCount: task.agentCount,
-        }),
+        () => workflowSource(task),
         theme,
         done,
-        {
-          onKill: () => {
-            if (task.abortController.signal.aborted) return;
-            task.abortController.abort();
-            ctx.ui.notify(`Stopped workflow "${task.meta?.name ?? task.id}".`, "info");
-          },
-          onPause: () => {
-            if (pauseWorkflowTask(task)) {
-              // Named rather than implied: "paused" on a run whose agents are
-              // still finishing reads as a stronger promise than it is.
-              ctx.ui.notify("Paused — running agents finish, no new ones start.", "info");
-            }
-          },
-          onResume: () => {
-            if (resumeWorkflowTask(task)) ctx.ui.notify("Resumed.", "info");
-          },
-          onSkipAgent: index => {
-            if (task.control?.skip(index) !== true) {
-              ctx.ui.notify("Nothing to skip — that agent has already finished.", "info");
-            }
-          },
-          onRetryAgent: index => {
-            if (task.control?.retry(index) !== true) {
-              // The window is exactly "while it is running": before that
-              // there is nothing to stop, after it the script has its answer.
-              ctx.ui.notify("Only a running agent can be retried.", "info");
-            }
-          },
-          onOpenAgent: recordId => {
-            const record = deps.getRecord(recordId);
-            // A run's children are records like any other, so they are swept
-            // ten minutes after they finish — the row outlives the
-            // conversation it points at, and saying why beats an overlay that
-            // opens empty.
-            if (record === undefined) {
-              ctx.ui.notify("No conversation left — agent records are dropped ten minutes after they finish.", "info");
-              return;
-            }
-            overlay?.setHidden(true);
-            // Caught before the `finally`, so a viewer that fails to open
-            // still un-hides the dialog and cannot surface as an unhandled
-            // rejection out of a detached promise.
-            void deps.viewAgentConversation(ctx, record)
-              .catch(err => ctx.ui.notify(
-                `Could not open the conversation: ${err instanceof Error ? err.message : String(err)}`,
-                "warning",
-              ))
-              .finally(() => overlay?.setHidden(false));
-          },
-        },
+        (() => {
+          if (!isLiveWorkflow(task)) return {};
+          return {
+            onKill: () => {
+              if (task.abortController.signal.aborted) return;
+              task.abortController.abort();
+              ctx.ui.notify(`Stopped workflow "${task.meta?.name ?? task.id}".`, "info");
+            },
+            onPause: () => {
+              if (pauseWorkflowTask(task)) {
+                // Named rather than implied: "paused" on a run whose agents are
+                // still finishing reads as a stronger promise than it is.
+                ctx.ui.notify("Paused — running agents finish, no new ones start.", "info");
+              }
+            },
+            onResume: () => {
+              if (resumeWorkflowTask(task)) ctx.ui.notify("Resumed.", "info");
+            },
+            onSkipAgent: index => {
+              if (task.control?.skip(index) !== true) {
+                ctx.ui.notify("Nothing to skip — that agent has already finished.", "info");
+              }
+            },
+            onRetryAgent: index => {
+              if (task.control?.retry(index) !== true) {
+                // The window is exactly "while it is running": before that
+                // there is nothing to stop, after it the script has its answer.
+                ctx.ui.notify("Only a running agent can be retried.", "info");
+              }
+            },
+            onOpenAgent: recordId => {
+              const record = deps.getRecord(recordId);
+              // A run's children are records like any other, so they are swept
+              // ten minutes after they finish — the row outlives the
+              // conversation it points at, and saying why beats an overlay that
+              // opens empty.
+              if (record === undefined) {
+                ctx.ui.notify("No conversation left — agent records are dropped ten minutes after they finish.", "info");
+                return;
+              }
+              overlay?.setHidden(true);
+              // Caught before the `finally`, so a viewer that fails to open
+              // still un-hides the dialog and cannot surface as an unhandled
+              // rejection out of a detached promise.
+              void deps.viewAgentConversation(ctx, record)
+                .catch(err => ctx.ui.notify(
+                  `Could not open the conversation: ${err instanceof Error ? err.message : String(err)}`,
+                  "warning",
+                ))
+                .finally(() => overlay?.setHidden(false));
+            },
+          };
+        })(),
       ),
     {
       overlay: true,
@@ -157,7 +201,7 @@ export async function showWorkflowDialog(
  * the reader at `main`.
  */
 export function openWorkflowFromFleet(id: string, deps: WorkflowMenuDeps): Promise<void> | void {
-  const task = deps.tasks.get(id);
+  const task = deps.tasks.get(id) ?? currentHistory(deps).get(id);
   const ctx = deps.getCtx();
   if (task === undefined || ctx === undefined) return;
   return showWorkflowDialog(ctx, task, deps);
@@ -168,7 +212,11 @@ export async function showWorkflowsMenu(
   ctx: ExtensionCommandContext,
   deps: WorkflowMenuDeps,
 ): Promise<void> {
-  const tasks = [...deps.tasks.values()].sort((a, b) => b.startTime - a.startTime);
+  const history = currentHistory(deps);
+  const tasks: WorkflowRun[] = [
+    ...deps.tasks.values(),
+    ...[...history.values()].filter(snapshot => !deps.tasks.has(snapshot.workflowId)),
+  ].sort((a, b) => (isLiveWorkflow(b) ? b.startTime : b.startedAt) - (isLiveWorkflow(a) ? a.startTime : a.startedAt));
   if (tasks.length === 0) {
     ctx.ui.notify("No workflows in this session.", "info");
     return;
@@ -183,9 +231,9 @@ export async function showWorkflowsMenu(
   // the second run of a workflow onto the first — the run id makes it so.
   const labels = tasks.map(
     task =>
-      `${task.meta?.name ?? task.id} — ${task.status}, ${task.agentCount} agent${
+      `${isLiveWorkflow(task) ? task.meta?.name ?? task.id : task.name} — ${task.status}, ${task.agentCount} agent${
         task.agentCount === 1 ? "" : "s"
-      } · ${task.id}`,
+      } · ${workflowId(task)}`,
   );
   const picked = await ctx.ui.select("Workflows", labels);
   const index = picked !== undefined ? labels.indexOf(picked) : -1;

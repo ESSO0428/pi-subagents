@@ -28,6 +28,8 @@ function agent(overrides: Partial<AgentRecord> & { id: string }): AgentRecord {
 
 function workflow(overrides: Partial<WorkflowTreeRoot> & { id: string }): WorkflowTreeRoot {
   return {
+    artifactRootCwd: "/project/default",
+    rootSessionId: "session-1",
     name: overrides.id,
     description: overrides.id,
     status: "running",
@@ -101,6 +103,35 @@ describe("AgentTreeMenu", () => {
     expect(rendered).toContain("Explore  nested");
     expect(rendered).not.toContain("other-session");
     expect(rendered).not.toContain("closed");
+  });
+
+  it("filters same-shape live and restored roots to the current artifact root", () => {
+    const source: AgentTreeMenuSource = {
+      agents: [],
+      workflowRoots: [
+        workflow({ id: "live-a", artifactRootCwd: "/project/a" }),
+        workflow({ id: "restored-a", artifactRootCwd: "/project/a", restoredHistory: true }),
+        workflow({ id: "live-b", artifactRootCwd: "/project/b" }),
+        workflow({ id: "restored-b", artifactRootCwd: "/project/b", restoredHistory: true }),
+      ],
+      artifactRootCwd: "/project/a",
+      resolveViewMode,
+    };
+    const { menu } = makeMenu(source);
+
+    const rendered = menu.render(160).join("\n");
+
+    expect(rendered).toContain("live-a");
+    expect(rendered).toContain("restored-a");
+    expect(rendered).not.toContain("live-b");
+    expect(rendered).not.toContain("restored-b");
+
+    source.artifactRootCwd = "/project/b";
+    const switched = menu.render(160).join("\n");
+    expect(switched).toContain("live-b");
+    expect(switched).toContain("restored-b");
+    expect(switched).not.toContain("live-a");
+    expect(switched).not.toContain("restored-a");
   });
 
   it("renders real-agent metadata and live activity on one row", () => {

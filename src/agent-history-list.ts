@@ -1,6 +1,7 @@
 /** Helpers for separating openable active agents from terminal history. */
 
 import { hasAgentHistory } from "./agent-history.js";
+import { sameArtifactRootCwd } from "./agent-session-storage.js";
 import { getAgentConfig } from "./agent-types.js";
 import type { AgentRecord } from "./types.js";
 import { formatDuration, getDisplayName } from "./ui/agent-widget.js";
@@ -12,7 +13,7 @@ export type AgentHistoryStatus =
   | "aborted"
   | "error";
 
-export type AgentViewMode = "live" | "history";
+export type AgentViewMode = "live" | "history" | "unavailable";
 
 const TERMINAL_STATUSES: ReadonlySet<string> = new Set<AgentHistoryStatus>([
   "completed",
@@ -27,15 +28,32 @@ export function isTerminalAgentStatus(status: string): status is AgentHistorySta
   return TERMINAL_STATUSES.has(status);
 }
 
+function persistedArtifactRoot(record: AgentRecord): string | undefined {
+  if (record.artifactRootCwd !== undefined) return record.artifactRootCwd;
+  const state = record.sessionState;
+  return state && state.kind !== "pending" ? state.artifactRootCwd : undefined;
+}
+
+/** Return whether a record belongs to the currently displayed artifact root. */
+export function isAgentRecordInArtifactRoot(record: AgentRecord, cwd: string | undefined): boolean {
+  return sameArtifactRootCwd(persistedArtifactRoot(record), cwd);
+}
+
+/** Return whether a v2 private record retains an executable native session. */
+export function isPrivateAgentRecord(record: AgentRecord): boolean {
+  return record.sessionState?.kind === "private";
+}
+
 /** Return whether an active record has a live session that can be opened. */
-export function canOpenActiveAgent(record: AgentRecord): boolean {
-  return (record.status === "running" || record.status === "queued")
+export function canOpenActiveAgent(record: AgentRecord, cwd?: string): boolean {
+  return isAgentRecordInArtifactRoot(record, cwd)
+    && (record.status === "running" || record.status === "queued")
     && record.session !== undefined;
 }
 
 /** Return whether a terminal record has an in-memory or durable conversation. */
 export function canOpenAgentHistory(record: AgentRecord, cwd: string | undefined): boolean {
-  if (!isTerminalAgentStatus(record.status)) return false;
+  if (!isTerminalAgentStatus(record.status) || !isAgentRecordInArtifactRoot(record, cwd)) return false;
   return record.session !== undefined
     || (cwd !== undefined && hasAgentHistory(cwd, record.transcriptPath));
 }
@@ -45,8 +63,11 @@ export function resolveAgentViewMode(
   record: AgentRecord,
   cwd: string | undefined,
 ): AgentViewMode | undefined {
-  if (canOpenActiveAgent(record)) return "live";
+  if (canOpenActiveAgent(record, cwd)) return "live";
   if (canOpenAgentHistory(record, cwd)) return "history";
+  if (isTerminalAgentStatus(record.status) && isPrivateAgentRecord(record) && isAgentRecordInArtifactRoot(record, cwd)) {
+    return "unavailable";
+  }
   return undefined;
 }
 
@@ -59,7 +80,7 @@ export function splitAgentRecords(
   const history: AgentRecord[] = [];
 
   for (const record of records) {
-    if (canOpenActiveAgent(record)) {
+    if (canOpenActiveAgent(record, cwd)) {
       active.push(record);
     } else if (canOpenAgentHistory(record, cwd)) {
       history.push(record);
@@ -98,9 +119,9 @@ export function countSessionAgentConversations(
 ): number {
   if (sessionId === undefined) return 0;
   return records.filter(record => {
-    if (record.sessionId !== sessionId) return false;
+    if (record.sessionId !== sessionId || !isAgentRecordInArtifactRoot(record, cwd)) return false;
     if (record.status === "running" || record.status === "queued") return true;
-    return canOpenAgentHistory(record, cwd);
+    return resolveAgentViewMode(record, cwd) !== undefined;
   }).length;
 }
 

@@ -17,9 +17,10 @@ import { Container, Key, matchesKey, SelectList, type SettingItem, SettingsList,
 import { Type } from "@sinclair/typebox";
 import { abortable } from "./abortable.js";
 import { readAgentHistory, readAgentHistoryResult } from "./agent-history.js";
-import { buildAgentStatusMenuEntries, canOpenActiveAgent, canOpenAgentHistory, formatAgentHistoryOption, resolveAgentViewMode, splitAgentRecords } from "./agent-history-list.js";
-import { AgentManager } from "./agent-manager.js";
-import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, normalizeMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, steerAgent } from "./agent-runner.js";
+import { buildAgentStatusMenuEntries, canOpenActiveAgent, canOpenAgentHistory, formatAgentHistoryOption, isAgentRecordInArtifactRoot, resolveAgentViewMode, splitAgentRecords } from "./agent-history-list.js";
+import { AgentManager, AgentResumeError } from "./agent-manager.js";
+import { type AgentResumeRuntimeDependencies, createAgentResumeRuntime, getAgentConversation, getDefaultMaxTurns, getGraceTurns, normalizeMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, steerAgent } from "./agent-runner.js";
+import { canonicalArtifactRootCwd, sameArtifactRootCwd } from "./agent-session-storage.js";
 import { applyNicoOverrides, BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, isDefaultsDisabled, registerAgents, resolveSpawnType, setDefaultsDisabled, setFallbackSubagent } from "./agent-types.js";
 import { CompletionOutbox } from "./completion-outbox.js";
 import { type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
@@ -60,6 +61,13 @@ import { renderWorkflowCard } from "./ui/workflow-card.js";
 import { openWorkflowFromFleet, showWorkflowsMenu } from "./ui/workflow-menu.js";
 import { addUsage, getLifetimeTotal, getSessionContextPercent, type LifetimeUsage } from "./usage.js";
 import { decideWorkflowCollision } from "./workflow/collisions.js";
+import {
+  loadWorkflowHistorySnapshots,
+  pruneWorkflowHistory,
+  toWorkflowHistoryTreeRoot,
+  type WorkflowHistorySnapshot,
+  writeWorkflowHistorySnapshot,
+} from "./workflow/history.js";
 import { createWorkflowHost } from "./workflow/host.js";
 import { appendJournal, readJournal, type WorkflowJournalEntry } from "./workflow/journal.js";
 import { extractMeta, type WorkflowMeta, workflowCallName } from "./workflow/meta.js";
@@ -558,6 +566,11 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     resetAgentMenuSelections();
     clearWorkflowTasks();
+    workflowHistorySnapshots.clear();
+    pruneWorkflowHistory(ctx.cwd);
+    for (const snapshot of loadWorkflowHistorySnapshots(ctx.cwd)) {
+      workflowHistorySnapshots.set(snapshot.workflowId, snapshot);
+    }
     currentCtx = ctx;
     manager.clearCompleted(true);
     const sessionId = ctx.sessionManager?.getSessionId?.();
@@ -567,7 +580,7 @@ export default function (pi: ExtensionAPI) {
       .map((entry: any) => entry.data), sessionId);
     // Checkpoint files cover agents whose parent session never got a terminal
     // branch entry (shutdown, session switch, or a process restart).
-    manager.restoreRecovered(ctx.cwd);
+    manager.restoreRecovered(ctx.cwd, sessionId);
     // Attach the panel during TUI startup, after restored records are present,
     // so terminal agents from the session branch are immediately visible.
     if (ctx.mode === "tui") {
@@ -596,6 +609,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_before_switch", () => {
     resetAgentMenuSelections();
     clearWorkflowTasks();
+    workflowHistorySnapshots.clear();
     // A switch is catchable. Stop and checkpoint live/queued agents before the
     // old session context is discarded, then retain their unread history.
     manager.abortAll();
@@ -619,6 +633,7 @@ export default function (pi: ExtensionAPI) {
     }
     scheduler.stop();
     clearWorkflowTasks();
+    workflowHistorySnapshots.clear();
     manager.abortAll();
     groupJoin.dispose();
     outbox.dispose();
@@ -630,7 +645,14 @@ export default function (pi: ExtensionAPI) {
   let widgetMode: WidgetMode = "all";
   function getWidgetMode(): WidgetMode { return widgetMode; }
   function getWorkflowRoots() {
-    return [...workflowTasks.values()].map(toWorkflowTreeRoot);
+    const live = [...workflowTasks.values()].map(toWorkflowTreeRoot);
+    const liveIds = new Set(live.map(root => root.id));
+    return [
+      ...live,
+      ...[...getCurrentWorkflowHistory().values()]
+        .filter(snapshot => !liveIds.has(snapshot.workflowId))
+        .map(toWorkflowHistoryTreeRoot),
+    ];
   }
   const widget = new AgentWidget(
     manager,
@@ -643,6 +665,7 @@ export default function (pi: ExtensionAPI) {
         if (ctx) void viewAgentConversation(ctx as ExtensionCommandContext, record, mode);
       },
       getSessionId: () => currentCtx?.sessionManager?.getSessionId?.(),
+      getArtifactRootCwd: () => currentCtx?.cwd,
       getWorkflowRoots,
       onOpenWorkflow: (id: string) => {
         void withModal(async () => {
@@ -1145,6 +1168,73 @@ Terse command-style prompts produce shallow, generic work.
       // Reload custom agents so new project/global .md files are picked up without restart
       reloadCustomAgents();
 
+      // Resume is a distinct raw-parameter branch. Do not resolve the caller's
+      // type/config/model first: stored record metadata is authoritative.
+      if (params.resume) {
+        const existing = manager.getRecord(params.resume);
+        if (!existing) {
+          return textResult(`Agent not found: "${params.resume}". It may have been cleaned up.`);
+        }
+        const invalid = [
+          ["model", params.model],
+          ["thinking", params.thinking],
+          ["max_turns", params.max_turns],
+          ["isolated", params.isolated],
+          ["inherit_context", params.inherit_context],
+          ["isolation", params.isolation],
+          ["schedule", params.schedule],
+        ].find(([, value]) => value !== undefined);
+        if (invalid) {
+          return textResult(
+            `resume-invalid-options: resume cannot override spawn option "${invalid[0]}".`,
+            undefined,
+          );
+        }
+        const isBackground = params.run_in_background ?? false;
+        const displayName = getDisplayName(existing.type);
+        const detailBase = {
+          displayName,
+          description: existing.description,
+          subagentType: existing.type,
+        };
+        const runtimeFactory = {
+          create: (deps: AgentResumeRuntimeDependencies) => createAgentResumeRuntime(pi, ctx, deps),
+        };
+        try {
+          const resumed = await manager.resume(
+            params.resume,
+            params.prompt,
+            runtimeFactory,
+            { kind: "top-level", artifactRootCwd: canonicalArtifactRootCwd(ctx.cwd) },
+            { isBackground, ...(isBackground ? {} : { signal }), toolCallId },
+          );
+          if (!resumed) return textResult(`Failed to resume agent "${params.resume}".`);
+          if (isBackground) {
+            widget.ensureTimer();
+            widget.update();
+            return textResult(
+              `Agent resumed in background.\n` +
+              `Agent ID: ${resumed.id}\n` +
+              `Type: ${existing.type}\n` +
+              `Description: ${existing.description}\n\n` +
+              `You will receive a completion notification when this agent finishes.\n` +
+              `Results arrive via that notification; after it, call get_subagent_result with wait omitted or false to render native expandable results.\n` +
+              `Do not duplicate this agent's work.`,
+              { ...detailBase, toolUses: 0, tokens: "", durationMs: 0, status: "background" as const, agentId: resumed.id },
+            );
+          }
+          return textResult(
+            formatInlineAgentResult(resumed),
+            buildInlineAgentDetails(resumed, detailBase),
+          );
+        } catch (error) {
+          const message = error instanceof AgentResumeError
+            ? error.message
+            : error instanceof Error ? error.message : String(error);
+          return textResult(message);
+        }
+      }
+
       const rawType = params.subagent_type as SubagentType;
       const resolution = resolveSpawnType(rawType);
       if (!resolution.ok) return textResult(resolution.message);
@@ -1281,47 +1371,6 @@ Terse command-style prompts produce shallow, generic work.
         }
       }
 
-      // Resume uses the same resolved mode as a fresh Agent call.
-      if (params.resume) {
-        const existing = manager.getRecord(params.resume);
-        if (!existing) {
-          return textResult(`Agent not found: "${params.resume}". It may have been cleaned up.`);
-        }
-        if (!existing.session) {
-          return textResult(`Agent "${params.resume}" has no active session to resume.`);
-        }
-
-        existing.resultConsumed = false;
-        existing.toolCallId = toolCallId;
-        const resumed = manager.resume(params.resume, params.prompt, {
-          isBackground,
-          ...(isBackground ? {} : { signal }),
-        });
-
-        if (isBackground) {
-          void resumed;
-          widget.ensureTimer();
-          widget.update();
-          return textResult(
-            `Agent resumed in background.\n` +
-            `Agent ID: ${params.resume}\n` +
-            `Type: ${displayName}\n` +
-            `Description: ${params.description}\n\n` +
-            `You will receive a completion notification when this agent finishes.\n` +
-            `Results arrive via that notification; after it, call get_subagent_result with wait omitted or false to render native expandable results.\n` +
-            `Do not duplicate this agent's work.`,
-            { ...detailBase, toolUses: 0, tokens: "", durationMs: 0, status: "background" as const, agentId: params.resume },
-          );
-        }
-
-        const record = await resumed;
-        if (!record) return textResult(`Failed to resume agent "${params.resume}".`);
-        return textResult(
-          formatInlineAgentResult(record),
-          buildInlineAgentDetails(record, detailBase),
-        );
-      }
-
       const { state: activityState, callbacks: activityCallbacks } = createActivityTracker(effectiveMaxTurns);
 
       if (!isBackground) {
@@ -1449,6 +1498,9 @@ Terse command-style prompts produce shallow, generic work.
       if (!record) {
         return textResult(`Agent not found: "${params.agent_id}". It may have been cleaned up.`);
       }
+      if (!isAgentRecordInArtifactRoot(record, _ctx?.cwd)) {
+        return textResult(`Agent not found: "${params.agent_id}". It may have been cleaned up.`);
+      }
 
       if (params.wait === true && (record.status === "queued" || record.status === "running")) {
         await waitForTerminalRecord(record, signal);
@@ -1560,8 +1612,21 @@ Terse command-style prompts produce shallow, generic work.
    * agents enter AgentManager.
    */
   const workflowTasks = new Map<string, WorkflowTask>();
+  const workflowHistorySnapshots = new Map<string, WorkflowHistorySnapshot>();
+
+  function getCurrentWorkflowHistory(): ReadonlyMap<string, WorkflowHistorySnapshot> {
+    const currentRoot = currentCtx?.cwd;
+    if (currentRoot === undefined) return new Map();
+    return new Map(
+      [...workflowHistorySnapshots.entries()]
+        .filter(([, snapshot]) => sameArtifactRootCwd(snapshot.artifactRootCwd, currentRoot)),
+    );
+  }
+
   const workflowMenuDeps = {
     tasks: workflowTasks,
+    history: workflowHistorySnapshots,
+    getHistory: getCurrentWorkflowHistory,
     getRecord: (id: string) => manager.getRecord(id),
     viewAgentConversation: (ctx: ExtensionCommandContext, record: AgentRecord) => viewAgentConversation(ctx, record, "live"),
     getCtx: () => currentCtx as ExtensionCommandContext | undefined,
@@ -1595,11 +1660,12 @@ Terse command-style prompts produce shallow, generic work.
           ctx,
           manager,
           signal: task.abortController.signal,
+          artifactRootCwd: ctx.cwd,
           // Real workflow children use the run id as their tree parent; the
           // grouping-only workflow root itself never enters AgentManager.
           workflowId: task.id,
           outputTranscript: getOutputTranscriptDefault(),
-          ...(ctx.sessionManager?.getSessionId?.() ? { rootSessionId: ctx.sessionManager.getSessionId() } : {}),
+          ...(task.rootSessionId !== undefined ? { rootSessionId: task.rootSessionId } : {}),
         }),
         onProgress: entries => {
           updateWorkflowProgressBatch(task, entries);
@@ -1620,6 +1686,17 @@ Terse command-style prompts produce shallow, generic work.
   }
 
   function notifyWorkflowFinished(task: WorkflowTask): void {
+    const artifactRoot = task.artifactRootCwd ?? currentCtx?.cwd ?? process.cwd();
+    const isCurrentArtifactRoot = currentCtx !== undefined && sameArtifactRootCwd(artifactRoot, currentCtx.cwd);
+    try {
+      const snapshot = writeWorkflowHistorySnapshot(task, artifactRoot);
+      if (snapshot !== undefined && isCurrentArtifactRoot) {
+        workflowHistorySnapshots.set(snapshot.workflowId, snapshot);
+      }
+    } catch (error) {
+      console.warn(`[pi-subagents] could not persist workflow history: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    if (!isCurrentArtifactRoot) return;
     widget.update();
     const result = workflowResultText(task);
     const status: NotificationDetails["status"] = task.status === "completed"
@@ -1696,6 +1773,9 @@ Terse command-style prompts produce shallow, generic work.
             startTime: task.startTime,
             endTime: task.endTime,
             totalPausedMs: task.totalPausedMs,
+            ...(task.error !== undefined
+              ? { errorPreview: task.error.slice(0, 4_000) }
+              : { resultPreview: workflowResultText(task).slice(0, 4_000) }),
           },
           meta: task.meta,
           agentCount: task.agentCount,
@@ -1745,6 +1825,8 @@ Terse command-style prompts produce shallow, generic work.
         args: params.args,
         meta,
         toolCallId,
+        artifactRootCwd: ctx.cwd,
+        rootSessionId: ctx.sessionManager?.getSessionId?.(),
         ...(journalPath !== undefined ? { journalPath } : {}),
         ...(replay !== undefined && replay.length > 0 ? { replay, resumedFrom: resumeFrom?.runId } : {}),
       });
@@ -1878,7 +1960,7 @@ Terse command-style prompts produce shallow, generic work.
     }
 
     if (isWorkflowsEnabled()) {
-      options.push(`Workflows (${workflowTasks.size})`);
+      options.push(`Workflows (${getWorkflowRoots().length})`);
     }
 
     // Actions
@@ -2070,6 +2152,7 @@ Terse command-style prompts produce shallow, generic work.
           agents: manager.listAgents(),
           workflowRoots: getWorkflowRoots(),
           sessionId: ctx.sessionManager?.getSessionId?.(),
+          artifactRootCwd: ctx.cwd,
           resolveViewMode: record => resolveAgentViewMode(record, ctx.cwd),
         }),
         agentTreeMenuState,
@@ -2087,6 +2170,13 @@ Terse command-style prompts produce shallow, generic work.
       const mode = record === undefined ? undefined : resolveAgentViewMode(record, ctx.cwd);
       if (record === undefined || mode === undefined) {
         ctx.ui.notify("No conversation available for that agent.", "info");
+        continue;
+      }
+      if (mode === "unavailable") {
+        ctx.ui.notify(
+          `No display transcript is available for "${record.description}". Resume agent ${record.id} with the Agent tool.`,
+          "info",
+        );
         continue;
       }
       await viewAgentConversation(ctx, record, mode);
@@ -2135,9 +2225,16 @@ Terse command-style prompts produce shallow, generic work.
   async function viewAgentConversation(
     ctx: ExtensionCommandContext,
     record: AgentRecord,
-    mode: "live" | "history",
+    mode: "live" | "history" | "unavailable",
   ) {
-    if (mode === "live" && !canOpenActiveAgent(record)) {
+    if (mode === "unavailable") {
+      ctx.ui.notify(
+        `No display transcript is available for "${record.description}". Resume agent ${record.id} with the Agent tool.`,
+        "info",
+      );
+      return;
+    }
+    if (mode === "live" && !canOpenActiveAgent(record, ctx.cwd)) {
       ctx.ui.notify(`Agent is ${record.status === "queued" ? "queued" : "expired"} — no history available.`, "info");
       return;
     }

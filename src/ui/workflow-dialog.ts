@@ -697,6 +697,14 @@ export function layoutWorkflowDialog(input: WorkflowDialogInput): WorkflowCardLi
       width,
     ),
   );
+  if (input.task.restoredHistory) {
+    lines.push(clampLine([{ text: " Restored workflow history · child conversations unavailable.", color: "warning" }], width));
+  }
+  if (input.task.errorPreview !== undefined) {
+    lines.push(clampLine([{ text: ` Error: ${input.task.errorPreview}`, color: "error" }], width));
+  } else if (input.task.resultPreview !== undefined) {
+    lines.push(clampLine([{ text: ` Result: ${input.task.resultPreview}`, color: "dim" }], width));
+  }
   lines.push([]);
 
   const frameWidth = width - 1;

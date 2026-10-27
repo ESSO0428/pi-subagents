@@ -9,7 +9,13 @@ import {
 import { Type } from "@sinclair/typebox";
 import { abortable } from "./abortable.js";
 import { readAgentHistoryResult } from "./agent-history.js";
-import type { ResumeOptions } from "./agent-manager.js";
+import type { ResumeAuthority, ResumeOptions } from "./agent-manager.js";
+import type {
+  AgentResumeRuntime,
+  AgentResumeRuntimeDependencies,
+  AgentResumeRuntimeFactory,
+} from "./agent-runner.js";
+import { canonicalArtifactRootCwd } from "./agent-session-storage.js";
 import {
   buildAgentRegistry,
   getAgentConfig,
@@ -26,7 +32,7 @@ import { checkModelScope } from "./model-scope.js";
 import { applyNicoOverridesToMap, readNicoAgentOverrides } from "./nico-overrides.js";
 import { createOutputFilePath, writeInitialEntry } from "./output-file.js";
 import { getStatusNote } from "./status-note.js";
-import type { AgentConfig, AgentInvocation, AgentRecord, IsolationMode, ThinkingLevel } from "./types.js";
+import type { AgentConfig, AgentInvocation, AgentOwnership, AgentRecord, IsolationMode, ThinkingLevel } from "./types.js";
 import { addUsage } from "./usage.js";
 
 let maxSubagentDepth = 2;
@@ -55,6 +61,8 @@ export interface NestedSpawnOptions {
   maxSubagentDepth: number;
   configCwd?: string;
   rootSessionId?: string;
+  artifactRootCwd?: string;
+  ownership?: AgentOwnership;
 }
 
 export interface NestedAgentManager {
@@ -68,7 +76,14 @@ export interface NestedAgentManager {
     onSpawned?: (id: string) => void,
   ): Promise<{ id: string; record: AgentRecord }>;
   getRecord(id: string): AgentRecord | undefined;
-  resume(id: string, prompt: string, options?: ResumeOptions): Promise<AgentRecord | undefined>;
+  resume(
+    id: string,
+    prompt: string,
+    runtimeFactory: AgentResumeRuntimeFactory,
+    authority: ResumeAuthority,
+    signalOrOptions?: AbortSignal | ResumeOptions,
+    options?: ResumeOptions,
+  ): Promise<AgentRecord | undefined>;
   reportNestedIssue?(parentAgentId: string, issue: string): void;
 }
 
@@ -80,6 +95,7 @@ export interface NestedToolContext {
   maxSubagentDepth: number;
   allowedSubagents: "all" | string[];
   configCwd: string;
+  createResumeRuntime?: (ctx: ExtensionContext, deps: AgentResumeRuntimeDependencies) => AgentResumeRuntime;
 }
 
 function textResult(text: string, isError = false) {
@@ -170,7 +186,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       inherit_context: Type.Optional(Type.Boolean({ description: "If true, fork the parent conversation. Used only when the selected agent's frontmatter or agentOverrides leaves inherit_context unspecified." })),
       isolation: Type.Optional(Type.Literal("worktree", { description: 'Run the agent in an isolated git worktree. Used only when the selected agent\'s frontmatter or agentOverrides leaves isolation unspecified.' })),
     }),
-    execute: async (_toolCallId, params, signal, _onUpdate, ctx) => {
+    execute: async (toolCallId, params, signal, _onUpdate, ctx) => {
       if (params.resume) {
         const existing = context.manager.getRecord(params.resume);
         if (!ownsRecord(existing, context.parentAgentId)) {
@@ -178,22 +194,56 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
           report(`ownership violation: ${message}`);
           return textResult(message, true);
         }
-
-        const config = getAgentConfigIn(loadRegistry(), existing.type);
-        const invocation = resolveAgentInvocationConfig(config, params);
-        const resumedPromise = context.manager.resume(params.resume, params.prompt, {
-          isBackground: invocation.runInBackground,
-          ...(!invocation.runInBackground && { signal }),
-        });
-        if (invocation.runInBackground) {
-          void resumedPromise;
-          return textResult(`Nested agent resumed in background. Agent ID: ${params.resume}`);
+        const invalid = [
+          ["model", params.model],
+          ["thinking", params.thinking],
+          ["max_turns", params.max_turns],
+          ["isolated", params.isolated],
+          ["inherit_context", params.inherit_context],
+          ["isolation", params.isolation],
+        ].find(([, value]) => value !== undefined);
+        if (invalid) {
+          return textResult(
+            `resume-invalid-options: resume cannot override spawn option "${invalid[0]}".`,
+            true,
+          );
         }
-
-        const resumed = await resumedPromise;
-        return resumed
-          ? textResult(formatRecord(resumed, false), resumed.status === "error")
-          : textResult(`Failed to resume nested agent "${params.resume}".`, true);
+        const isBackground = params.run_in_background ?? false;
+        const runtimeFactory: AgentResumeRuntimeFactory = {
+          create: (deps: AgentResumeRuntimeDependencies) => context.createResumeRuntime?.(ctx, deps) ?? {
+            rehydrate: async () => {
+              throw new Error("resume-session-incompatible: resume runtime is unavailable");
+            },
+          },
+        };
+        try {
+          const resumed = await context.manager.resume(
+            params.resume,
+            params.prompt,
+            runtimeFactory,
+            {
+              kind: "nested",
+              artifactRootCwd: canonicalArtifactRootCwd(context.configCwd),
+              parentAgentId: context.parentAgentId,
+            },
+            { isBackground, ...(isBackground ? {} : { signal }), toolCallId },
+          );
+          if (isBackground) {
+            return textResult(`Nested agent resumed in background. Agent ID: ${params.resume}`);
+          }
+          return resumed
+            ? textResult(formatRecord(resumed, false), resumed.status === "error")
+            : textResult(`Failed to resume nested agent "${params.resume}".`, true);
+        } catch (error) {
+          const code = error instanceof Error && "code" in error
+            && typeof (error as { code?: unknown }).code === "string"
+            ? (error as { code: string }).code
+            : undefined;
+          const message = error instanceof Error
+            ? code ? `${code}: ${error.message.replace(`${code}: `, "")}` : error.message
+            : String(error);
+          return textResult(message, true);
+        }
       }
 
       if (context.depth >= context.maxSubagentDepth) {
@@ -261,6 +311,8 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
         parentAgentId: context.parentAgentId,
         maxSubagentDepth: context.maxSubagentDepth,
         configCwd: context.configCwd,
+        artifactRootCwd: canonicalArtifactRootCwd(context.configCwd),
+        ownership: { kind: "nested", parentAgentId: context.parentAgentId, depth: childDepth },
         rootSessionId,
         onAssistantUsage: usage => {
           for (let id: string | undefined = context.parentAgentId; id !== undefined;) {

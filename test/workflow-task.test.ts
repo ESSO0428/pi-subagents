@@ -31,8 +31,10 @@ function stubControl(): WorkflowControl & { pause: ReturnType<typeof vi.fn> } {
   } as unknown as WorkflowControl & { pause: ReturnType<typeof vi.fn> };
 }
 
+const ARTIFACT_ROOT = process.cwd();
+
 function runningTask(): { task: WorkflowTask; control: ReturnType<typeof stubControl> } {
-  const task = createWorkflowTask({ id: "wf_abc123", script: "", startTime: 1_000 });
+  const task = createWorkflowTask({ id: "wf_abc123", script: "", artifactRootCwd: ARTIFACT_ROOT, startTime: 1_000 });
   const control = stubControl();
   task.control = control;
   return { task, control };
@@ -43,6 +45,7 @@ describe("workflow tree root mapping", () => {
     const task = createWorkflowTask({
       id: "wf_abc123",
       script: "",
+      artifactRootCwd: ARTIFACT_ROOT,
       startTime: 1_000,
       meta: { name: "review", description: "Review changes" },
     });
@@ -53,6 +56,7 @@ describe("workflow tree root mapping", () => {
     task.totalTokens = 42;
 
     expect(toWorkflowTreeRoot(task)).toEqual({
+      artifactRootCwd: ARTIFACT_ROOT,
       id: "wf_abc123",
       name: "review",
       description: "Review changes",
@@ -66,7 +70,7 @@ describe("workflow tree root mapping", () => {
   });
 
   it("leaves a running root without a completion time", () => {
-    const task = createWorkflowTask({ id: "wf_abc123", script: "", startTime: 1_000 });
+    const task = createWorkflowTask({ id: "wf_abc123", script: "", artifactRootCwd: ARTIFACT_ROOT, startTime: 1_000 });
 
     expect(toWorkflowTreeRoot(task).completedAt).toBeUndefined();
   });
@@ -108,7 +112,7 @@ describe("pausing a run", () => {
   it("refuses when there is no run behind the record", () => {
     // A task whose run has settled keeps its progress but loses its control;
     // pausing it would be a status the runtime never agreed to.
-    const task = createWorkflowTask({ id: "wf_abc123", script: "" });
+    const task = createWorkflowTask({ id: "wf_abc123", script: "", artifactRootCwd: ARTIFACT_ROOT });
     expect(pauseWorkflowTask(task)).toBe(false);
     expect(task.status).toBe("running");
   });

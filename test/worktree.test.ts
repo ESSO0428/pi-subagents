@@ -1,9 +1,20 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { cleanupWorktree, createWorktree, pruneWorktrees } from "../src/worktree.js";
+import { AgentManager } from "../src/agent-manager.js";
+import type { WorktreeResumeState } from "../src/types.js";
+import {
+  cleanupWorktree,
+  createDetachedWorktree,
+  createWorktree,
+  getCanonicalRepoRoot,
+  pruneWorktrees,
+  removeWorktree,
+  validateWorktreeTarget,
+  verifyCommitSha,
+} from "../src/worktree.js";
 
 /**
  * Helper: create a temporary git repo with an initial commit.
@@ -70,9 +81,12 @@ describe("worktree", () => {
       }
     });
 
-    it("workPath equals path when created from the repo root", () => {
+    it("workPath equals path and records canonical root state at the repo root", () => {
       const wt = createWorktree(repoDir, "root-wp")!;
       expect(wt.workPath).toBe(wt.path);
+      expect(wt.repoRoot).toBe(repoDir);
+      expect(wt.originalTargetSubdirectory).toBe("");
+      expect(wt.baseSha).toMatch(/^[0-9a-f]{40}$/);
       try { execFileSync("git", ["worktree", "remove", "--force", wt.path], { cwd: repoDir, stdio: "pipe" }); } catch { /* ignore */ }
     });
 
@@ -85,6 +99,8 @@ describe("worktree", () => {
       const wt = createWorktree(join(repoDir, "packages", "api"), "subdir-wp")!;
       expect(wt).toBeDefined();
       expect(wt.workPath).toBe(join(wt.path, "packages", "api"));
+      expect(wt.repoRoot).toBe(repoDir);
+      expect(wt.originalTargetSubdirectory).toBe("packages/api");
       expect(existsSync(wt.workPath)).toBe(true);
       try { execFileSync("git", ["worktree", "remove", "--force", wt.path], { cwd: repoDir, stdio: "pipe" }); } catch { /* ignore */ }
     });
@@ -123,6 +139,7 @@ describe("worktree", () => {
       expect(result.hasChanges).toBe(true);
       expect(result.branch).toBeDefined();
       expect(result.branch).toContain("pi-agent-dirty-1");
+      expect(result.savedCommitSha).toMatch(/^[0-9a-f]{40}$/);
 
       // Verify the branch exists in the main repo
       const branches = execFileSync("git", ["branch", "--list", result.branch!], {
@@ -178,6 +195,7 @@ describe("worktree", () => {
         cwd: repoDir, stdio: "pipe",
       }).toString().trim();
       expect(branchCommit).toBe(agentCommit);
+      expect(result.savedCommitSha).toBe(agentCommit);
       expect(existsSync(wt.path)).toBe(false);
 
       // Cleanup branch
@@ -238,6 +256,144 @@ describe("worktree", () => {
 
       // Cleanup
       try { execFileSync("git", ["branch", "-D", result.branch!], { cwd: repoDir, stdio: "pipe" }); } catch { /* ignore */ }
+    });
+  });
+
+  describe("detached worktree primitive", () => {
+    function state(overrides: Partial<WorktreeResumeState> = {}): WorktreeResumeState {
+      const baseSha = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoDir, stdio: "pipe" }).toString().trim();
+      return {
+        repoRoot: repoDir,
+        baseCommitSha: baseSha,
+        originalTargetSubdirectory: "",
+        ...overrides,
+      };
+    }
+
+    function reconstructWithPrimitives(resumeState: WorktreeResumeState, agentId: string) {
+      const repoRoot = getCanonicalRepoRoot(resumeState.repoRoot, "resume-worktree-missing-cwd", true);
+      const sourceSha = verifyCommitSha(repoRoot, resumeState.savedCommitSha ?? resumeState.baseCommitSha);
+      validateWorktreeTarget(repoRoot, resumeState.originalTargetSubdirectory);
+      const worktree = createDetachedWorktree(repoRoot, sourceSha, resumeState.originalTargetSubdirectory, agentId);
+      return { worktree, executionCwd: realpathSync(worktree.workPath) };
+    }
+
+    it("reconstructs a fresh detached root worktree from baseCommitSha", () => {
+      const first = reconstructWithPrimitives(state(), "resume-root");
+      expect(first.executionCwd).toBe(first.worktree.path);
+      expect(first.executionCwd).not.toBe(repoDir);
+      expect(existsSync(first.executionCwd)).toBe(true);
+      expect(execFileSync("git", ["rev-parse", "HEAD"], { cwd: first.executionCwd, stdio: "pipe" }).toString().trim())
+        .toBe(state().baseCommitSha);
+      removeWorktree(repoDir, first.worktree);
+      expect(existsSync(first.worktree.path)).toBe(false);
+    });
+
+    it("reconstructs a nested target and always uses a fresh unique path", () => {
+      mkdirSync(join(repoDir, "packages", "api"), { recursive: true });
+      writeFileSync(join(repoDir, "packages", "api", "index.ts"), "export {}\n");
+      execFileSync("git", ["add", "-A"], { cwd: repoDir, stdio: "pipe" });
+      execFileSync("git", ["commit", "-m", "package"], { cwd: repoDir, stdio: "pipe" });
+      const resumeState = state({ originalTargetSubdirectory: "packages/api" });
+
+      const first = reconstructWithPrimitives(resumeState, "resume-nested-1");
+      const second = reconstructWithPrimitives(resumeState, "resume-nested-2");
+      expect(first.worktree.path).not.toBe(second.worktree.path);
+      expect(first.executionCwd).toBe(join(first.worktree.path, "packages", "api"));
+      expect(first.executionCwd).not.toBe(join(repoDir, "packages", "api"));
+      expect(existsSync(first.executionCwd)).toBe(true);
+      removeWorktree(repoDir, first.worktree);
+      removeWorktree(repoDir, second.worktree);
+    });
+
+    it("prefers savedCommitSha and falls back to baseCommitSha", () => {
+      const first = createWorktree(repoDir, "progression")!;
+      writeFileSync(join(first.path, "progress.txt"), "saved\n");
+      const cleanup = cleanupWorktree(repoDir, first, "save progression");
+      expect(cleanup.savedCommitSha).toBeDefined();
+
+      const resumed = reconstructWithPrimitives(state({ savedCommitSha: cleanup.savedCommitSha }), "resume-saved");
+      expect(execFileSync("git", ["rev-parse", "HEAD"], { cwd: resumed.executionCwd, stdio: "pipe" }).toString().trim())
+        .toBe(cleanup.savedCommitSha);
+      removeWorktree(repoDir, resumed.worktree);
+
+      const base = reconstructWithPrimitives(state(), "resume-base");
+      expect(execFileSync("git", ["rev-parse", "HEAD"], { cwd: base.executionCwd, stdio: "pipe" }).toString().trim())
+        .toBe(state().baseCommitSha);
+      removeWorktree(repoDir, base.worktree);
+    });
+
+    it.each(["missing repo", "missing commit", "missing subdirectory"] as const)("fails closed for %s", (label) => {
+      const resumeState = label === "missing repo"
+        ? state({ repoRoot: join(repoDir, "missing") })
+        : label === "missing commit"
+          ? state({ baseCommitSha: "0".repeat(40) })
+          : state({ originalTargetSubdirectory: "packages/missing" });
+      expect(() => reconstructWithPrimitives(resumeState, "resume-invalid")).toThrowError(
+        expect.objectContaining({ code: expect.stringMatching(/^resume-worktree-/) }),
+      );
+      expect(existsSync(repoDir)).toBe(true);
+    });
+
+    it("rejects a full SHA that names a non-commit object", () => {
+      const blobSha = execFileSync("git", ["hash-object", "README.md"], { cwd: repoDir, stdio: "pipe" }).toString().trim();
+      expect(blobSha).toMatch(/^[0-9a-f]{40}$/);
+      expect(() => reconstructWithPrimitives(state({ baseCommitSha: blobSha }), "resume-blob"))
+        .toThrowError(expect.objectContaining({ code: "resume-worktree-invalid-ref" }));
+    });
+  });
+
+  describe("AgentManager reconstruction orchestration", () => {
+    it("reconstructs a caller-supplied target subdirectory through AgentManager", () => {
+      mkdirSync(join(repoDir, "packages", "api"), { recursive: true });
+      writeFileSync(join(repoDir, "packages", "api", "index.ts"), "export const initial = true;\n");
+      execFileSync("git", ["add", "-A"], { cwd: repoDir, stdio: "pipe" });
+      execFileSync("git", ["commit", "-m", "package"], { cwd: repoDir, stdio: "pipe" });
+
+      const first = createWorktree(join(repoDir, "packages", "api"), "first")!;
+      writeFileSync(join(first.workPath, "changed.ts"), "export const changed = true;\n");
+      const cleanup = cleanupWorktree(repoDir, first, "save branch");
+      const manager = new AgentManager();
+      try {
+        const resumed = manager.reconstructResumeWorktree({
+          repoRoot: repoDir,
+          baseCommitSha: first.baseSha,
+          savedCommitSha: cleanup.savedCommitSha,
+          originalTargetSubdirectory: "packages/api",
+        }, "resumed");
+
+        expect(resumed.worktree.path).not.toBe(first.path);
+        expect(resumed.executionCwd).toBe(join(resumed.worktree.path, "packages", "api"));
+        expect(existsSync(resumed.executionCwd)).toBe(true);
+        expect(resumed.executionCwd).not.toBe(repoDir);
+        manager.removeReconstructedWorktree("resumed");
+
+        rmSync(join(repoDir, "packages"), { recursive: true, force: true });
+        execFileSync("git", ["add", "-A"], { cwd: repoDir, stdio: "pipe" });
+        execFileSync("git", ["commit", "-m", "remove package"], { cwd: repoDir, stdio: "pipe" });
+        const oldTarget = manager.reconstructResumeWorktree({
+          repoRoot: repoDir,
+          baseCommitSha: first.baseSha,
+          originalTargetSubdirectory: "packages/api",
+        }, "old-target");
+        expect(existsSync(oldTarget.executionCwd)).toBe(true);
+        manager.removeReconstructedWorktree("old-target");
+      } finally {
+        manager.dispose();
+      }
+    });
+  });
+
+  describe("reconstructed worktree cleanup", () => {
+    it("is idempotent after reconstruction preparation fails", () => {
+      const baseSha = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repoDir, stdio: "pipe" }).toString().trim();
+      const repoRoot = getCanonicalRepoRoot(repoDir, "resume-worktree-missing-cwd", true);
+      const worktree = createDetachedWorktree(repoRoot, verifyCommitSha(repoRoot, baseSha), "", "resume-cleanup");
+      expect(existsSync(worktree.path)).toBe(true);
+
+      removeWorktree(repoDir, worktree);
+      removeWorktree(repoDir, worktree);
+      expect(existsSync(worktree.path)).toBe(false);
     });
   });
 

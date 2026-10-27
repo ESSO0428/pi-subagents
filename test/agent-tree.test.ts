@@ -23,6 +23,7 @@ function agent(overrides: Partial<AgentRecord> & { id: string }): AgentRecord {
 
 function workflow(overrides: Partial<WorkflowTreeRoot> & { id: string }): WorkflowTreeRoot {
   return {
+    artifactRootCwd: "/project/default",
     name: overrides.id,
     description: overrides.id,
     status: "running",
@@ -38,10 +39,12 @@ function project(
   agents: readonly AgentRecord[],
   workflowRoots: readonly WorkflowTreeRoot[] = [],
   collapsedKeys: ReadonlySet<AgentTreeKey> = new Set(),
+  artifactRootCwd?: string,
 ) {
   return projectAgentTree({
     agents,
     workflowRoots,
+    artifactRootCwd,
     collapsedKeys,
     canOpenTerminalAgent: () => true,
   });
@@ -105,7 +108,7 @@ describe("agent tree projection", () => {
 
     const projection = projectAgentTree({
       agents: records,
-      workflowRoots: [workflow({ id: "settled", status: "completed", completedAt: 2 })],
+      workflowRoots: [workflow({ id: "settled", status: "completed", completedAt: 2, rootSessionId: "session-1" })],
       sessionId: "session-1",
       canOpenTerminalAgent: record => record.id === "open",
     });
@@ -114,6 +117,43 @@ describe("agent tree projection", () => {
       "agent:active",
       "workflow:settled",
       "agent:open",
+    ]);
+  });
+
+  it("filters workflow roots to the exact current session when provenance exists", () => {
+    const roots = [
+      workflow({ id: "current", rootSessionId: "session-current" }),
+      workflow({ id: "old", rootSessionId: "session-old" }),
+      workflow({ id: "unknown" }),
+    ];
+
+    expect(projectAgentTree({
+      agents: [],
+      workflowRoots: roots,
+      sessionId: "session-current",
+      canOpenTerminalAgent: () => true,
+    }).rows.map(row => row.key)).toEqual(["workflow:current"]);
+  });
+
+  it("filters live and restored roots to the current artifact root", () => {
+    const projectA = "/project/a";
+    const projectB = "/project/b";
+    const missingRoot = { ...workflow({ id: "missing" }), artifactRootCwd: undefined } as unknown as WorkflowTreeRoot;
+    const roots = [
+      workflow({ id: "live-a", artifactRootCwd: projectA }),
+      workflow({ id: "restored-a", artifactRootCwd: projectA, restoredHistory: true }),
+      workflow({ id: "live-b", artifactRootCwd: projectB }),
+      workflow({ id: "restored-b", artifactRootCwd: projectB, restoredHistory: true }),
+      missingRoot,
+    ];
+
+    expect(project([], roots, new Set(), projectA).rows.map(row => row.key)).toEqual([
+      "workflow:live-a",
+      "workflow:restored-a",
+    ]);
+    expect(project([], roots, new Set(), projectB).rows.map(row => row.key)).toEqual([
+      "workflow:live-b",
+      "workflow:restored-b",
     ]);
   });
 

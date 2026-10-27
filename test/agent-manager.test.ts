@@ -1,9 +1,11 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agent-manager.js";
+import * as recovery from "../src/agent-recovery.js";
+import { ensurePrivateSessionDirectory, privateSessionLocator } from "../src/agent-session-storage.js";
 import type { AgentRecord } from "../src/types.js";
 
 vi.mock("../src/agent-runner.js", () => ({
@@ -15,12 +17,37 @@ vi.mock("../src/worktree.js", () => ({
   createWorktree: vi.fn(),
   cleanupWorktree: vi.fn(() => ({ hasChanges: false })),
   pruneWorktrees: vi.fn(),
+  createDetachedWorktree: vi.fn(),
+  getCanonicalRepoRoot: vi.fn(),
+  removeWorktree: vi.fn(),
+  validateWorktreeTargetPath: vi.fn(),
+  verifyCommitSha: vi.fn(),
+  WorktreeError: class WorktreeError extends Error {
+    code: string;
+    constructor(code: string, message: string) {
+      super(`${code}: ${message}`);
+      this.code = code;
+    }
+  },
 }));
 
 import { resumeAgent, runAgent } from "../src/agent-runner.js";
+import {
+  cleanupWorktree,
+  createDetachedWorktree,
+  createWorktree,
+  getCanonicalRepoRoot,
+  removeWorktree,
+  validateWorktreeTargetPath,
+  verifyCommitSha,
+} from "../src/worktree.js";
 
 const mockPi = {} as any;
 const mockCtx = { cwd: "/tmp" } as any;
+const resumeRuntimeFactory = { create: vi.fn(() => ({ rehydrate: vi.fn() })) };
+const topLevelAuthority = { kind: "top-level" as const, artifactRootCwd: "/tmp" };
+const nestedAuthority = { kind: "nested" as const, artifactRootCwd: "/tmp", parentAgentId: "workflow-1" };
+const baseShaForTests = "0123456789abcdef0123456789abcdef01234567";
 
 const mockSession = () => ({
   messages: [],
@@ -120,16 +147,235 @@ describe("AgentManager — result consumption and completion callbacks", () => {
     await manager.getRecord(id)!.promise;
 
     vi.mocked(resumeAgent).mockResolvedValue({ text: "blocking result" });
-    const blocking = await manager.resume(id, "blocking prompt", { isBackground: false });
+    const blocking = await manager.resume(id, "blocking prompt", resumeRuntimeFactory, topLevelAuthority, { isBackground: false });
     expect(blocking?.isBackground).toBe(false);
     expect(blocking?.resultConsumed).toBe(true);
     expect(blocking?.invocation?.runInBackground).toBe(false);
 
     vi.mocked(resumeAgent).mockResolvedValue({ text: "detached result" });
-    const detached = await manager.resume(id, "detached prompt", { isBackground: true });
+    const detached = await manager.resume(id, "detached prompt", resumeRuntimeFactory, topLevelAuthority, { isBackground: true });
     expect(detached?.isBackground).toBe(true);
     expect(detached?.resultConsumed).toBe(false);
     expect(detached?.invocation?.runInBackground).toBe(true);
+  });
+
+  it("rejects wrong-root, wrong-parent, and wrong-workflow resume authorities before runtime creation", async () => {
+    manager = new AgentManager();
+    resolvedRun();
+
+    const topLevelId = manager.spawn(mockPi, mockCtx, "general-purpose", "top", {
+      description: "top",
+      isBackground: true,
+      bypassQueue: true,
+    });
+    const nestedId = manager.spawn(mockPi, mockCtx, "general-purpose", "nested", {
+      description: "nested",
+      isBackground: true,
+      bypassQueue: true,
+      parentAgentId: "parent-a",
+      ownership: { kind: "nested", parentAgentId: "parent-a", depth: 2 },
+    });
+    const workflowId = manager.spawn(mockPi, mockCtx, "general-purpose", "workflow", {
+      description: "workflow",
+      isBackground: true,
+      bypassQueue: true,
+      ownership: { kind: "workflow", workflowId: "workflow-a" },
+    });
+    await Promise.all([
+      manager.getRecord(topLevelId)!.promise,
+      manager.getRecord(nestedId)!.promise,
+      manager.getRecord(workflowId)!.promise,
+    ]);
+
+    const runtime = { create: vi.fn() };
+    await expect(manager.resume(topLevelId, "continue", runtime, {
+      kind: "top-level", artifactRootCwd: "/other-project",
+    })).rejects.toMatchObject({ code: "resume-ownership-denied" });
+    await expect(manager.resume(nestedId, "continue", runtime, {
+      kind: "nested", artifactRootCwd: "/tmp", parentAgentId: "parent-b",
+    })).rejects.toMatchObject({ code: "resume-ownership-denied" });
+    await expect(manager.resume(workflowId, "continue", runtime, {
+      kind: "workflow", artifactRootCwd: "/tmp", workflowId: "workflow-b", runtimeAgentId: "workflow-handle",
+    })).rejects.toMatchObject({ code: "resume-ownership-denied" });
+    expect(runtime.create).not.toHaveBeenCalled();
+  });
+
+  it("keeps terminal fields unchanged when absent-session preflight fails", async () => {
+    manager = new AgentManager();
+    vi.mocked(resumeAgent).mockClear();
+    resolvedRun();
+    const id = manager.spawn(mockPi, mockCtx, "general-purpose", "initial", {
+      description: "preflight",
+      isBackground: true,
+      bypassQueue: true,
+    });
+    const record = manager.getRecord(id)!;
+    await record.promise;
+    record.session = undefined;
+    record.result = "old result";
+    record.error = "old error";
+    record.resultConsumed = true;
+    record.toolCallId = "old-tool-call";
+    const previous = {
+      status: record.status,
+      startedAt: record.startedAt,
+      completedAt: record.completedAt,
+      result: record.result,
+      error: record.error,
+      resultConsumed: record.resultConsumed,
+      toolCallId: record.toolCallId,
+    };
+
+    await expect(manager.resume(id, "must not run", resumeRuntimeFactory, topLevelAuthority))
+      .rejects.toMatchObject({ code: "resume-checkpoint-invalid" });
+    expect(record).toMatchObject(previous);
+    expect(resumeAgent).not.toHaveBeenCalled();
+  });
+
+  it("rolls back a top-level background resume when setup checkpointing fails", async () => {
+    vi.mocked(resumeAgent).mockClear();
+    let starts = 0;
+    let completes = 0;
+    manager = new AgentManager(() => { completes++; }, 1, () => { starts++; });
+    resolvedRun();
+    const id = manager.spawn(mockPi, mockCtx, "general-purpose", "initial", {
+      description: "transaction",
+      isBackground: true,
+      bypassQueue: true,
+    });
+    const record = manager.getRecord(id)!;
+    await record.promise;
+    record.result = "old result";
+    record.error = "old error";
+    record.resultConsumed = true;
+    record.toolCallId = "old-tool-call";
+    const previous = {
+      status: record.status,
+      startedAt: record.startedAt,
+      completedAt: record.completedAt,
+      result: record.result,
+      error: record.error,
+      resultConsumed: record.resultConsumed,
+      toolCallId: record.toolCallId,
+      session: record.session,
+      promise: record.promise,
+    };
+    vi.mocked(resumeAgent).mockResolvedValue({ text: "must not run" });
+    const checkpoint = vi.spyOn(recovery, "writeAgentRecoveryCheckpoint").mockImplementationOnce(() => {
+      throw new Error("forced setup checkpoint failure");
+    });
+
+    await expect(manager.resume(id, "must not run", resumeRuntimeFactory, topLevelAuthority, { isBackground: true }))
+      .rejects.toThrow("forced setup checkpoint failure");
+
+    expect(record).toMatchObject(previous);
+    expect(record.historyFile).toBeTruthy();
+    expect(record.outputCleanup).toBeUndefined();
+    expect(resumeAgent).not.toHaveBeenCalled();
+    expect(starts).toBe(1);
+    expect(completes).toBe(1);
+
+    vi.mocked(runAgent).mockImplementationOnce(() => new Promise(() => {}));
+    const probeId = manager.spawn(mockPi, mockCtx, "general-purpose", "probe", {
+      description: "pool probe",
+      isBackground: true,
+    });
+    expect(manager.getRecord(probeId)?.status).toBe("running");
+    checkpoint.mockRestore();
+  });
+
+  it("disposes a prepared session and removes a fresh worktree on setup rollback", async () => {
+    vi.mocked(resumeAgent).mockClear();
+    const project = mkdtempSync(join(tmpdir(), "pi-agent-manager-resume-rollback-"));
+    const privateDirectory = ensurePrivateSessionDirectory(project);
+    const sessionFile = join(privateDirectory, "session-1.jsonl");
+    writeFileSync(sessionFile, JSON.stringify({
+      type: "session", id: "session-1", timestamp: new Date().toISOString(), cwd: project,
+    }) + "\n");
+    const locator = privateSessionLocator(project, sessionFile);
+    const initialWorktree = {
+      path: "/tmp/initial-resume-worktree",
+      branch: "initial-branch",
+      baseSha: "0123456789abcdef0123456789abcdef01234567",
+      repoRoot: "/repo",
+      originalTargetSubdirectory: "",
+      workPath: "/tmp/initial-resume-worktree",
+    };
+    const freshPath = mkdtempSync(join(tmpdir(), "pi-agent-manager-fresh-"));
+    const freshWorktree = { ...initialWorktree, path: freshPath, workPath: freshPath };
+    const resumedSession = { ...mockSession(), dispose: vi.fn() };
+    try {
+      vi.mocked(createWorktree).mockReturnValueOnce(initialWorktree);
+      vi.mocked(cleanupWorktree).mockReturnValueOnce({ hasChanges: false });
+      vi.mocked(runAgent).mockImplementationOnce(async (_ctx, _type, _prompt, options: any) => {
+        options.onSessionMetadata?.({
+          sessionState: {
+            kind: "private",
+            locator,
+            sessionId: "session-1",
+            artifactRootCwd: project,
+            resourceCwd: project,
+            originalExecutionCwd: project,
+            provider: "test-provider",
+            modelId: "test-model",
+            thinking: "off",
+          },
+          runtimeIdentity: { depth: 1, maxSubagentDepth: 2 },
+          ownership: { kind: "top-level" },
+          artifactRootCwd: project,
+          resourceCwd: project,
+          originalExecutionCwd: project,
+        });
+        return { responseText: "initial", session: mockSession(), aborted: false, steered: false };
+      });
+      manager = new AgentManager();
+      const context = { ...mockCtx, cwd: project };
+      const id = manager.spawn(mockPi, context, "general-purpose", "initial", {
+        description: "worktree rollback",
+        isolation: "worktree",
+        artifactRootCwd: project,
+      });
+      const record = manager.getRecord(id)!;
+      await record.promise;
+      record.session = undefined;
+      record.resultConsumed = true;
+      record.toolCallId = "old-tool-call";
+
+      vi.mocked(getCanonicalRepoRoot).mockReturnValueOnce("/repo");
+      vi.mocked(verifyCommitSha).mockReturnValue(baseShaForTests);
+      vi.mocked(createDetachedWorktree).mockReturnValueOnce(freshWorktree);
+      vi.mocked(removeWorktree).mockClear();
+      const runtime = {
+        create: vi.fn(() => ({
+          rehydrate: vi.fn(async () => ({
+            session: resumedSession,
+            executionCwd: freshPath,
+            resourceCwd: project,
+            model: { provider: "test-provider", id: "test-model", name: "test-model" },
+            thinkingLevel: "off",
+            historyStartIndex: 0,
+          })),
+        })),
+      };
+      vi.spyOn(recovery, "writeAgentRecoveryCheckpoint").mockImplementationOnce(() => {
+        throw new Error("forced prepared setup failure");
+      });
+
+      await expect(manager.resume(id, "must not run", runtime, {
+        kind: "top-level", artifactRootCwd: project,
+      }, { isBackground: true })).rejects.toThrow("forced prepared setup failure");
+
+      expect(resumedSession.dispose).toHaveBeenCalledOnce();
+      expect(removeWorktree).toHaveBeenCalledWith("/repo", freshWorktree);
+      expect(record.status).toBe("completed");
+      expect(record.resultConsumed).toBe(true);
+      expect(record.toolCallId).toBe("old-tool-call");
+      expect(resumeAgent).not.toHaveBeenCalled();
+    } finally {
+      vi.restoreAllMocks();
+      rmSync(project, { recursive: true, force: true });
+      rmSync(freshPath, { recursive: true, force: true });
+    }
   });
 
   it("does not queue a top-level background spawn for an owned detached resume", async () => {
@@ -150,7 +396,7 @@ describe("AgentManager — result consumption and completion callbacks", () => {
     await manager.getRecord(ownedId)!.promise;
 
     vi.mocked(resumeAgent).mockImplementation(() => new Promise(() => {}));
-    void manager.resume(ownedId, "owned resume", { isBackground: true });
+    void manager.resume(ownedId, "owned resume", resumeRuntimeFactory, nestedAuthority, { isBackground: true });
 
     const topLevelId = manager.spawn(mockPi, mockCtx, "general-purpose", "top-level", {
       description: "top-level child",
@@ -598,7 +844,7 @@ describe("AgentManager — lifetime usage + compaction count are eagerly initial
       return { text: "second" };
     });
 
-    await manager.resume(id, "more");
+    await manager.resume(id, "more", resumeRuntimeFactory, topLevelAuthority);
 
     expect(manager.getRecord(id)!.lifetimeUsage).toEqual({ input: 70, output: 30, cacheWrite: 5 });
     expect(manager.getRecord(id)!.compactionCount).toBe(1);
@@ -630,6 +876,218 @@ describe("AgentManager — isolation: worktree fails loud, no silent fallback", 
     expect(manager.listAgents()).toEqual([]);
     // runAgent never invoked — strict, no silent fallback
     expect(runAgent).not.toHaveBeenCalled();
+  });
+});
+
+describe("AgentManager — durable worktree state", () => {
+  let manager: AgentManager;
+  const baseSha = "0123456789abcdef0123456789abcdef01234567";
+  const savedSha = "fedcba9876543210fedcba9876543210fedcba98";
+  const worktree = {
+    path: "/tmp/fresh-worktree",
+    branch: "pi-agent-resume",
+    baseSha,
+    repoRoot: "/repo",
+    originalTargetSubdirectory: "packages/api",
+    workPath: "/tmp/fresh-worktree/packages/api",
+  };
+
+  afterEach(() => manager?.dispose());
+
+  it("stores stable config cwd while preserving the temporary worktree cwd during startup", async () => {
+    vi.mocked(createWorktree).mockReturnValueOnce(worktree);
+    vi.mocked(runAgent).mockImplementationOnce((_ctx, _type, _prompt, options: any) => {
+      expect(options.cwd).toBe(worktree.path);
+      expect(options.configCwd).toBeUndefined();
+      const metadata = {
+        sessionState: {
+          kind: "private",
+          locator: ".pi-subagents/agent-sessions/session-1.jsonl",
+          sessionId: "session-1",
+          artifactRootCwd: mockCtx.cwd,
+          resourceCwd: worktree.path,
+          originalExecutionCwd: mockCtx.cwd,
+          provider: "openai",
+          modelId: "gpt-test",
+          thinking: "high",
+        },
+        runtimeIdentity: { depth: 1, maxSubagentDepth: 2 },
+        ownership: { kind: "top-level" },
+        artifactRootCwd: mockCtx.cwd,
+        resourceCwd: worktree.path,
+        originalExecutionCwd: mockCtx.cwd,
+      };
+      options.onSessionMetadata?.(metadata);
+      expect(metadata.resourceCwd).toBe(worktree.path);
+      expect(metadata.sessionState.resourceCwd).toBe(worktree.path);
+      return Promise.resolve({
+        responseText: "done",
+        session: mockSession(),
+        aborted: false,
+        steered: false,
+      });
+    });
+    manager = new AgentManager();
+
+    const id = manager.spawn(mockPi, mockCtx, "general-purpose", "test", {
+      description: "test",
+      isolation: "worktree",
+    });
+    await manager.getRecord(id)!.promise;
+
+    const record = manager.getRecord(id)!;
+    expect(record.resourceCwd).toBe(mockCtx.cwd);
+    expect(record.sessionState).toMatchObject({ resourceCwd: mockCtx.cwd });
+    expect((record.sessionState as any).resourceCwd).not.toBe(worktree.path);
+  });
+
+  it("normalizes worktree resource metadata to the stable project cwd", async () => {
+    vi.mocked(createWorktree).mockReturnValueOnce(worktree);
+    vi.mocked(cleanupWorktree).mockReturnValueOnce({ hasChanges: false });
+    vi.mocked(runAgent).mockImplementationOnce(async (_ctx, _type, _prompt, options: any) => {
+      options.onSessionMetadata?.({
+        sessionState: {
+          kind: "private",
+          locator: ".pi-subagents/agent-sessions/session-1.jsonl",
+          sessionId: "session-1",
+          artifactRootCwd: "/tmp",
+          resourceCwd: worktree.path,
+          originalExecutionCwd: worktree.path,
+          provider: "openai",
+          modelId: "gpt-test",
+          thinking: "medium",
+        },
+        runtimeIdentity: { depth: 1, maxSubagentDepth: 1 },
+        ownership: { kind: "top-level" },
+        artifactRootCwd: "/tmp",
+        resourceCwd: worktree.path,
+        originalExecutionCwd: worktree.path,
+      });
+      return { responseText: "done", session: mockSession(), aborted: false, steered: false };
+    });
+    manager = new AgentManager();
+
+    const id = manager.spawn(mockPi, mockCtx, "general-purpose", "test", {
+      description: "test",
+      isolation: "worktree",
+    });
+    await manager.getRecord(id)!.promise;
+
+    expect(manager.getRecord(id)?.resourceCwd).toBe(mockCtx.cwd);
+    expect(manager.getRecord(id)?.sessionState).toMatchObject({ resourceCwd: mockCtx.cwd });
+  });
+
+  it("captures canonical repo state and preserves savedCommitSha on no-change cleanup", async () => {
+    vi.mocked(createWorktree).mockReturnValueOnce(worktree);
+    vi.mocked(cleanupWorktree).mockReturnValueOnce({ hasChanges: false });
+    resolvedRun();
+    manager = new AgentManager();
+
+    const id = manager.spawn(mockPi, mockCtx, "general-purpose", "test", {
+      description: "test",
+      cwd: "/",
+      isolation: "worktree",
+    });
+    const record = manager.getRecord(id)!;
+    record.worktreeResume!.savedCommitSha = savedSha;
+    await record.promise;
+
+    expect(record.worktreeResume).toEqual({
+      repoRoot: "/repo",
+      baseCommitSha: baseSha,
+      savedCommitSha: savedSha,
+      originalTargetSubdirectory: "packages/api",
+    });
+  });
+
+  it("cleans up the worktree when agent startup throws synchronously", () => {
+    vi.mocked(createWorktree).mockReturnValueOnce(worktree);
+    vi.mocked(cleanupWorktree).mockReturnValueOnce({ hasChanges: false });
+    vi.mocked(runAgent).mockImplementationOnce(() => {
+      throw new Error("startup failed");
+    });
+    vi.mocked(removeWorktree).mockClear();
+    manager = new AgentManager();
+
+    expect(() => manager.spawn(mockPi, mockCtx, "general-purpose", "test", {
+      description: "test",
+      isolation: "worktree",
+      isBackground: true,
+    })).toThrow("startup failed");
+    expect(cleanupWorktree).toHaveBeenCalledWith("/repo", worktree, "test");
+    expect(manager.listAgents()).toEqual([]);
+  });
+
+  it("updates canonical state with the cleanup saved commit SHA", async () => {
+    vi.mocked(createWorktree).mockReturnValueOnce(worktree);
+    vi.mocked(cleanupWorktree).mockReturnValueOnce({
+      hasChanges: true,
+      branch: "pi-agent-resume",
+      savedCommitSha: savedSha,
+    });
+    resolvedRun();
+    manager = new AgentManager();
+
+    const id = manager.spawn(mockPi, mockCtx, "general-purpose", "test", {
+      description: "test",
+      cwd: "/",
+      isolation: "worktree",
+    });
+    await manager.getRecord(id)!.promise;
+
+    expect(manager.getRecord(id)?.worktreeResult).toMatchObject({ savedCommitSha: savedSha });
+    expect(manager.getRecord(id)?.worktreeResume?.savedCommitSha).toBe(savedSha);
+  });
+
+  it("removes a fresh tree when final cwd preparation fails", () => {
+    const state = {
+      repoRoot: "/repo",
+      baseCommitSha: baseSha,
+      originalTargetSubdirectory: "packages/api",
+    };
+    const missingWorktree = { ...worktree, path: "/tmp/missing-resume-worktree", workPath: "/tmp/missing-resume-worktree/packages/api" };
+    vi.mocked(getCanonicalRepoRoot).mockReturnValueOnce("/repo");
+    vi.mocked(verifyCommitSha).mockReturnValueOnce(baseSha);
+    vi.mocked(createDetachedWorktree).mockReturnValueOnce(missingWorktree);
+    vi.mocked(removeWorktree).mockClear();
+    manager = new AgentManager();
+
+    expect(() => manager.reconstructResumeWorktree(state, "agent-failed")).toThrowError(
+      expect.objectContaining({ code: "resume-worktree-missing-cwd" }),
+    );
+    expect(removeWorktree).toHaveBeenCalledTimes(1);
+    expect(removeWorktree).toHaveBeenCalledWith("/repo", missingWorktree);
+  });
+
+  it("owns fresh reconstruction and exposes idempotent cleanup", () => {
+    const state = {
+      repoRoot: "/repo",
+      baseCommitSha: baseSha,
+      savedCommitSha: savedSha,
+      originalTargetSubdirectory: "packages/api",
+    };
+    const freshPath = mkdtempSync(join(tmpdir(), "pi-agent-resume-test-"));
+    mkdirSync(join(freshPath, "packages", "api"), { recursive: true });
+    vi.mocked(removeWorktree).mockClear();
+    const freshWorktree = { ...worktree, path: freshPath, workPath: freshPath };
+    vi.mocked(getCanonicalRepoRoot).mockReturnValueOnce("/repo");
+    vi.mocked(verifyCommitSha).mockReturnValue(baseSha).mockReturnValueOnce(baseSha).mockReturnValueOnce(savedSha);
+    vi.mocked(createDetachedWorktree).mockReturnValueOnce(freshWorktree);
+    manager = new AgentManager();
+
+    const result = manager.reconstructResumeWorktree(state, "agent-1");
+    expect(result.executionCwd).toBe(join(freshPath, "packages", "api"));
+    expect(getCanonicalRepoRoot).toHaveBeenCalledWith("/repo", "resume-worktree-missing-cwd", true);
+    expect(verifyCommitSha).toHaveBeenCalledWith("/repo", baseSha);
+    expect(verifyCommitSha).toHaveBeenCalledWith("/repo", savedSha);
+    expect(validateWorktreeTargetPath).toHaveBeenCalledWith("/repo", "packages/api");
+    expect(createDetachedWorktree).toHaveBeenCalledWith("/repo", savedSha, "packages/api", "agent-1");
+
+    manager.removeReconstructedWorktree("agent-1");
+    manager.removeReconstructedWorktree("agent-1");
+    expect(removeWorktree).toHaveBeenCalledTimes(1);
+    expect(removeWorktree).toHaveBeenCalledWith("/repo", freshWorktree);
+    rmSync(freshPath, { recursive: true, force: true });
   });
 });
 
@@ -714,7 +1172,7 @@ describe("AgentManager — SpawnOptions.cwd passthrough (#96)", () => {
     // copy's root — moving it would also move .pi config discovery.
     const { createWorktree } = await import("../src/worktree.js");
     vi.mocked(createWorktree).mockReturnValueOnce({
-      path: "/wt/copy", branch: "pi-agent-x", baseSha: "abc", workPath: "/wt/copy/sub/dir",
+      path: "/wt/copy", branch: "pi-agent-x", baseSha: "abc", repoRoot: "/repo", originalTargetSubdirectory: "sub/dir", workPath: "/wt/copy/sub/dir",
     });
     vi.mocked(runAgent).mockClear();
     resolvedRun();
@@ -729,6 +1187,7 @@ describe("AgentManager — SpawnOptions.cwd passthrough (#96)", () => {
     const opts = vi.mocked(runAgent).mock.lastCall![3];
     expect(opts.cwd).toBe("/wt/copy");
     expect(opts.configCwd).toBeUndefined();
+    expect(manager.getRecord(id)?.worktreeResume?.originalTargetSubdirectory).toBe("");
   });
 
   it("relative cwd throws immediately; no orphan record", () => {
@@ -1124,7 +1583,7 @@ describe("AgentManager — resolved runs with a failed final turn map to error (
       failure: "retries exhausted on resume",
     });
 
-    await manager.resume(id, "more");
+    await manager.resume(id, "more", resumeRuntimeFactory, topLevelAuthority);
 
     expect(record.status).toBe("error");
     expect(record.error).toBe("retries exhausted on resume");
@@ -1144,7 +1603,7 @@ describe("AgentManager — resolved runs with a failed final turn map to error (
       failure: "provider died mid-turn",
     });
 
-    await manager.resume(id, "more");
+    await manager.resume(id, "more", resumeRuntimeFactory, topLevelAuthority);
 
     expect(record.status).toBe("error");
     expect(record.result).toBe("new partial progress"); // salvageable, this-run text

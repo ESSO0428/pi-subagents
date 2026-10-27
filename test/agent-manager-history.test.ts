@@ -1,5 +1,9 @@
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { AgentManager } from "../src/agent-manager.js";
+import { readAgentRecoveryCheckpoints, writeAgentRecoveryCheckpoint } from "../src/agent-recovery.js";
 
 const managers: AgentManager[] = [];
 
@@ -84,5 +88,93 @@ describe("AgentManager.restoreCompleted", () => {
     expect(manager.getRecord("live")?.result).toBe("original");
     expect(manager.getRecord("bad-time")).toBeUndefined();
     expect(manager.getRecord("bad-path")).toBeUndefined();
+  });
+
+  it("keeps an existing record's session identity when a v1 checkpoint has none", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "pi-agent-manager-session-stamp-"));
+    const transcriptPath = ".pi-subagents/agent-transcripts/restored.jsonl";
+    mkdirSync(join(cwd, ".pi-subagents", "agent-transcripts"), { recursive: true });
+    writeFileSync(join(cwd, transcriptPath), JSON.stringify({ message: { role: "user", content: "restored" } }) + "\n");
+    const manager = makeManager();
+    manager.restoreCompleted([record({ id: "restored" })]);
+    expect(manager.getRecord("restored")?.sessionId).toBeUndefined();
+
+    writeAgentRecoveryCheckpoint(cwd, {
+      version: 1,
+      id: "restored",
+      type: "Explore",
+      description: "Restored record",
+      status: "completed",
+      startedAt: 1_000,
+      completedAt: 2_000,
+      toolUses: 0,
+      lifetimeUsage: { input: 0, output: 0, cacheWrite: 0 },
+      compactionCount: 0,
+      transcriptPath,
+    });
+    manager.restoreRecovered(cwd, "session-b");
+
+    expect(manager.getRecord("restored")).toMatchObject({
+      id: "restored",
+      sessionId: undefined,
+      transcriptPath,
+    });
+    rmSync(cwd, { recursive: true, force: true });
+  });
+
+  it("restores a valid private v2 stub without requiring its display transcript", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "pi-agent-manager-v2-history-"));
+    const manager = makeManager();
+    writeAgentRecoveryCheckpoint(cwd, {
+      version: 2,
+      id: "private-without-transcript",
+      type: "Explore",
+      description: "Private native session",
+      status: "completed",
+      startedAt: 1_000,
+      completedAt: 2_000,
+      resultConsumed: false,
+      toolUses: 0,
+      lifetimeUsage: { input: 0, output: 0, cacheWrite: 0 },
+      compactionCount: 0,
+      runtime: { depth: 1, maxSubagentDepth: 2, rootSessionId: "root-session" },
+      session: {
+        kind: "private",
+        locator: ".pi-subagents/agent-sessions/session-1.jsonl",
+        sessionId: "session-1",
+        artifactRootCwd: cwd,
+        resourceCwd: cwd,
+        originalExecutionCwd: cwd,
+        provider: "openai",
+        modelId: "gpt-test",
+        thinking: "high",
+      },
+      ownership: { kind: "top-level" },
+    });
+
+    manager.restoreRecovered(cwd);
+
+    expect(manager.getRecord("private-without-transcript")).toMatchObject({
+      id: "private-without-transcript",
+      status: "completed",
+      transcriptPath: undefined,
+      depth: 1,
+      maxSubagentDepth: 2,
+      rootSessionId: "root-session",
+      runtimeIdentity: { depth: 1, maxSubagentDepth: 2, rootSessionId: "root-session" },
+      sessionState: {
+        kind: "private",
+        locator: ".pi-subagents/agent-sessions/session-1.jsonl",
+        sessionId: "session-1",
+        artifactRootCwd: cwd,
+        resourceCwd: cwd,
+        originalExecutionCwd: cwd,
+        provider: "openai",
+        modelId: "gpt-test",
+        thinking: "high",
+      },
+    });
+    expect(readAgentRecoveryCheckpoints(cwd)).toHaveLength(1);
+    rmSync(cwd, { recursive: true, force: true });
   });
 });

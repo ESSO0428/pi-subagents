@@ -2,6 +2,7 @@
  * Framework-free projection and navigation for workflow roots and real agents.
  */
 
+import { sameArtifactRootCwd } from "./agent-session-storage.js";
 import type { AgentRecord, WidgetMode, WorkflowTreeRoot } from "./types.js";
 
 export type { WorkflowTreeRoot } from "./types.js";
@@ -42,6 +43,7 @@ export interface ProjectAgentTreeOptions {
   agents: readonly AgentRecord[];
   workflowRoots?: readonly WorkflowTreeRoot[];
   sessionId?: string;
+  artifactRootCwd?: string;
   mode?: WidgetMode;
   collapsedKeys?: ReadonlySet<AgentTreeKey>;
   /** Called only for terminal real agents. Active agents are always openable. */
@@ -76,16 +78,35 @@ function compare(a: InternalNode, b: InternalNode): number {
   return rank(a.node) - rank(b.node) || a.order - b.order;
 }
 
+function persistedArtifactRoot(record: AgentRecord): string | undefined {
+  if (record.artifactRootCwd !== undefined) return record.artifactRootCwd;
+  const state = record.sessionState;
+  return state && state.kind !== "pending" ? state.artifactRootCwd : undefined;
+}
+
+function isVisibleWorkflowRoot(
+  root: WorkflowTreeRoot,
+  artifactRootCwd: string | undefined,
+  sessionId: string | undefined,
+): boolean {
+  if (artifactRootCwd !== undefined
+    && (root.artifactRootCwd === undefined || !sameArtifactRootCwd(root.artifactRootCwd, artifactRootCwd))) {
+    return false;
+  }
+  return sessionId === undefined || root.rootSessionId === sessionId;
+}
+
 function isVisibleAgent(
   record: AgentRecord,
   options: ProjectAgentTreeOptions,
 ): boolean {
+  if (!sameArtifactRootCwd(persistedArtifactRoot(record), options.artifactRootCwd)) return false;
   if (options.sessionId !== undefined && record.sessionId !== options.sessionId) return false;
   if (options.mode === "background" && record.parentAgentId === undefined && record.isBackground === false) {
     return false;
   }
   if (record.status === "running" || record.status === "queued") return true;
-  return options.canOpenTerminalAgent(record);
+  return options.canOpenTerminalAgent(record) || record.sessionState?.kind === "private";
 }
 
 /**
@@ -97,7 +118,8 @@ function isVisibleAgent(
 export function projectAgentTree(options: ProjectAgentTreeOptions): AgentTreeProjection {
   if (options.mode === "off") return { rows: [] };
 
-  const workflowRoots = options.workflowRoots ?? [];
+  const workflowRoots = (options.workflowRoots ?? [])
+    .filter(root => isVisibleWorkflowRoot(root, options.artifactRootCwd, options.sessionId));
   const collapsedKeys = options.collapsedKeys ?? new Set<AgentTreeKey>();
   const workflowNodes = workflowRoots.map((root, index): InternalNode => ({
     node: { kind: "workflow", key: `workflow:${root.id}`, root },

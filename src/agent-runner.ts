@@ -18,6 +18,15 @@ import {
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
+import {
+  canonicalArtifactRootCwd,
+  ensurePrivateSessionDirectory,
+  preflightPrivateSession,
+  privateSessionDirectory,
+  privateSessionLocator,
+  ResumeStorageError,
+  resolvePrivateSessionLocator,
+} from "./agent-session-storage.js";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getConfig, getMemoryToolNames, getReadOnlyMemoryToolNames, getToolNamesForType } from "./agent-types.js";
 import { runInChildSessionContext } from "./child-context.js";
 import { buildParentContext, extractText } from "./context.js";
@@ -27,7 +36,15 @@ import { buildMemoryBlock, buildReadOnlyMemoryBlock } from "./memory.js";
 import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager } from "./nested-tools.js";
 import { buildAgentPrompt, type PromptExtras } from "./prompts.js";
 import { preloadSkills } from "./skill-loader.js";
-import type { SubagentType, ThinkingLevel } from "./types.js";
+import type {
+  AgentConfig,
+  AgentOwnership,
+  AgentRecord,
+  AgentRecoveryRuntimeIdentity,
+  AgentRecoverySessionState,
+  SubagentType,
+  ThinkingLevel,
+} from "./types.js";
 import { createTrackedWriteTool } from "./write-execution.js";
 
 /**
@@ -385,6 +402,23 @@ export interface RunOptions {
   thinkingLevel?: ThinkingLevel;
   /** Override working directory (e.g. for worktree isolation). */
   cwd?: string;
+  /** Stable project root for artifacts/private native sessions. */
+  artifactRootCwd?: string;
+  /** Original execution cwd before a resume worktree was reconstructed. */
+  originalExecutionCwd?: string;
+  /** Exact stored private-session identity used only by the rehydrate adapter. */
+  storedPrivateSession?: Extract<AgentRecoverySessionState, { kind: "private" }>;
+  /** Internal session preparation mode; callers should use prepareChildSession(). */
+  sessionMode?: ChildSessionMode;
+  /** Internal snapshots prevent config resolution from being performed twice. */
+  configOverride?: ReturnType<typeof getConfig>;
+  agentConfigOverride?: AgentConfig;
+  /** Persisted identity metadata supplied by AgentManager. */
+  runtimeIdentity?: AgentRecoveryRuntimeIdentity;
+  ownership?: AgentOwnership;
+  rootSessionId?: string;
+  /** Callback for initial checkpoint metadata, not a per-turn lifecycle hook. */
+  onSessionMetadata?: (metadata: AgentSessionMetadata) => void;
   /**
    * Where .pi config is discovered (project extensions, skills, pi settings,
    * agent memory). Default: same as the working directory. The manager sets
@@ -425,9 +459,88 @@ export interface RunOptions {
     parentAgentId: string;
     depth: number;
     maxSubagentDepth?: number;
+    rootSessionId?: string;
   };
   /** True only for an agent spawned by another agent, not a top-level owner. */
   nestedSession?: boolean;
+}
+
+export type ChildSessionMode =
+  | {
+      kind: "create";
+      artifactRootCwd: string;
+      resourceCwd: string;
+      originalExecutionCwd: string;
+      executionCwd: string;
+      persistence: "private" | "explicit" | "memory";
+      privateDir?: string;
+      sessionDir?: string;
+    }
+  | {
+      kind: "open";
+      artifactRootCwd: string;
+      resourceCwd: string;
+      originalExecutionCwd: string;
+      executionCwd: string;
+      persistence: "private";
+      privateDir: string;
+      file: string;
+      sessionId: string;
+    };
+
+export interface AgentSessionMetadata {
+  sessionState: AgentRecoverySessionState;
+  runtimeIdentity: AgentRecoveryRuntimeIdentity;
+  ownership: AgentOwnership;
+  artifactRootCwd: string;
+  resourceCwd: string;
+  originalExecutionCwd: string;
+}
+
+export interface PreparedChildSession {
+  session: AgentSession;
+  sessionFile?: string;
+  executionCwd: string;
+  resourceCwd: string;
+  model: Model<any>;
+  thinkingLevel: ThinkingLevel;
+  metadata?: AgentSessionMetadata;
+  /** Re-checks private creation metadata after the first prompt flushes JSONL. */
+  finalizeMetadata?: () => AgentSessionMetadata | undefined;
+  historyStartIndex: number;
+}
+
+export interface AgentResumeRuntimeDependencies {
+  nestedManager: NestedAgentManager;
+  childIdentity: {
+    parentAgentId: string;
+    depth: number;
+    maxSubagentDepth: number;
+    rootSessionId?: string;
+  };
+}
+
+export interface AgentResumeRuntime {
+  rehydrate(
+    record: AgentRecord,
+    executionCwd: string,
+    signal?: AbortSignal,
+  ): Promise<PreparedChildSession>;
+}
+
+export interface AgentResumeRuntimeFactory {
+  create(deps: AgentResumeRuntimeDependencies): AgentResumeRuntime;
+}
+
+export type ResumeRuntimeErrorCode =
+  | "resume-model-unavailable"
+  | "resume-session-incompatible";
+
+export class ResumeRuntimeError extends Error {
+  constructor(public readonly code: ResumeRuntimeErrorCode, message: string) {
+    super(`${code}: ${message}`);
+    this.name = "ResumeRuntimeError";
+  }
 }
 
 export interface RunResult {
@@ -533,20 +646,150 @@ function resolveConfiguredSessionDir(sessionDir: string | undefined, cwd: string
   return resolve(cwd, sessionDir);
 }
 
-export async function runAgent(
+function createChildSessionMode(
   ctx: ExtensionContext,
   type: SubagentType,
-  prompt: string,
   options: RunOptions,
-): Promise<RunResult> {
-  const config = getConfig(type);
-  const agentConfig = getAgentConfig(type);
+  agentConfig = getAgentConfig(type),
+): ChildSessionMode {
+  const executionCwd = options.cwd ?? ctx.cwd;
+  const resourceCwd = options.configCwd ?? executionCwd;
+  const persistence = agentConfig?.persistSession === true
+    ? "explicit"
+    : agentConfig?.persistSession === false
+      ? "memory"
+      : "private";
+  return {
+    kind: "create",
+    artifactRootCwd: canonicalArtifactRootCwd(options.artifactRootCwd ?? ctx.cwd),
+    resourceCwd,
+    originalExecutionCwd: options.originalExecutionCwd ?? executionCwd,
+    executionCwd,
+    persistence,
+    ...(agentConfig?.sessionDir !== undefined ? { sessionDir: agentConfig.sessionDir } : {}),
+  };
+}
 
-  // Resolve working directory: worktree override > parent cwd
-  const effectiveCwd = options.cwd ?? ctx.cwd;
-  // Filesystem work happens in effectiveCwd; config discovery in configCwd.
-  // They differ only for SpawnOptions.cwd spawns (config stays with the parent).
-  const configCwd = options.configCwd ?? effectiveCwd;
+function runtimeIdentityFor(options: RunOptions): AgentRecoveryRuntimeIdentity {
+  const depth = options.runtimeIdentity?.depth ?? options.nestedRuntime?.depth ?? 1;
+  return {
+    depth,
+    maxSubagentDepth: options.runtimeIdentity?.maxSubagentDepth
+      ?? options.nestedRuntime?.maxSubagentDepth
+      ?? depth,
+    ...(options.runtimeIdentity?.rootSessionId ?? options.rootSessionId ?? options.nestedRuntime?.rootSessionId
+      ? { rootSessionId: options.runtimeIdentity?.rootSessionId ?? options.rootSessionId ?? options.nestedRuntime?.rootSessionId }
+      : {}),
+  };
+}
+
+function ownershipFor(options: RunOptions): AgentOwnership {
+  if (options.ownership) return options.ownership;
+  if (options.nestedRuntime) {
+    return { kind: "nested", parentAgentId: options.nestedRuntime.parentAgentId, depth: options.nestedRuntime.depth };
+  }
+  return { kind: "top-level" };
+}
+
+function privateCreationMetadata(
+  mode: ChildSessionMode,
+  sessionManager: SessionManager,
+  model: Model<any> | undefined,
+  thinkingLevel: ThinkingLevel,
+  options: RunOptions,
+): AgentSessionMetadata | undefined {
+  if (mode.kind !== "create" || mode.persistence !== "private") return undefined;
+  const file = typeof sessionManager.getSessionFile === "function"
+    ? sessionManager.getSessionFile()
+    : undefined;
+  if (!file || typeof sessionManager.getSessionId !== "function") return undefined;
+  try {
+    const locator = privateSessionLocator(mode.artifactRootCwd, file);
+    const preflight = preflightPrivateSession(mode.artifactRootCwd, locator, sessionManager.getSessionId());
+    if (preflight.header.parentSession !== undefined) {
+      throw new ResumeRuntimeError("resume-session-incompatible", "private session unexpectedly has a parentSession");
+    }
+    if (!model) return undefined;
+    return {
+      sessionState: {
+        kind: "private",
+        locator,
+        sessionId: sessionManager.getSessionId(),
+        artifactRootCwd: mode.artifactRootCwd,
+        resourceCwd: mode.resourceCwd,
+        originalExecutionCwd: mode.originalExecutionCwd,
+        provider: model.provider,
+        modelId: model.id,
+        thinking: thinkingLevel,
+      },
+      runtimeIdentity: runtimeIdentityFor(options),
+      ownership: ownershipFor(options),
+      artifactRootCwd: mode.artifactRootCwd,
+      resourceCwd: mode.resourceCwd,
+      originalExecutionCwd: mode.originalExecutionCwd,
+    };
+  } catch (error) {
+    // SessionManager creates the filename before the first conversation, but
+    // writes the JSONL only when the first user/assistant message is persisted.
+    // Keep the metadata pending until runAgent's first prompt has flushed it.
+    if (error instanceof ResumeStorageError && error.code === "resume-session-missing") return undefined;
+    throw error;
+  }
+}
+
+function nonPrivateMetadata(
+  mode: ChildSessionMode,
+  options: RunOptions,
+): AgentSessionMetadata | undefined {
+  if (mode.kind !== "create" || mode.persistence === "private") return undefined;
+  return {
+    sessionState: {
+      kind: mode.persistence,
+      artifactRootCwd: mode.artifactRootCwd,
+      resourceCwd: mode.resourceCwd,
+      originalExecutionCwd: mode.originalExecutionCwd,
+    },
+    runtimeIdentity: runtimeIdentityFor(options),
+    ownership: ownershipFor(options),
+    artifactRootCwd: mode.artifactRootCwd,
+    resourceCwd: mode.resourceCwd,
+    originalExecutionCwd: mode.originalExecutionCwd,
+  };
+}
+
+function resolveStoredModel(
+  ctx: ExtensionContext,
+  type: SubagentType,
+  state: Extract<AgentRecoverySessionState, { kind: "private" }>,
+): Model<any> {
+  const agentConfig = getAgentConfig(type);
+  if (!agentConfig || agentConfig.enabled === false) {
+    throw new ResumeRuntimeError("resume-session-incompatible", `agent type is no longer configured: ${type}`);
+  }
+  const model = ctx.modelRegistry.find(state.provider, state.modelId);
+  if (!model || model.provider !== state.provider || model.id !== state.modelId) {
+    throw new ResumeRuntimeError("resume-model-unavailable", `stored model is unavailable: ${state.provider}/${state.modelId}`);
+  }
+  if (typeof ctx.modelRegistry.hasConfiguredAuth !== "function"
+    || !ctx.modelRegistry.hasConfiguredAuth(model)) {
+    throw new ResumeRuntimeError("resume-model-unavailable", `stored model has no configured auth: ${state.provider}/${state.modelId}`);
+  }
+  return model;
+}
+
+async function prepareChildSessionInternal(
+  ctx: ExtensionContext,
+  type: SubagentType,
+  options: RunOptions,
+): Promise<PreparedChildSession> {
+  const mode = options.sessionMode ?? createChildSessionMode(ctx, type, options);
+  const config = options.configOverride ?? getConfig(type);
+  const agentConfig = options.agentConfigOverride ?? getAgentConfig(type);
+  if (mode.kind === "open" && (!agentConfig || agentConfig.enabled === false)) {
+    throw new ResumeRuntimeError("resume-session-incompatible", `agent type is no longer configured: ${type}`);
+  }
+  const effectiveCwd = mode.executionCwd;
+  const configCwd = mode.resourceCwd;
 
   const env = await detectEnv(options.pi, effectiveCwd);
 
@@ -780,13 +1023,23 @@ export async function runAgent(
     }
   }
 
-  // Resolve model: explicit option > config.model > parent model
-  const model = options.model ?? resolveDefaultModel(
-    ctx.model, ctx.modelRegistry, agentConfig?.model,
-  );
-
-  // Resolve thinking level: explicit option > agent config > undefined (inherit)
-  const thinkingLevel = options.thinkingLevel ?? agentConfig?.thinking;
+  // Live creation keeps the existing precedence. Rehydrate resolves only the
+  // exact stored provider/model pair and never falls back to the parent model.
+  const storedPrivateSession = mode.kind === "open"
+    ? options.storedPrivateSession
+    : undefined;
+  if (mode.kind === "open" && !storedPrivateSession) {
+    throw new ResumeRuntimeError("resume-session-incompatible", "private session identity is missing");
+  }
+  const model = mode.kind === "open"
+    ? resolveStoredModel(ctx, type, storedPrivateSession!)
+    : options.model ?? resolveDefaultModel(ctx.model, ctx.modelRegistry, agentConfig?.model);
+  const thinkingLevel = mode.kind === "open"
+    ? storedPrivateSession!.thinking
+    : options.thinkingLevel ?? agentConfig?.thinking;
+  if (!model && mode.kind === "open") {
+    throw new ResumeRuntimeError("resume-model-unavailable", `no model is available for agent type ${type}`);
+  }
 
   // Nested tools are built for this session and injected directly. Nested child
   // sessions deliberately do not bind the pi-subagents extension again: doing
@@ -807,6 +1060,7 @@ export async function runAgent(
         maxSubagentDepth: effectiveMaxDepth,
         allowedSubagents: agentConfig.allowedSubagents,
         configCwd,
+        createResumeRuntime: (resumeCtx, deps) => createAgentResumeRuntime(options.pi, resumeCtx, deps),
       })
     : [];
   const nestedToolNames = new Set(nestedTools.map(tool => tool.name));
@@ -865,11 +1119,37 @@ export async function runAgent(
   }
 
   const settingsManager = SettingsManager.create(configCwd, agentDir);
-  const configuredSessionDir = resolveConfiguredSessionDir(agentConfig?.sessionDir, effectiveCwd);
+  const configuredSessionDir = resolveConfiguredSessionDir(
+    mode.kind === "create" ? mode.sessionDir : undefined,
+    effectiveCwd,
+  );
   const defaultSessionDir = process.env.PI_CODING_AGENT_SESSION_DIR ?? settingsManager.getSessionDir?.();
-  const sessionManager = agentConfig?.persistSession
-    ? SessionManager.create(effectiveCwd, configuredSessionDir ?? defaultSessionDir)
-    : SessionManager.inMemory(effectiveCwd);
+  let sessionManager: SessionManager;
+  if (mode.kind === "open") {
+    const locator = privateSessionLocator(mode.artifactRootCwd, mode.file);
+    const preflight = preflightPrivateSession(mode.artifactRootCwd, locator, mode.sessionId);
+    if (preflight.header.parentSession !== undefined) {
+      throw new ResumeRuntimeError("resume-session-incompatible", "private session unexpectedly has a parentSession");
+    }
+    sessionManager = SessionManager.open(preflight.file, mode.privateDir, mode.executionCwd);
+    const projection = sessionManager.buildSessionProjection();
+    if (!projection.model
+      || projection.model.provider !== storedPrivateSession!.provider
+      || projection.model.modelId !== storedPrivateSession!.modelId) {
+      throw new ResumeRuntimeError("resume-session-incompatible", "native session model does not match its checkpoint");
+    }
+    if (projection.thinkingLevel !== storedPrivateSession!.thinking) {
+      throw new ResumeRuntimeError("resume-session-incompatible", "native session thinking level does not match its checkpoint");
+    }
+  } else if (mode.persistence === "private") {
+    const privateDir = mode.privateDir ?? ensurePrivateSessionDirectory(mode.artifactRootCwd);
+    mode.privateDir = privateDir;
+    sessionManager = SessionManager.create(effectiveCwd, privateDir);
+  } else if (mode.persistence === "explicit") {
+    sessionManager = SessionManager.create(effectiveCwd, configuredSessionDir ?? defaultSessionDir);
+  } else {
+    sessionManager = SessionManager.inMemory(effectiveCwd);
+  }
   // Keep write tracking session-local. The custom definition shadows only this
   // child session's built-in write entry; the parent registry is untouched.
   const trackedWriteTool = toolNames.includes("write")
@@ -895,9 +1175,9 @@ export async function runAgent(
     tools: sessionTools,
     resourceLoader: loader,
     // Child subagent sessions run inside the parent Pi process; they are not a
-    // fresh interactive app startup. Mark their extension lifecycle as a fork so
-    // startup-only UI/theme extensions do not clear or rewrite the parent TUI.
-    sessionStartEvent: { type: "session_start", reason: "fork" },
+    // fresh interactive app startup. Opened private sessions use the resume
+    // lifecycle reason so extensions can distinguish rehydration from a fork.
+    sessionStartEvent: { type: "session_start", reason: mode.kind === "open" ? "resume" : "fork" },
     ...(customTools.length > 0 && { customTools }),
   };
   if (sessionExcludeTools) {
@@ -907,10 +1187,11 @@ export async function runAgent(
     sessionOpts.thinkingLevel = thinkingLevel;
   }
 
-  const { session } = await runInChildSessionContext(() => createAgentSession(sessionOpts));
+  let session: AgentSession | undefined;
+  try {
+    ({ session } = await runInChildSessionContext(() => createAgentSession(sessionOpts)));
 
-
-  const baseSessionName = agentConfig?.name ?? type;
+    const baseSessionName = agentConfig?.name ?? type;
   session.setSessionName(
     options.agentId ? `${baseSessionName}#${options.agentId.slice(0, 8)}` : baseSessionName,
   );
@@ -948,80 +1229,228 @@ export async function runAgent(
     });
   }
 
-  options.onSessionCreated?.(session);
+  } catch (error) {
+    try { session?.dispose(); } catch { /* adapter cleanup is best effort */ }
+    throw error;
+  }
 
-  // Track turns for graceful max_turns enforcement
+  if (!session) throw new Error("createAgentSession returned no session");
+  try {
+    const sessionFile = (mode.kind === "open" || mode.persistence === "private")
+      && typeof sessionManager.getSessionFile === "function"
+      ? sessionManager.getSessionFile()
+      : undefined;
+    const effectiveModel = model ?? session.model;
+    const effectiveThinking = (session.thinkingLevel ?? thinkingLevel ?? "off") as ThinkingLevel;
+    const metadata = mode.kind === "open"
+      ? {
+          sessionState: storedPrivateSession!,
+          runtimeIdentity: runtimeIdentityFor(options),
+          ownership: ownershipFor(options),
+          artifactRootCwd: mode.artifactRootCwd,
+          resourceCwd: mode.resourceCwd,
+          originalExecutionCwd: mode.originalExecutionCwd,
+        }
+      : nonPrivateMetadata(mode, options) ?? privateCreationMetadata(mode, sessionManager, effectiveModel, effectiveThinking, options);
+    const finalizeMetadata = mode.kind === "create" && mode.persistence === "private"
+      ? () => privateCreationMetadata(mode, sessionManager, effectiveModel, effectiveThinking, options)
+      : undefined;
+
+    return {
+      session,
+      sessionFile,
+      executionCwd: mode.executionCwd,
+      resourceCwd: mode.resourceCwd,
+      model: effectiveModel as Model<any>,
+      thinkingLevel: effectiveThinking,
+      metadata,
+      finalizeMetadata,
+      historyStartIndex: session.messages.length,
+    };
+  } catch (error) {
+    try { session.dispose(); } catch { /* adapter cleanup is best effort */ }
+    throw error;
+  }
+}
+
+export async function prepareChildSession(
+  ctx: ExtensionContext,
+  type: SubagentType,
+  options: RunOptions,
+  mode: ChildSessionMode,
+): Promise<PreparedChildSession> {
+  return prepareChildSessionInternal(ctx, type, {
+    ...options,
+    sessionMode: mode,
+    onSessionCreated: undefined,
+    onSessionMetadata: undefined,
+  });
+}
+
+export function createAgentResumeRuntime(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  deps: AgentResumeRuntimeDependencies,
+): AgentResumeRuntime {
+  return {
+    async rehydrate(record, executionCwd, signal) {
+      const state = record.sessionState;
+      if (!state || state.kind !== "private") {
+        throw new ResumeRuntimeError("resume-session-incompatible", "record does not contain private session state");
+      }
+      const artifactRootCwd = record.artifactRootCwd ?? state.artifactRootCwd;
+      const resourceCwd = record.resourceCwd ?? state.resourceCwd;
+      const originalExecutionCwd = record.originalExecutionCwd ?? state.originalExecutionCwd;
+      const resolved = resolvePrivateSessionLocator(artifactRootCwd, state.locator);
+      const identity = record.runtimeIdentity ?? deps.childIdentity;
+      const nestedRuntime = {
+        manager: deps.nestedManager,
+        parentAgentId: record.id,
+        depth: identity.depth,
+        maxSubagentDepth: identity.maxSubagentDepth,
+        rootSessionId: identity.rootSessionId ?? deps.childIdentity.rootSessionId,
+      };
+      return prepareChildSession(ctx, record.type, {
+        pi,
+        agentId: record.id,
+        cwd: executionCwd,
+        configCwd: resourceCwd,
+        artifactRootCwd,
+        originalExecutionCwd,
+        signal,
+        thinkingLevel: state.thinking,
+        storedPrivateSession: state,
+        isolated: record.invocation?.isolated,
+        inheritContext: record.invocation?.inheritContext,
+        nestedRuntime,
+        nestedSession: record.ownership?.kind === "nested",
+        runtimeIdentity: identity,
+        ownership: record.ownership,
+        rootSessionId: identity.rootSessionId,
+      }, {
+        kind: "open",
+        artifactRootCwd,
+        resourceCwd,
+        originalExecutionCwd,
+        executionCwd,
+        persistence: "private",
+        privateDir: privateSessionDirectory(artifactRootCwd),
+        file: resolved.file,
+        sessionId: state.sessionId,
+      });
+    },
+  };
+}
+
+export async function runAgent(
+  ctx: ExtensionContext,
+  type: SubagentType,
+  prompt: string,
+  options: RunOptions,
+): Promise<RunResult> {
+  const config = getConfig(type);
+  const agentConfig = getAgentConfig(type);
+  const mode = createChildSessionMode(ctx, type, options, agentConfig);
+  const prepared = await prepareChildSession(ctx, type, {
+    ...options,
+    configOverride: config,
+    agentConfigOverride: agentConfig,
+  }, mode);
+  let metadataNotified = false;
+  try {
+    if (prepared.metadata) {
+      options.onSessionMetadata?.(prepared.metadata);
+      metadataNotified = true;
+    }
+    options.onSessionCreated?.(prepared.session);
+  } catch (error) {
+    try { prepared.session.dispose(); } catch { /* adapter cleanup is best effort */ }
+    throw error;
+  }
+
   let turnCount = 0;
   const maxTurns = normalizeMaxTurns(options.maxTurns ?? agentConfig?.maxTurns ?? defaultMaxTurns);
   let softLimitReached = false;
   let aborted = false;
-
   let currentMessageText = "";
-  const unsubTurns = session.subscribe((event: AgentSessionEvent) => {
+  const unsubTurns = prepared.session.subscribe((event: AgentSessionEvent) => {
     if (event.type === "turn_end") {
       turnCount++;
       options.onTurnEnd?.(turnCount);
       if (maxTurns != null) {
         if (!softLimitReached && turnCount >= maxTurns) {
           softLimitReached = true;
-          session.steer("You have reached your turn limit. Wrap up immediately — provide your final answer now.");
+          prepared.session.steer("You have reached your turn limit. Wrap up immediately — provide your final answer now.");
         } else if (softLimitReached && turnCount >= maxTurns + graceTurns) {
           aborted = true;
-          session.abort();
+          prepared.session.abort();
         }
       }
     }
-    if (event.type === "message_start") {
-      currentMessageText = "";
-    }
+    if (event.type === "message_start") currentMessageText = "";
     if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
       currentMessageText += event.assistantMessageEvent.delta;
       options.onTextDelta?.(event.assistantMessageEvent.delta, currentMessageText);
     }
-    if (event.type === "tool_execution_start") {
-      options.onToolActivity?.({ type: "start", toolName: event.toolName });
-    }
-    if (event.type === "tool_execution_end") {
-      options.onToolActivity?.({ type: "end", toolName: event.toolName });
-    }
+    if (event.type === "tool_execution_start") options.onToolActivity?.({ type: "start", toolName: event.toolName });
+    if (event.type === "tool_execution_end") options.onToolActivity?.({ type: "end", toolName: event.toolName });
     if (event.type === "message_end" && event.message.role === "assistant") {
       const u = (event.message as any).usage;
-      if (u) options.onAssistantUsage?.({
-        input: u.input ?? 0,
-        output: u.output ?? 0,
-        cacheWrite: u.cacheWrite ?? 0,
-      });
+      if (u) options.onAssistantUsage?.({ input: u.input ?? 0, output: u.output ?? 0, cacheWrite: u.cacheWrite ?? 0 });
     }
     if (event.type === "compaction_end" && !event.aborted && event.result) {
       options.onCompaction?.({ reason: event.reason, tokensBefore: event.result.tokensBefore });
     }
   });
 
-  const collector = collectResponseText(session);
-  const cleanupAbort = forwardAbortSignal(session, options.signal);
-
-  // Build the effective prompt: optionally prepend parent context
+  const collector = collectResponseText(prepared.session);
+  const cleanupAbort = forwardAbortSignal(prepared.session, options.signal);
   let effectivePrompt = prompt;
   if (options.inheritContext) {
     const parentContext = buildParentContext(ctx);
-    if (parentContext) {
-      effectivePrompt = parentContext + prompt;
-    }
+    if (parentContext) effectivePrompt = parentContext + prompt;
+  }
+  const startLen = prepared.historyStartIndex;
+  let promptFailed = false;
+  let promptError: unknown;
+  try {
+    await prepared.session.prompt(effectivePrompt);
+  } catch (error) {
+    promptFailed = true;
+    promptError = error;
   }
 
-  // Boundary for the history fallback: only assistant text produced from here
-  // on counts as this run's output (a fresh session, so usually 0).
-  const startLen = session.messages.length;
+  let finalizationFailed = false;
+  let finalizationError: unknown;
   try {
-    await session.prompt(effectivePrompt);
+    const finalized = prepared.finalizeMetadata?.();
+    if (finalized && !metadataNotified) {
+      options.onSessionMetadata?.(finalized);
+      metadataNotified = true;
+    }
+  } catch (error) {
+    finalizationFailed = true;
+    finalizationError = error;
   } finally {
     unsubTurns();
     collector.unsubscribe();
     cleanupAbort();
   }
 
-  const responseText = collector.getText().trim() || getLastAssistantText(session, startLen);
-  return { responseText, session, aborted, steered: softLimitReached, failure: finalTurnError(session, startLen) };
+  if (promptFailed || finalizationFailed) {
+    try { prepared.session.dispose(); } catch { /* adapter cleanup is best effort */ }
+    if (promptFailed) throw promptError;
+    throw finalizationError;
+  }
+
+  const responseText = collector.getText().trim() || getLastAssistantText(prepared.session, startLen);
+  return {
+    responseText,
+    session: prepared.session,
+    aborted,
+    steered: softLimitReached,
+    failure: finalTurnError(prepared.session, startLen),
+  };
 }
 
 /**
@@ -1031,6 +1460,8 @@ export async function resumeAgent(
   session: AgentSession,
   prompt: string,
   options: {
+    /** Cursor captured once before the new turn and shared with transcript wiring. */
+    historyStartIndex?: number;
     onToolActivity?: (activity: ToolActivity) => void;
     onAssistantUsage?: (usage: { input: number; output: number; cacheWrite: number }) => void;
     onCompaction?: (info: { reason: "manual" | "threshold" | "overflow"; tokensBefore: number }) => void;
@@ -1040,7 +1471,7 @@ export async function resumeAgent(
   // Boundary for the history fallback: the session already holds prior turns,
   // so only assistant text produced by THIS resume prompt counts as its output
   // — a failed resume must not surface the previous turn's answer (#144).
-  const startLen = session.messages.length;
+  const startLen = options.historyStartIndex ?? session.messages.length;
   const collector = collectResponseText(session);
   const cleanupAbort = forwardAbortSignal(session, options.signal);
 

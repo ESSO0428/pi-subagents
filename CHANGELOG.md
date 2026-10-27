@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-10-27
+
+### Added
+- **Durable executable private-agent resume**: automatic top-level private agents persist a v2 checkpoint plus a package-owned native session under `.pi-subagents/agent-sessions/`, so the original Agent ID can resume after `/reload`, process restart, or provider interruption. Legacy v1 history remains display-only, and workflow/nested ownership remains non-resumable.
+- **Completed workflow display history**: terminal workflows now persist bounded, project-scoped display snapshots and reappear after reload as immutable history roots with their phases, summaries, logs, and tree structure. Restored history never rebinds a workflow or exposes workflow controls.
+
+### Changed
+- **Restored records now preserve real session scope**: the current Agents tree admits only agents from the active Pi session and v2 records whose persisted root session ID matches it. Older, foreign-session, and identity-unknown records remain available through all-session/project history instead of being stamped into a new session.
+- **Workflow roster navigation is more compact**: the sidebar advertises `←→ workflow fold`, folds workflow roots only, and no longer renders per-row disclosure triangles.
+
+### Fixed
+- **Reload reconstruction preserves workflow child nesting and artifact boundaries**: workflow-owned agents recover their workflow parent ID, restored workflow history is filtered by canonical artifact root and session provenance, and delayed completion after a project switch cannot leak another project's workflow into the current roster.
+
 ## [0.18.0] - 2026-10-21
 
 > **Breaking: direct `Agent` calls now block by default.** Use `run_in_background: true` for explicit detached execution. Scheduled agents, cross-extension RPC spawns, and `TaskExecute` remain detached.

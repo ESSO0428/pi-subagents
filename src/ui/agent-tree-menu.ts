@@ -33,6 +33,7 @@ export interface AgentTreeMenuSource {
   agents: readonly AgentRecord[];
   workflowRoots: readonly WorkflowTreeRoot[];
   sessionId?: string;
+  artifactRootCwd?: string;
   resolveViewMode(record: AgentRecord): AgentViewMode | undefined;
 }
 
@@ -64,8 +65,9 @@ function projectionFor(
     agents: source.agents,
     workflowRoots: source.workflowRoots,
     sessionId: source.sessionId,
+    artifactRootCwd: source.artifactRootCwd,
     collapsedKeys,
-    canOpenTerminalAgent: record => source.resolveViewMode(record) === "history",
+    canOpenTerminalAgent: record => source.resolveViewMode(record) !== undefined,
   });
 }
 
@@ -169,7 +171,8 @@ export class AgentTreeMenu implements Component {
         lines.push(truncateToWidth(
           `${prefix}${marker} ${disclosure} ${statusIcon(root.status)} ${bold("workflow")}  `
           + `${root.description || root.name} · ${root.status} · ${progress} · `
-          + `${formatTokens(root.tokens)} · ${elapsed}`,
+          + `${formatTokens(root.tokens)} · ${elapsed}`
+          + (root.restoredHistory ? " · restored history (child conversations unavailable)" : ""),
           width,
         ));
       } else {

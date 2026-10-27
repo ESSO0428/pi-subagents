@@ -71,7 +71,7 @@ export type Theme = {
   bold(text: string): string;
 };
 
-export type AgentWidgetOpenMode = "live" | "history";
+export type AgentWidgetOpenMode = "live" | "history" | "unavailable";
 export type AgentWidgetOpenCallback = (record: AgentRecord, mode: AgentWidgetOpenMode) => void | Promise<void>;
 export type AgentWidgetOptions = {
   canOpenHistory: (record: AgentRecord) => boolean;
@@ -83,6 +83,8 @@ export type AgentWidgetOptions = {
    * Nested children carry their parent's session id, so trees stay intact.
    */
   getSessionId?: () => string | undefined;
+  /** Current artifact root. Records from another project stay out of every widget surface. */
+  getArtifactRootCwd?: () => string | undefined;
   /** Workflow grouping roots for the current session; never conversations. */
   getWorkflowRoots?: () => WorkflowTreeRoot[];
   /** Open a root's inspector. Separate from `onOpen`, which opens a transcript. */
@@ -373,6 +375,7 @@ export class AgentWidget {
       agents: this.manager.listAgents(),
       workflowRoots: this.options.getWorkflowRoots?.() ?? [],
       sessionId: this.currentSessionId(),
+      artifactRootCwd: this.options.getArtifactRootCwd?.(),
       mode: this.mode(),
       collapsedKeys,
       canOpenTerminalAgent: this.options.canOpenHistory,
@@ -549,9 +552,12 @@ export class AgentWidget {
     return true;
   }
 
-  /** Collapse, expand, or move to a parent while tree navigation is active. */
+  /** Collapse or expand a selected workflow root while tree navigation is active. */
   private moveHorizontal(direction: "left" | "right"): void {
     const projection = this.treeProjection();
+    const selected = projection.rows.find(row => row.key === this.selectedNodeKey);
+    if (selected?.node.kind !== "workflow") return;
+
     const navigation = navigateAgentTree(
       projection,
       this.selectedNodeKey,
@@ -573,7 +579,9 @@ export class AgentWidget {
       return;
     }
     const record = row.node.record;
-    const mode: AgentWidgetOpenMode = record.status === "running" || record.status === "queued" ? "live" : "history";
+    const mode: AgentWidgetOpenMode = record.status === "running" || record.status === "queued"
+      ? "live"
+      : this.options.canOpenHistory(record) ? "history" : "unavailable";
     void this.options.onOpen(record, mode);
   }
 
@@ -702,9 +710,6 @@ export class AgentWidget {
     for (const row of projection.rows) {
       const note = orphanNote(row);
       const marker = row.key === selectedKey ? theme.fg("accent", "●") : theme.fg("dim", "○");
-      const disclosure = row.hasChildren
-        ? theme.fg("dim", row.expanded ? "▾" : "▸")
-        : " ";
       const prefix = theme.fg("dim", rowPrefix(row));
 
       if (row.node.kind === "workflow") {
@@ -728,10 +733,11 @@ export class AgentWidget {
           depth: row.depth,
           lines: [truncate(
             prefix
-            + `${marker} ${disclosure} ${icon} ${theme.bold("workflow")}  `
+            + `${marker} ${icon} ${theme.bold("workflow")}  `
             + `${theme.fg("muted", truncateLine(root.description || root.name))} ${theme.fg("dim", "·")} `
             + `${theme.fg(statusColor, root.status)} ${theme.fg("dim", "·")} `
-            + `${theme.fg("dim", `${progress} · ${formatTokens(root.tokens)} · ${elapsed}`)}`,
+            + `${theme.fg("dim", `${progress} · ${formatTokens(root.tokens)} · ${elapsed}`)}`
+            + (root.restoredHistory ? theme.fg("dim", " · restored history (child conversations unavailable)") : ""),
           )],
         });
         continue;
@@ -763,7 +769,7 @@ export class AgentWidget {
           row,
           depth: row.depth,
           lines: [
-            truncate(prefix + `${marker} ${disclosure} ${theme.fg("accent", frame)} ${theme.bold(name)}${modeTag}  ${theme.fg("muted", truncateLine(a.description))} ${theme.fg("dim", "·")} ${fgPreservingNestedStyles(theme, "dim", statsText)}${note}`),
+            truncate(prefix + `${marker} ${theme.fg("accent", frame)} ${theme.bold(name)}${modeTag}  ${theme.fg("muted", truncateLine(a.description))} ${theme.fg("dim", "·")} ${fgPreservingNestedStyles(theme, "dim", statsText)}${note}`),
             truncate(theme.fg("dim", detailPrefix(row)) + theme.fg("dim", `⎿  ${activity}`)),
           ],
         });
@@ -771,13 +777,13 @@ export class AgentWidget {
         renderedRows.push({
           row,
           depth: row.depth,
-          lines: [truncate(prefix + `${marker} ${disclosure} ${theme.fg("muted", "◦")} ${theme.fg("dim", `${rowTypeName(a.type)}  ${truncateLine(a.description)} · queued`)}${note}`)],
+          lines: [truncate(prefix + `${marker} ${theme.fg("muted", "◦")} ${theme.fg("dim", `${rowTypeName(a.type)}  ${truncateLine(a.description)} · queued`)}${note}`)],
         });
       } else {
         renderedRows.push({
           row,
           depth: row.depth,
-          lines: [truncate(prefix + `${marker} ${disclosure} ` + this.renderFinishedLine(a, theme) + note)],
+          lines: [truncate(prefix + `${marker} ` + this.renderFinishedLine(a, theme) + note)],
         });
       }
     }
@@ -788,7 +794,7 @@ export class AgentWidget {
     const rows = renderedRows;
     const totalBody = rows.reduce((total, row) => total + row.lines.length, 0);
 
-    const heading = "Agents  ↑↓ select · ←→ fold · enter view · esc back";
+    const heading = "Agents  ↑↓ select · ←→ workflow fold · enter view · esc back";
     const lines: string[] = [truncate(theme.fg(headingColor, headingIcon) + " " + theme.fg(headingColor, heading))];
 
     if (maxLines === 1) {

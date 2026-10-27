@@ -153,6 +153,9 @@ export interface WorkflowCardTask {
   startTime: number;
   endTime?: number;
   totalPausedMs?: number;
+  resultPreview?: string;
+  errorPreview?: string;
+  restoredHistory?: boolean;
 }
 
 export interface WorkflowCardInput {
@@ -328,6 +331,14 @@ export function layoutWorkflowCard(input: WorkflowCardInput): WorkflowCardLine[]
   lines.push([...clampedLeft, { text: " ".repeat(gap) }, { text: head.stats, color: "dim" }]);
 
   if (head.subtext) lines.push(clampLine([{ text: `  ${head.subtext}`, color: "dim" }], width));
+  if (input.task.restoredHistory) {
+    lines.push(clampLine([{ text: "  Restored workflow history · child conversations unavailable.", color: "warning" }], width));
+  }
+  if (input.task.errorPreview !== undefined) {
+    lines.push(clampLine([{ text: `  Error: ${input.task.errorPreview}`, color: "error" }], width));
+  } else if (input.task.resultPreview !== undefined) {
+    lines.push(clampLine([{ text: `  Result: ${input.task.resultPreview}`, color: "dim" }], width));
+  }
 
   // ---- Phase tree ----
   // Stats line up in one column across the whole card, not per group, so the

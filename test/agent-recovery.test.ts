@@ -4,8 +4,11 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { agentHistoryLocator, createAgentHistoryPath, readAgentHistoryResult } from "../src/agent-history.js";
 import { AgentManager } from "../src/agent-manager.js";
+import type { AgentRecoveryCheckpointV2 } from "../src/agent-recovery.js";
 import {
   agentRecoveryCheckpointPath,
+  isAgentRecoveryCheckpoint,
+  isAgentRecoveryCheckpointV2,
   readAgentRecoveryCheckpoints,
   writeAgentRecoveryCheckpoint,
 } from "../src/agent-recovery.js";
@@ -57,6 +60,149 @@ afterEach(() => {
   for (const directory of tempDirectories.splice(0)) rmSync(directory, { recursive: true, force: true });
 });
 
+describe("checkpoint v2 validation", () => {
+  const baseV2 = (session: AgentRecoveryCheckpointV2["session"]): AgentRecoveryCheckpointV2 => ({
+    version: 2,
+    id: "agent-v2",
+    type: "Explore",
+    description: "v2 checkpoint",
+    status: "completed",
+    startedAt: 1,
+    completedAt: 2,
+    resultConsumed: false,
+    toolCallId: "call-1",
+    toolUses: 1,
+    lifetimeUsage: { input: 2, output: 3, cacheWrite: 4 },
+    compactionCount: 1,
+    invocation: {
+      effectiveModelName: "gpt-test",
+      effectiveThinking: "high",
+      runInBackground: true,
+    },
+    runtime: { depth: 2, maxSubagentDepth: 4, rootSessionId: "root-session" },
+    session,
+    ownership: { kind: "nested", parentAgentId: "parent-agent", depth: 2 },
+    worktree: {
+      repoRoot: "/project",
+      baseCommitSha: "0123456789abcdef0123456789abcdef01234567",
+      savedCommitSha: "fedcba9876543210fedcba9876543210fedcba98",
+      originalTargetSubdirectory: "packages/api",
+    },
+  });
+
+  it("keeps v1 as a strict display-only checkpoint and accepts valid v2 state", () => {
+    const v1 = {
+      version: 1 as const,
+      id: "legacy",
+      type: "Explore",
+      description: "legacy checkpoint",
+      status: "stopped" as const,
+      startedAt: 1,
+      completedAt: 2,
+      toolUses: 0,
+      lifetimeUsage: { input: 0, output: 0, cacheWrite: 0 },
+      compactionCount: 0,
+      transcriptPath: ".pi-subagents/agent-transcripts/legacy.jsonl",
+    };
+    const v2 = baseV2({
+      kind: "private",
+      locator: ".pi-subagents/agent-sessions/session-1.jsonl",
+      sessionId: "session-1",
+      artifactRootCwd: "/project",
+      resourceCwd: "/project",
+      originalExecutionCwd: "/project/packages/api",
+      provider: "openai",
+      modelId: "gpt-test",
+      thinking: "high",
+    });
+
+    expect(isAgentRecoveryCheckpoint(v1)).toBe(true);
+    expect(isAgentRecoveryCheckpointV2(v1)).toBe(false);
+    expect(isAgentRecoveryCheckpoint(v2)).toBe(true);
+    expect(isAgentRecoveryCheckpointV2(v2)).toBe(true);
+  });
+
+  it.each([
+    { kind: "pending" },
+    {
+      kind: "memory",
+      artifactRootCwd: "/project",
+      resourceCwd: "/project",
+      originalExecutionCwd: "/project",
+    },
+    {
+      kind: "explicit",
+      artifactRootCwd: "/project",
+      resourceCwd: "/project",
+      originalExecutionCwd: "/project",
+    },
+  ] as const)("accepts non-executable session state %j without guessed private metadata", (session) => {
+    expect(isAgentRecoveryCheckpointV2(baseV2(session))).toBe(true);
+  });
+
+  it.each([
+    ["future version", { ...baseV2({ kind: "pending" }), version: 3 }],
+    ["missing runtime identity", (() => {
+      const checkpoint = baseV2({ kind: "pending" });
+      const { runtime: _runtime, ...withoutRuntime } = checkpoint;
+      return withoutRuntime;
+    })()],
+    ["private missing exact model", (() => {
+      const checkpoint = baseV2({
+        kind: "private",
+        locator: ".pi-subagents/agent-sessions/session-1.jsonl",
+        sessionId: "session-1",
+        artifactRootCwd: "/project",
+        resourceCwd: "/project",
+        originalExecutionCwd: "/project",
+        provider: "openai",
+        modelId: "gpt-test",
+        thinking: "high",
+      });
+      const session = { ...checkpoint.session };
+      delete (session as { modelId?: string }).modelId;
+      return { ...checkpoint, session };
+    })()],
+  ] as const)("rejects %s as non-executable", (_label, value) => {
+    expect(isAgentRecoveryCheckpoint(value)).toBe(false);
+    expect(isAgentRecoveryCheckpointV2(value)).toBe(false);
+  });
+
+  it("round-trips v2 runtime identity and private state atomically", () => {
+    const cwd = makeProject();
+    const checkpoint = baseV2({
+      kind: "private",
+      locator: ".pi-subagents/agent-sessions/session-1.jsonl",
+      sessionId: "session-1",
+      artifactRootCwd: cwd,
+      resourceCwd: cwd,
+      originalExecutionCwd: cwd,
+      provider: "openai",
+      modelId: "gpt-test",
+      thinking: "high",
+    });
+
+    expect(writeAgentRecoveryCheckpoint(cwd, checkpoint)).toBe(true);
+    expect(readAgentRecoveryCheckpoints(cwd)).toEqual([checkpoint]);
+    expect(readAgentRecoveryCheckpoints(cwd)[0]?.runtime).toEqual({
+      depth: 2,
+      maxSubagentDepth: 4,
+      rootSessionId: "root-session",
+    });
+    expect(readAgentRecoveryCheckpoints(cwd)[0]?.invocation).toEqual(checkpoint.invocation);
+  });
+
+  it("fails closed for malformed and future checkpoints", () => {
+    const cwd = makeProject();
+    const directory = join(cwd, ".pi-subagents", "agent-checkpoints");
+    mkdirSync(directory, { recursive: true });
+    writeFileSync(join(directory, "future.json"), JSON.stringify({ version: 3, id: "future" }));
+    writeFileSync(join(directory, "corrupt.json"), "not json\n");
+
+    expect(readAgentRecoveryCheckpoints(cwd)).toEqual([]);
+  });
+});
+
 describe("durable interrupted recovery", () => {
   it("persists the transcript locator before a queued or running spawn is exposed", () => {
     const cwd = makeProject();
@@ -76,9 +222,13 @@ describe("durable interrupted recovery", () => {
     expect(callbackId).toBe(id);
     expect(readAgentRecoveryCheckpoints(cwd)).toEqual([
       expect.objectContaining({
+        version: 2,
         id,
         status: "running",
         transcriptPath: `.pi-subagents/agent-transcripts/${id}.jsonl`,
+        session: { kind: "pending" },
+        runtime: { depth: 1, maxSubagentDepth: 2 },
+        ownership: { kind: "top-level" },
       }),
     ]);
   });
@@ -129,8 +279,9 @@ describe("durable interrupted recovery", () => {
     manager.setTranscript(childId, childFile, agentHistoryLocator(cwd, childFile), cwd);
 
     const written = readAgentRecoveryCheckpoints(cwd).find((c) => c.id === childId);
-    expect(written?.parentAgentId).toBe(parentId);
-    expect(written?.depth).toBe(2);
+    expect(written?.version).toBe(2);
+    expect(written?.ownership).toEqual({ kind: "nested", parentAgentId: parentId, depth: 2 });
+    expect(written?.runtime.depth).toBe(2);
 
     // A fresh manager rebuilding from disk must keep the edge, or the roster
     // renders the child as a root and the tree flattens after a reload.
@@ -140,6 +291,33 @@ describe("durable interrupted recovery", () => {
     const child = restored.getRecord(childId);
     expect(child?.parentAgentId).toBe(parentId);
     expect(child?.depth).toBe(2);
+  });
+
+  it("round-trips a workflow child's ownership and workflow parent through a reload", () => {
+    const cwd = makeProject();
+    const manager = new AgentManager(undefined, 1);
+    managers.push(manager);
+    const workflowId = "wf_workflow1";
+    const childId = manager.spawn(mockPi, makeContext(cwd), "Explore", "workflow task", {
+      description: "workflow child",
+      isBackground: true,
+      depth: 1,
+      ownership: { kind: "workflow", workflowId, depth: 1 },
+    });
+    const childFile = addTranscript(cwd, childId, "workflow child done");
+    manager.setTranscript(childId, childFile, agentHistoryLocator(cwd, childFile), cwd);
+
+    const written = readAgentRecoveryCheckpoints(cwd).find((checkpoint) => checkpoint.id === childId);
+    expect(written?.version).toBe(2);
+    expect(written?.ownership).toEqual({ kind: "workflow", workflowId, depth: 1 });
+
+    const restored = new AgentManager(undefined, 1);
+    managers.push(restored);
+    restored.restoreRecovered(cwd);
+    const child = restored.getRecord(childId);
+    expect(child?.ownership).toEqual({ kind: "workflow", workflowId, depth: 1 });
+    expect(child?.parentAgentId).toBe(workflowId);
+    expect(child?.depth).toBe(1);
   });
 
   it("checkpoints a stopped record when a session switches", () => {
@@ -166,6 +344,7 @@ describe("durable interrupted recovery", () => {
     const recovered = reopened.getRecord(first.id);
     expect(recovered?.status).toBe("stopped");
     expect(recovered?.transcriptPath).toBe(first.locator);
+    expect(recovered?.sessionState).toEqual({ kind: "pending" });
     expect(readAgentHistoryResult(cwd, first.locator)).toBe("partial output");
   });
 

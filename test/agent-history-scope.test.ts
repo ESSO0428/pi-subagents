@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { buildAgentStatusMenuEntries } from "../src/agent-history-list.js";
+import { projectAgentTree } from "../src/agent-tree.js";
 import type { AgentRecord } from "../src/types.js";
 
 function record(over: Partial<AgentRecord> & { id: string }): AgentRecord {
@@ -53,15 +54,36 @@ describe("agent history menu scope", () => {
     expect(entries.some((e) => e.startsWith("Agent history all sessions"))).toBe(true);
   });
 });
+describe("current-session visibility behavior", () => {
+  it("hides a raw unstamped record while admitting a restored stamped record", () => {
+    const records = [
+      record({ id: "raw-unstamped" }),
+      record({ id: "restored", sessionId: "session-b" }),
+    ];
+    const projection = projectAgentTree({
+      agents: records,
+      sessionId: "session-b",
+      canOpenTerminalAgent: () => true,
+    });
+
+    expect(projection.rows.map(row => row.node.kind === "agent" ? row.node.record.id : row.node.root.id))
+      .toEqual(["restored"]);
+    expect(buildAgentStatusMenuEntries(records, undefined, "session-b"))
+      .toEqual([
+        "Agent conversations this session (1)",
+        "Agent history all sessions (2)",
+      ]);
+  });
+});
+
 describe("session stamp provenance", () => {
-  it("a checkpoint-restored record keeps its own session, a branch-restored one adopts the current", () => {
-    // Guards the mistake that made both counts equal: stamping every restored
-    // record with the current session turned "this session" into "everything".
-    // Only branch inheritance (restoreCompleted) may re-stamp.
+  it("checkpoint restore stamps only when the reload supplies the current session", () => {
+    // Project checkpoints mix every session. The reload lifecycle may stamp the
+    // in-memory projection, while direct restore callers remain all-session.
     const src = readFileSync(new URL("../src/agent-manager.ts", import.meta.url), "utf-8");
-    const recovered = src.slice(src.indexOf("restoreRecovered(cwd: string)"));
+    const recovered = src.slice(src.indexOf("restoreRecovered(cwd: string, sessionId?: string)"));
     const recoveredBody = recovered.slice(0, recovered.indexOf("\n  }"));
-    expect(recoveredBody).not.toMatch(/createRestoredRecord\(\{[\s\S]*?\bsessionId,/);
+    expect(recoveredBody).toContain("sessionId !== undefined");
     expect(recoveredBody).toContain("...checkpoint");
 
     const completed = src.slice(src.indexOf("restoreCompleted(records"));

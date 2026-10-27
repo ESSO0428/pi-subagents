@@ -86,6 +86,10 @@ export type WidgetMode = 'all' | 'background' | 'off';
 
 /** A workflow run projected as a grouping-only root in the shared agent tree. */
 export interface WorkflowTreeRoot {
+  /** Canonical project root that owns this live or restored workflow. */
+  artifactRootCwd: string;
+  /** Root Pi session that started this workflow; absent means history-only. */
+  rootSessionId?: string;
   id: string;
   name: string;
   description: string;
@@ -95,6 +99,46 @@ export interface WorkflowTreeRoot {
   doneCount: number;
   agentCount: number;
   tokens: number;
+  /** True when the root came from durable display-only workflow history. */
+  restoredHistory?: boolean;
+}
+
+export type AgentOwnership =
+  | { kind: "top-level" }
+  | { kind: "nested"; parentAgentId: string; depth: number }
+  | { kind: "workflow"; workflowId: string; depth?: number };
+
+export type AgentRecoverySessionState =
+  | { kind: "pending" }
+  | {
+      kind: "memory" | "explicit";
+      artifactRootCwd: string;
+      resourceCwd: string;
+      originalExecutionCwd: string;
+    }
+  | {
+      kind: "private";
+      locator: string;
+      sessionId: string;
+      artifactRootCwd: string;
+      resourceCwd: string;
+      originalExecutionCwd: string;
+      provider: string;
+      modelId: string;
+      thinking: ThinkingLevel;
+    };
+
+export interface AgentRecoveryRuntimeIdentity {
+  depth: number;
+  maxSubagentDepth: number;
+  rootSessionId?: string;
+}
+
+export interface WorktreeResumeState {
+  repoRoot: string;
+  baseCommitSha: string;
+  savedCommitSha?: string;
+  originalTargetSubdirectory: string;
 }
 
 export interface AgentRecord {
@@ -117,9 +161,16 @@ export interface AgentRecord {
   /** Steering messages queued before the session was ready. */
   pendingSteers?: string[];
   /** Worktree info if the agent is running in an isolated worktree. */
-  worktree?: { path: string; branch: string; baseSha: string; workPath: string };
+  worktree?: {
+    path: string;
+    branch: string;
+    baseSha: string;
+    repoRoot: string;
+    originalTargetSubdirectory: string;
+    workPath: string;
+  };
   /** Worktree cleanup result after agent completion. */
-  worktreeResult?: { hasChanges: boolean; branch?: string };
+  worktreeResult?: { hasChanges: boolean; branch?: string; savedCommitSha?: string };
   /** The tool_use_id from the original Agent tool call. */
   toolCallId?: string;
   /** Absolute path to the optional temporary `.output` mirror while live. */
@@ -155,7 +206,7 @@ export interface AgentRecord {
   depth?: number;
   /** Parent agent ID for ownership-scoped nested controls. */
   parentAgentId?: string;
-  /** Session this record belongs to; re-stamped on restore. */
+  /** Current-session roster identity; only exact restored provenance is admitted. */
   sessionId?: string;
   /** Parent description shown in a nested conversation viewer. */
   parentDescription?: string;
@@ -173,6 +224,18 @@ export interface AgentRecord {
   };
   /** Latest nested delegation refusal, retained so the widget can explain it. */
   nestedIssue?: string;
+  /** v2 checkpoint session state; pending until the native session is known. */
+  sessionState?: AgentRecoverySessionState;
+  /** Persisted owner shape used by the v2 checkpoint and later resume authority. */
+  ownership?: AgentOwnership;
+  /** Persisted child identity used when reconstructing nested tools. */
+  runtimeIdentity?: AgentRecoveryRuntimeIdentity;
+  /** Stable cwd metadata used by executable session recovery. */
+  artifactRootCwd?: string;
+  resourceCwd?: string;
+  originalExecutionCwd?: string;
+  /** Canonical worktree state used by a later resume reconstruction phase. */
+  worktreeResume?: WorktreeResumeState;
 }
 
 export interface AgentInvocation {

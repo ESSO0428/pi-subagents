@@ -236,9 +236,21 @@ describe("nested delegation policy", () => {
     expect(spawn).toHaveBeenCalledTimes(2);
 
     await agent.execute("resume", { resume: "resume-id", subagent_type: "detached", description: "resume", prompt: "continue" }, undefined, undefined, toolCtx);
-    expect(resume).toHaveBeenCalledWith("resume-id", "continue", expect.objectContaining({ isBackground: true }));
+    expect(resume).toHaveBeenCalledWith(
+      "resume-id",
+      "continue",
+      expect.objectContaining({ create: expect.any(Function) }),
+      expect.objectContaining({ kind: "nested", parentAgentId: "parent", artifactRootCwd: cwd }),
+      expect.objectContaining({ isBackground: false }),
+    );
     await agent.execute("resume-blocking", { resume: "resume-id", subagent_type: "detached", description: "resume", prompt: "continue", run_in_background: false }, undefined, undefined, toolCtx);
-    expect(resume).toHaveBeenLastCalledWith("resume-id", "continue", expect.objectContaining({ isBackground: false }));
+    expect(resume).toHaveBeenLastCalledWith(
+      "resume-id",
+      "continue",
+      expect.objectContaining({ create: expect.any(Function) }),
+      expect.objectContaining({ kind: "nested", parentAgentId: "parent", artifactRootCwd: cwd }),
+      expect.objectContaining({ isBackground: false }),
+    );
   });
 
   it("checks and waits only for owned nested results, consuming terminal retrieval", async () => {

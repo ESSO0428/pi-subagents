@@ -10,6 +10,7 @@ const {
   getAgentDir,
   sessionManagerInMemory,
   sessionManagerCreate,
+  sessionManagerOpen,
   settingsManagerCreate,
   settingsManagerGetSessionDir,
   codemodeHostRef,
@@ -26,6 +27,7 @@ const {
   getAgentDir: vi.fn(() => "/mock/agent-dir"),
   sessionManagerInMemory: vi.fn(() => ({ kind: "memory-session-manager" })),
   sessionManagerCreate: vi.fn(() => ({ kind: "persistent-session-manager" })),
+  sessionManagerOpen: vi.fn(),
   settingsManagerGetSessionDir: vi.fn(() => undefined as string | undefined),
   settingsManagerCreate: vi.fn(() => ({ kind: "settings-manager", getSessionDir: settingsManagerGetSessionDir })),
   codemodeHostRef: { current: true },
@@ -67,7 +69,11 @@ vi.mock("@earendil-works/pi-coding-agent", async (importOriginal) => {
     }
   },
   getAgentDir,
-  SessionManager: { inMemory: sessionManagerInMemory, create: sessionManagerCreate },
+  SessionManager: {
+    inMemory: sessionManagerInMemory,
+    create: sessionManagerCreate,
+    open: sessionManagerOpen,
+  },
     SettingsManager: { create: settingsManagerCreate },
   };
 });
@@ -117,6 +123,7 @@ vi.mock("../src/skill-loader.js", () => ({
 }));
 
 import {
+  createAgentResumeRuntime,
   extensionCanonicalName,
   extensionCanonicalNames,
   getAgentConversation,
@@ -189,6 +196,7 @@ beforeEach(() => {
   getAgentDir.mockClear();
   sessionManagerInMemory.mockClear();
   sessionManagerCreate.mockClear();
+  sessionManagerOpen.mockReset();
   settingsManagerGetSessionDir.mockReset();
   settingsManagerGetSessionDir.mockReturnValue(undefined);
   settingsManagerCreate.mockClear();
@@ -223,6 +231,7 @@ describe("agent-runner final output capture", () => {
   });
 
   it("passes effective cwd and agentDir to the loader and settings manager", async () => {
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig({ persistSession: false }));
     const { session } = createSession("CONFIGURED");
     createAgentSession.mockResolvedValue({ session });
 
@@ -772,8 +781,8 @@ function lastLoaderOpts(): Record<string, unknown> {
 }
 
 describe("agent-runner session persistence", () => {
-  it("uses an in-memory session by default", async () => {
-    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig());
+  it("uses an in-memory session when persist_session is explicitly false", async () => {
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig({ persistSession: false }));
     const { session } = createSession("OK");
     createAgentSession.mockResolvedValue({ session });
 
@@ -784,6 +793,166 @@ describe("agent-runner session persistence", () => {
     expect(createAgentSession).toHaveBeenCalledWith(expect.objectContaining({
       sessionManager: { kind: "memory-session-manager" },
     }));
+  });
+
+  it("uses the private durable default when persist_session is unset", async () => {
+    const artifactRoot = mkdtempSync(join(tmpdir(), "agent-runner-private-"));
+    try {
+      vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig({ persistSession: undefined }));
+      const { session } = createSession("OK");
+      createAgentSession.mockResolvedValue({ session });
+
+      await runAgent(ctx, "Explore", "go", {
+        pi,
+        cwd: join(artifactRoot, "worktree"),
+        artifactRootCwd: artifactRoot,
+      });
+
+      expect(sessionManagerCreate).toHaveBeenCalledWith(
+        join(artifactRoot, "worktree"),
+        join(artifactRoot, ".pi-subagents/agent-sessions"),
+      );
+      expect(sessionManagerInMemory).not.toHaveBeenCalled();
+      expect(createAgentSession.mock.calls[0][0]).not.toHaveProperty("cwdOverride");
+      expect(createAgentSession.mock.calls[0][0]).not.toHaveProperty("parentSession");
+    } finally {
+      rmSync(artifactRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("reports a validated private native locator after creation", async () => {
+    const artifactRoot = mkdtempSync(join(tmpdir(), "agent-runner-metadata-"));
+    const privateDir = join(artifactRoot, ".pi-subagents/agent-sessions");
+    mkdirSync(privateDir, { recursive: true });
+    const file = join(privateDir, "session-2.jsonl");
+    writeFileSync(file, `${JSON.stringify({
+      type: "session",
+      version: 3,
+      id: "session-2",
+      timestamp: new Date(0).toISOString(),
+      cwd: join(artifactRoot, "worktree"),
+    })}\n`);
+    try {
+      vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig({ persistSession: undefined }));
+      sessionManagerCreate.mockReturnValueOnce({
+        getSessionFile: () => file,
+        getSessionId: () => "session-2",
+        getHeader: () => ({ parentSession: undefined }),
+      });
+      const { session } = createSession("OK");
+      createAgentSession.mockResolvedValue({ session });
+      const onSessionMetadata = vi.fn();
+
+      await runAgent(ctx, "Explore", "go", {
+        pi,
+        model: { provider: "openai", id: "gpt-test" } as any,
+        cwd: join(artifactRoot, "worktree"),
+        artifactRootCwd: artifactRoot,
+        onSessionMetadata,
+      });
+
+      expect(onSessionMetadata).toHaveBeenCalledWith(expect.objectContaining({
+        sessionState: expect.objectContaining({
+          kind: "private",
+          locator: ".pi-subagents/agent-sessions/session-2.jsonl",
+          sessionId: "session-2",
+        }),
+      }));
+    } finally {
+      rmSync(artifactRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("finalizes private metadata when the first prompt rejects after writing JSONL", async () => {
+    const artifactRoot = mkdtempSync(join(tmpdir(), "agent-runner-failed-private-"));
+    const privateDir = join(artifactRoot, ".pi-subagents/agent-sessions");
+    mkdirSync(privateDir, { recursive: true });
+    const file = join(privateDir, "session-failed.jsonl");
+    const promptError = new Error("provider failed");
+    try {
+      vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig({ persistSession: undefined }));
+      sessionManagerCreate.mockReturnValueOnce({
+        getSessionFile: () => file,
+        getSessionId: () => "session-failed",
+      });
+      const { session } = createSession("unused");
+      const lifecycle: string[] = [];
+      (session as any).dispose = vi.fn(() => lifecycle.push("dispose"));
+      session.prompt.mockImplementationOnce(async () => {
+        writeFileSync(file, `${JSON.stringify({
+          type: "session",
+          version: 3,
+          id: "session-failed",
+          timestamp: new Date(0).toISOString(),
+          cwd: join(artifactRoot, "worktree"),
+        })}\n`);
+        throw promptError;
+      });
+      createAgentSession.mockResolvedValue({ session });
+      const onSessionMetadata = vi.fn(() => lifecycle.push("metadata"));
+
+      await expect(runAgent(ctx, "Explore", "go", {
+        pi,
+        model: { provider: "openai", id: "gpt-test" } as any,
+        cwd: join(artifactRoot, "worktree"),
+        artifactRootCwd: artifactRoot,
+        onSessionMetadata,
+      })).rejects.toBe(promptError);
+
+      expect(onSessionMetadata).toHaveBeenCalledTimes(1);
+      expect(onSessionMetadata).toHaveBeenCalledWith(expect.objectContaining({
+        sessionState: expect.objectContaining({
+          kind: "private",
+          locator: ".pi-subagents/agent-sessions/session-failed.jsonl",
+          sessionId: "session-failed",
+        }),
+      }));
+      expect((session as any).dispose).toHaveBeenCalledTimes(1);
+      expect(lifecycle).toEqual(["metadata", "dispose"]);
+    } finally {
+      rmSync(artifactRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("finalizes private metadata after a failed prompt without masking the prompt error", async () => {
+    const artifactRoot = mkdtempSync(join(tmpdir(), "agent-runner-metadata-failure-"));
+    const privateDir = join(artifactRoot, ".pi-subagents/agent-sessions");
+    mkdirSync(privateDir, { recursive: true });
+    const file = join(privateDir, "session-failure.jsonl");
+    const promptError = new Error("prompt failed");
+    const metadataError = new Error("metadata callback failed");
+    const onSessionMetadata = vi.fn(() => { throw metadataError; });
+    sessionManagerCreate.mockReturnValueOnce({
+      getSessionFile: () => file,
+      getSessionId: () => "session-failure",
+      getHeader: () => ({ parentSession: undefined }),
+    });
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig({ persistSession: undefined }));
+    const { session } = createSession("");
+    session.prompt = vi.fn(async () => {
+      writeFileSync(file, `${JSON.stringify({
+        type: "session",
+        version: 3,
+        id: "session-failure",
+        timestamp: new Date(0).toISOString(),
+        cwd: artifactRoot,
+      })}\n`);
+      throw promptError;
+    }) as any;
+    createAgentSession.mockResolvedValue({ session });
+
+    try {
+      await expect(runAgent(ctx, "Explore", "go", {
+        pi,
+        model: { provider: "openai", id: "gpt-test" } as any,
+        cwd: artifactRoot,
+        artifactRootCwd: artifactRoot,
+        onSessionMetadata,
+      })).rejects.toBe(promptError);
+      expect(onSessionMetadata).toHaveBeenCalledOnce();
+    } finally {
+      rmSync(artifactRoot, { recursive: true, force: true });
+    }
   });
 
   it("uses pi's normal persistent session location when persistSession is true", async () => {
@@ -799,6 +968,154 @@ describe("agent-runner session persistence", () => {
     expect(createAgentSession).toHaveBeenCalledWith(expect.objectContaining({
       sessionManager: { kind: "persistent-session-manager" },
     }));
+  });
+
+  it("rejects a disabled stored agent before opening its private session", async () => {
+    const artifactRoot = mkdtempSync(join(tmpdir(), "agent-runner-disabled-resume-"));
+    const privateDir = join(artifactRoot, ".pi-subagents/agent-sessions");
+    mkdirSync(privateDir, { recursive: true });
+    const file = join(privateDir, "session-disabled.jsonl");
+    writeFileSync(file, `${JSON.stringify({
+      type: "session",
+      version: 3,
+      id: "session-disabled",
+      timestamp: new Date(0).toISOString(),
+      cwd: artifactRoot,
+    })}\n`);
+    try {
+      vi.mocked(getAgentConfig)
+        .mockReturnValueOnce(makeAgentConfig())
+        .mockReturnValueOnce(makeAgentConfig({ enabled: false }));
+      const model = { provider: "openai", id: "gpt-test" };
+      const resumeCtx = {
+        ...ctx,
+        modelRegistry: {
+          find: vi.fn(() => model),
+          hasConfiguredAuth: vi.fn(() => true),
+        },
+      } as any;
+      const runtime = createAgentResumeRuntime(pi, resumeCtx, {
+        nestedManager: {} as any,
+        childIdentity: { parentAgentId: "agent-disabled", depth: 1, maxSubagentDepth: 2 },
+      });
+      const record = {
+        id: "agent-disabled",
+        type: "Explore",
+        description: "disabled",
+        status: "stopped",
+        toolUses: 0,
+        startedAt: 0,
+        lifetimeUsage: { input: 0, output: 0, cacheWrite: 0 },
+        compactionCount: 0,
+        artifactRootCwd: artifactRoot,
+        resourceCwd: artifactRoot,
+        originalExecutionCwd: artifactRoot,
+        sessionState: {
+          kind: "private",
+          locator: ".pi-subagents/agent-sessions/session-disabled.jsonl",
+          sessionId: "session-disabled",
+          artifactRootCwd: artifactRoot,
+          resourceCwd: artifactRoot,
+          originalExecutionCwd: artifactRoot,
+          provider: "openai",
+          modelId: "gpt-test",
+          thinking: "medium",
+        },
+        ownership: { kind: "top-level" },
+        runtimeIdentity: { depth: 1, maxSubagentDepth: 2 },
+      } as any;
+
+      await expect(runtime.rehydrate(record, artifactRoot, new AbortController().signal))
+        .rejects.toMatchObject({ code: "resume-session-incompatible" });
+      expect(sessionManagerOpen).not.toHaveBeenCalled();
+    } finally {
+      rmSync(artifactRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("opens a private native session with the resume lifecycle reason", async () => {
+    const artifactRoot = mkdtempSync(join(tmpdir(), "agent-runner-reopen-"));
+    const privateDir = join(artifactRoot, ".pi-subagents/agent-sessions");
+    mkdirSync(privateDir, { recursive: true });
+    const file = join(privateDir, "session-1.jsonl");
+    writeFileSync(file, `${JSON.stringify({
+      type: "session",
+      version: 3,
+      id: "session-1",
+      timestamp: new Date(0).toISOString(),
+      cwd: "/tmp/worktree",
+    })}\n`);
+    try {
+      const { session } = createSession("OK");
+      const opened = {
+        getSessionFile: () => file,
+        getSessionId: () => "session-1",
+        buildSessionProjection: () => ({
+          entries: [],
+          messages: [],
+          model: { provider: "openai", modelId: "gpt-test" },
+          thinkingLevel: "medium",
+        }),
+      };
+      sessionManagerOpen.mockReturnValue(opened);
+      createAgentSession.mockResolvedValue({ session });
+      const model = { provider: "openai", id: "gpt-test", name: "GPT Test" };
+      const resumeCtx = {
+        ...ctx,
+        modelRegistry: {
+          find: vi.fn(() => model),
+          hasConfiguredAuth: vi.fn(() => true),
+        },
+      } as any;
+      const runtime = createAgentResumeRuntime(pi, resumeCtx, {
+        nestedManager: {} as any,
+        childIdentity: {
+          parentAgentId: "parent-agent",
+          depth: 1,
+          maxSubagentDepth: 2,
+          rootSessionId: "root-session",
+        },
+      });
+      const record = {
+        id: "resumed-agent-1",
+        type: "Explore",
+        description: "resume me",
+        status: "stopped",
+        toolUses: 0,
+        startedAt: 0,
+        lifetimeUsage: { input: 0, output: 0, cacheWrite: 0 },
+        compactionCount: 0,
+        artifactRootCwd: artifactRoot,
+        resourceCwd: artifactRoot,
+        originalExecutionCwd: "/tmp/worktree",
+        sessionState: {
+          kind: "private",
+          locator: ".pi-subagents/agent-sessions/session-1.jsonl",
+          sessionId: "session-1",
+          artifactRootCwd: artifactRoot,
+          resourceCwd: artifactRoot,
+          originalExecutionCwd: "/tmp/worktree",
+          provider: "openai",
+          modelId: "gpt-test",
+          thinking: "medium",
+        },
+        ownership: { kind: "top-level" },
+        runtimeIdentity: { depth: 1, maxSubagentDepth: 2, rootSessionId: "root-session" },
+      } as any;
+
+      await runtime.rehydrate(record, "/tmp/worktree-resumed", new AbortController().signal);
+
+      expect(sessionManagerOpen).toHaveBeenCalledWith(file, privateDir, "/tmp/worktree-resumed");
+      expect(lastLoaderOpts().cwd).toBe(artifactRoot);
+      expect(createAgentSession.mock.calls[0][0]).toMatchObject({
+        cwd: "/tmp/worktree-resumed",
+        sessionStartEvent: { type: "session_start", reason: "resume" },
+      });
+      expect(createAgentSession.mock.calls[0][0]).not.toHaveProperty("cwdOverride");
+      expect(createAgentSession.mock.calls[0][0]).not.toHaveProperty("parentSession");
+    } finally {
+      rmSync(artifactRoot, { recursive: true, force: true });
+    }
   });
 
   it("uses a frontmatter sessionDir when persistSession is true and sessionDir is configured", async () => {

@@ -34,12 +34,18 @@
 
 import { existsSync } from "node:fs";
 import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { AgentManager } from "../agent-manager.js";
+import {
+  type AgentManager,
+  AgentResumeError,
+  type ResumeOptions,
+} from "../agent-manager.js";
+import { type AgentResumeRuntimeDependencies, createAgentResumeRuntime } from "../agent-runner.js";
+import { canonicalArtifactRootCwd } from "../agent-session-storage.js";
 import { getAgentConfig, resolveSpawnType } from "../agent-types.js";
 import { resolveModel } from "../model-resolver.js";
 import { checkModelScope } from "../model-scope.js";
 import { createOutputFilePath, writeInitialEntry } from "../output-file.js";
-import type { AgentRecord, ThinkingLevel } from "../types.js";
+import type { AgentOwnership, AgentRecord, ThinkingLevel } from "../types.js";
 import { getLifetimeTotal } from "../usage.js";
 import type { WorkflowGateResult, WorkflowHost, WorkflowSpawnResult } from "./runtime.js";
 import { resolveWorkflowSource } from "./saved.js";
@@ -59,6 +65,8 @@ export interface WorkflowHostOptions {
   signal?: AbortSignal;
   /** Groups child transcripts under the parent session. */
   rootSessionId?: string;
+  /** Stable project root used for workflow authority checks and artifacts. */
+  artifactRootCwd?: string;
   /**
    * The run id every child is stamped with.
    *
@@ -172,6 +180,7 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
    */
   const warnedScopeMessages = new Set<string>();
   const rootSessionId = deps.rootSessionId ?? ctx.sessionManager?.getSessionId?.();
+  const artifactRootCwd = canonicalArtifactRootCwd(deps.artifactRootCwd ?? ctx.cwd ?? process.cwd());
 
   /**
    * Run a gate command in `cwd`. The only place a gate is executed — `runGate`
@@ -315,7 +324,11 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
             isBackground: true,
             // The workflow run owns this real child through AgentManager's
             // existing hierarchy seam; no synthetic workflow record is created.
-            ...(deps.workflowId !== undefined ? { parentAgentId: deps.workflowId } : {}),
+            ...(deps.workflowId !== undefined ? {
+              parentAgentId: deps.workflowId,
+              ownership: { kind: "workflow", workflowId: deps.workflowId } satisfies AgentOwnership,
+            } : {}),
+            artifactRootCwd,
             ...(model !== undefined ? { model } : {}),
             ...(request.effort !== undefined ? { thinkingLevel: request.effort as ThinkingLevel } : {}),
             ...(request.isolation !== undefined ? { isolation: request.isolation } : {}),
@@ -354,7 +367,11 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
             // twice would let one fan-out starve everything else the user is
             // doing. No `bypassQueue` needed: an agent outside the pool is
             // never queued behind it.
-            ...(deps.workflowId !== undefined ? { parentAgentId: deps.workflowId } : {}),
+            ...(deps.workflowId !== undefined ? {
+              parentAgentId: deps.workflowId,
+              ownership: { kind: "workflow", workflowId: deps.workflowId } satisfies AgentOwnership,
+            } : {}),
+            artifactRootCwd,
             ...(model !== undefined ? { model } : {}),
             // Validated worker-side against the same list pi accepts, so the
             // cast asserts what the boundary has already checked. Left unset,
@@ -424,7 +441,14 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
      * waits on, so a collected child is indistinguishable from a blocking one.
      */
     async waitForAgent(agentId: string) {
-      const record = manager.getRecord(agentId);
+      const managerId = records.get(agentId);
+      if (managerId === undefined) {
+        return {
+          ok: false,
+          error: `Cannot collect "${agentId}" — no such agent. It may have finished and been dropped already.`,
+        };
+      }
+      const record = manager.getRecord(managerId);
       if (record === undefined) {
         return {
           ok: false,
@@ -432,7 +456,7 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
         };
       }
       if (record.promise) await record.promise;
-      const settled = manager.getRecord(agentId) ?? record;
+      const settled = manager.getRecord(managerId) ?? record;
       if (settled.error !== undefined) return { ok: false, error: settled.error };
       return { ok: true, text: settled.result ?? "" };
     },
@@ -442,39 +466,47 @@ export function createWorkflowHost(deps: WorkflowHostOptions): WorkflowHost {
       if (id === undefined) {
         return { ok: false, error: `Cannot resume "${agentId}" — it never started.` };
       }
-      if (runInBackground) {
-        const current = manager.getRecord(id);
-        if (current === undefined) {
+      if (deps.workflowId === undefined) {
+        return { ok: false, error: "resume-ownership-denied: workflow authority is unavailable." };
+      }
+      const current = manager.getRecord(id);
+      if (current === undefined) {
+        return { ok: false, error: `Agent ${id} has no session left to resume.` };
+      }
+      const runtimeFactory = {
+        create: (childDeps: AgentResumeRuntimeDependencies) => createAgentResumeRuntime(pi, ctx, childDeps),
+      };
+      const resumeOptions: ResumeOptions = {
+        isBackground: runInBackground,
+        ...(deps.signal !== undefined ? { signal: deps.signal } : {}),
+      };
+      try {
+        const record = await manager.resume(
+          id,
+          prompt,
+          runtimeFactory,
+          {
+            kind: "workflow",
+            artifactRootCwd,
+            workflowId: deps.workflowId,
+            runtimeAgentId: agentId,
+          },
+          resumeOptions,
+        );
+        if (record === undefined) {
           return { ok: false, error: `Agent ${id} has no session left to resume.` };
         }
         onResolved?.({ recordId: id });
-        void manager.resume(id, prompt, {
-          isBackground: true,
-          signal: deps.signal,
-        }).catch(() => {
-          // The manager records resume failures; the scoped wait path reads it.
-        });
-        return { ok: true, text: id, detached: true };
+        if (runInBackground) return { ok: true, text: id, detached: true };
+        const info = resolvedInfo(record);
+        if (info !== undefined) onResolved?.(info);
+        return toSpawnResult(record);
+      } catch (error) {
+        const message = error instanceof AgentResumeError
+          ? error.message
+          : error instanceof Error ? error.message : String(error);
+        return { ok: false, error: message };
       }
-      const record = await manager.resume(id, prompt, {
-        isBackground: false,
-        signal: deps.signal,
-      });
-      if (record === undefined) {
-        return {
-          ok: false,
-          error: `Agent ${id} has no session left to resume — records are dropped ten minutes after they finish.`,
-        };
-      }
-      // The resumed row is built from scratch, so it has to be told the same
-      // thing the first one was — the child's session already exists, so this is
-      // simply read back rather than waited for. The id goes first for the same
-      // reason it does on the spawn path: it is knowable even when the rest is
-      // not.
-      onResolved?.({ recordId: id });
-      const info = resolvedInfo(record);
-      if (info !== undefined) onResolved?.(info);
-      return toSpawnResult(record);
     },
 
     /**

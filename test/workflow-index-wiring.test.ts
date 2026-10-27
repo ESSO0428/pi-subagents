@@ -1,7 +1,11 @@
 /** Integration coverage for the SubagentWorkflow extension wiring. */
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { writeWorkflowHistorySnapshot } from "../src/workflow/history.js";
 import type { WorkflowEntry } from "../src/workflow/progress.js";
-import { toWorkflowTreeRoot } from "../src/workflow/task.js";
+import { createWorkflowTask, toWorkflowTreeRoot } from "../src/workflow/task.js";
 
 const mocks = vi.hoisted(() => ({
   runWorkflow: vi.fn(),
@@ -38,12 +42,12 @@ function makePi() {
   return { pi, tools, lifecycle, commands };
 }
 
-function makeContext(ui: Record<string, unknown>) {
+function makeContext(ui: Record<string, unknown>, cwd = process.cwd()) {
   return {
     mode: "tui",
     hasUI: true,
     ui,
-    cwd: process.cwd(),
+    cwd,
     sessionManager: { getSessionId: () => "session-1", getBranch: () => [] },
     modelRegistry: { find: vi.fn(), getAvailable: vi.fn(() => []) },
   } as any;
@@ -92,6 +96,103 @@ describe("SubagentWorkflow index wiring", () => {
     ]));
   });
 
+  it("restores terminal workflow history into the menu after a reload-shaped activation", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "pi-workflow-index-history-"));
+    try {
+      for (const [index, status] of (["completed", "failed", "killed"] as const).entries()) {
+        const task = createWorkflowTask({
+          id: `wf_reload${index}`,
+          script: "secret",
+          artifactRootCwd: cwd,
+          startTime: 10,
+          meta: { name: `history-${status}`, description: `restored ${status}` },
+        });
+        task.status = status;
+        task.endTime = 20 + index;
+        writeWorkflowHistorySnapshot(task, cwd);
+      }
+
+      const { pi, tools, commands, lifecycle } = makePi();
+      subagentsExtension(pi);
+      const ui = makeUi();
+      const ctx = makeContext(ui);
+      ctx.cwd = cwd;
+      await lifecycle.get("session_start")?.({}, ctx);
+      ui.select.mockResolvedValueOnce("Workflows (3)");
+      await commands.get("agents")?.handler("", ctx);
+
+      expect(ui.select).toHaveBeenCalledWith("Agents", expect.arrayContaining([
+        "Workflows (3)",
+      ]));
+      const deps = mocks.showWorkflowsMenu.mock.calls.at(-1)?.[1] as {
+        history: ReadonlyMap<string, { status: string }>;
+      };
+      expect([...deps.history.values()].map(snapshot => snapshot.status).sort()).toEqual(["completed", "failed", "killed"]);
+      expect(tools.get("SubagentWorkflow")).toBeDefined();
+      await lifecycle.get("session_shutdown")?.({}, ctx);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("does not leak delayed A completion into B, then restores A history on return", async () => {
+    const projectA = mkdtempSync(join(tmpdir(), "pi-workflow-switch-a-"));
+    const projectB = mkdtempSync(join(tmpdir(), "pi-workflow-switch-b-"));
+    let resolveA!: (result: unknown) => void;
+    const delayedA = new Promise(resolve => { resolveA = resolve; });
+    mocks.runWorkflow.mockReturnValueOnce(delayedA);
+    const { pi, tools, commands, lifecycle } = makePi();
+    subagentsExtension(pi);
+    const uiA = makeUi();
+    const uiB = makeUi();
+    const contextA = makeContext(uiA, projectA);
+    const contextB = makeContext(uiB, projectB);
+
+    try {
+      await lifecycle.get("session_start")?.({}, contextA);
+      const started = await tools.get("SubagentWorkflow")?.execute(
+        "switch-a",
+        { script: 'export const meta = { name: "A workflow", description: "A secret details" }; return "A";' },
+        undefined,
+        undefined,
+        contextA,
+      );
+      expect((started as { details?: { taskId?: string } }).details?.taskId).toMatch(/^wf_/);
+
+      await lifecycle.get("session_before_switch")?.();
+      await lifecycle.get("session_start")?.({}, contextB);
+      resolveA({
+        status: "killed",
+        meta: { name: "A workflow", description: "A secret details" },
+        progress: [],
+        agentCount: 0,
+        replayedCount: 0,
+      });
+      await flush();
+      await lifecycle.get("turn_end")?.({ message: { role: "assistant", stopReason: "stop" } }, contextB);
+      await flush();
+
+      uiB.select.mockResolvedValue(undefined);
+      await commands.get("agents")?.handler("", contextB);
+      expect(JSON.stringify(uiB.setWidget.mock.calls)).not.toContain("A secret details");
+      expect(JSON.stringify(uiB.select.mock.calls)).not.toContain("A secret details");
+      expect(JSON.stringify(uiB.select.mock.calls)).not.toContain("A workflow");
+      expect(JSON.stringify(pi.sendMessage.mock.calls)).not.toContain("A secret details");
+
+      await lifecycle.get("session_before_switch")?.();
+      const uiA2 = makeUi();
+      const contextA2 = makeContext(uiA2, projectA);
+      await lifecycle.get("session_start")?.({}, contextA2);
+      uiA2.select.mockResolvedValue(undefined);
+      await commands.get("agents")?.handler("", contextA2);
+      expect(uiA2.select).toHaveBeenCalledWith("Agents", expect.arrayContaining(["Workflows (1)"]));
+    } finally {
+      await lifecycle.get("session_shutdown")?.({}, contextA);
+      rmSync(projectA, { recursive: true, force: true });
+      rmSync(projectB, { recursive: true, force: true });
+    }
+  });
+
   it("forwards progress batches to the live task", async () => {
     mocks.runWorkflow.mockReturnValue(new Promise(() => {}));
     const { pi, tools, commands } = makePi();
@@ -134,6 +235,7 @@ describe("SubagentWorkflow index wiring", () => {
  */
 describe("workflow run roster mapping", () => {
   const base = {
+    artifactRootCwd: process.cwd(),
     id: "wf_1",
     status: "running" as const,
     workflowName: "smoke",
@@ -165,6 +267,7 @@ describe("workflow run roster mapping", () => {
     } as never);
 
     expect(run).toMatchObject({
+      artifactRootCwd: process.cwd(),
       id: "wf_1",
       description: "Smoke run",
       status: "failed",

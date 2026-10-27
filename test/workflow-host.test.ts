@@ -173,7 +173,18 @@ describe("workflow host transcript wiring", () => {
     await Promise.resolve();
 
     expect(result).toMatchObject({ ok: true });
-    expect(resume).toHaveBeenCalledWith(recordId, "continue", { isBackground: runInBackground, signal });
+    expect(resume).toHaveBeenCalledWith(
+      recordId,
+      "continue",
+      expect.objectContaining({ create: expect.any(Function) }),
+      expect.objectContaining({
+        kind: "workflow",
+        artifactRootCwd: cwd,
+        workflowId: "workflow-1",
+        runtimeAgentId: "wf-agent-0",
+      }),
+      { isBackground: runInBackground, signal },
+    );
   });
 
   it.each([

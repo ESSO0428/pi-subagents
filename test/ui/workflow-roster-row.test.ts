@@ -25,6 +25,7 @@ function harness(
   agents: AgentRecord[] = [],
   canOpenHistory: (record: AgentRecord) => boolean = () => true,
   mode: "all" | "background" | "off" = "all",
+  artifactRootCwd?: string,
 ) {
   const manager = { listAgents: () => agents } as unknown as AgentManager;
   let openedWorkflow: string | undefined;
@@ -35,6 +36,7 @@ function harness(
       openedAgent = record.id;
     },
     getSessionId: () => "s1",
+    getArtifactRootCwd: () => artifactRootCwd,
     getWorkflowRoots: () => roots,
     onOpenWorkflow: id => {
       openedWorkflow = id;
@@ -57,6 +59,8 @@ function harness(
 }
 
 const running: WorkflowTreeRoot = {
+  artifactRootCwd: "/project/default",
+  rootSessionId: "s1",
   id: "wf_1",
   name: "smoke",
   description: "Smoke run",
@@ -68,6 +72,23 @@ const running: WorkflowTreeRoot = {
 };
 
 describe("a workflow grouping root in the roster", () => {
+  it("filters same-shape live and restored roots to the current artifact root", () => {
+    const roots: WorkflowTreeRoot[] = [
+      { ...running, id: "live-a", artifactRootCwd: "/project/a" },
+      { ...running, id: "restored-a", artifactRootCwd: "/project/a", restoredHistory: true },
+      { ...running, id: "live-b", artifactRootCwd: "/project/b" },
+      { ...running, id: "restored-b", artifactRootCwd: "/project/b", restoredHistory: true },
+    ];
+
+    expect(harness(roots, [], () => true, "all", "/project/a").rows().map(row => row.key)).toEqual([
+      "workflow:live-a",
+      "workflow:restored-a",
+    ]);
+    expect(harness(roots, [], () => true, "all", "/project/b").rows().map(row => row.key)).toEqual([
+      "workflow:live-b",
+      "workflow:restored-b",
+    ]);
+  });
   it("shows a separate grouping node while running", () => {
     const rows = harness([running]).rows();
 
@@ -204,7 +225,8 @@ describe("workflow root rendering", () => {
     const ordinary = makeAgent({ id: "a1", description: "an ordinary agent" });
     const output = harness([], [ordinary]).render().join("\n");
 
-    expect(output).toContain("an ordinary agent");
-    expect(output).not.toContain("workflow");
+    const ordinaryLine = output.split("\n").find(line => line.includes("an ordinary agent")) ?? "";
+    expect(ordinaryLine).toContain("an ordinary agent");
+    expect(ordinaryLine).not.toContain("workflow");
   });
 });

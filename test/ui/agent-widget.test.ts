@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../../src/agent-manager.js";
-import type { AgentRecord } from "../../src/types.js";
+import type { AgentRecord, WorkflowTreeRoot } from "../../src/types.js";
 import {
   type AgentActivity,
   AgentWidget,
@@ -87,6 +87,7 @@ function createNavigableWidgetHarness(
     canOpenHistory?: (record: AgentRecord) => boolean;
     rows?: number;
     getSessionId?: () => string | undefined;
+    getWorkflowRoots?: () => WorkflowTreeRoot[];
   } = {},
 ) {
   const manager = { listAgents: () => records } as unknown as AgentManager;
@@ -111,6 +112,7 @@ function createNavigableWidgetHarness(
     canOpenHistory: overrides.canOpenHistory ?? ((record) => record.status !== "running" && record.status !== "queued"),
     onOpen: overrides.onOpen ?? (() => {}),
     getSessionId: overrides.getSessionId,
+    getWorkflowRoots: overrides.getWorkflowRoots,
   });
   widget.setUICtx(ui);
   widget.update();
@@ -520,38 +522,44 @@ describe("AgentWidget live records", () => {
     harness.widget.dispose();
   });
 
-  it("expands by default and navigates collapse state with left and right", () => {
+  it("folds selected workflow roots without disclosure triangles", () => {
     const records = [
-      makeRecord({ id: "parent", description: "parent", status: "running", completedAt: undefined }),
-      makeRecord({ id: "child", description: "child", status: "running", completedAt: undefined, parentAgentId: "parent" }),
-      makeRecord({ id: "sibling", description: "sibling", status: "queued", completedAt: undefined }),
+      makeRecord({ id: "child", description: "child", status: "running", completedAt: undefined, parentAgentId: "workflow-1" }),
     ];
-    const harness = createNavigableWidgetHarness(records);
+    const workflowRoots: WorkflowTreeRoot[] = [{
+      id: "workflow-1",
+      name: "workflow",
+      description: "workflow root",
+      status: "running",
+      startedAt: 1,
+      doneCount: 0,
+      agentCount: 1,
+      tokens: 0,
+    }];
+    const harness = createNavigableWidgetHarness(records, { getWorkflowRoots: () => workflowRoots });
 
-    expect(harness.render().find(line => line.includes("parent"))).toContain("▾");
-    expect(harness.render().join("\n")).toContain("child");
+    const initial = harness.render().join("\n");
+    expect(initial).toContain("child");
+    expect(initial).not.toContain("▾");
+    expect(initial).not.toContain("▸");
 
     harness.input("\u001b[B");
-    expect((harness.widget as any).selectedNodeKey).toBe("agent:parent");
+    expect((harness.widget as any).selectedNodeKey).toBe("workflow:workflow-1");
     expect(harness.input("\u001b[D")).toEqual({ consume: true });
-    expect(harness.render().find(line => line.includes("parent"))).toContain("▸");
     expect(harness.render().join("\n")).not.toContain("child");
 
-    harness.input("\u001b[B");
-    expect((harness.widget as any).selectedNodeKey).toBe("agent:sibling");
-    harness.input("\u001b[A");
-    expect((harness.widget as any).selectedNodeKey).toBe("agent:parent");
     expect(harness.input("\u001b[C")).toEqual({ consume: true });
     expect(harness.render().join("\n")).toContain("child");
 
     harness.input("\u001b[B");
     expect((harness.widget as any).selectedNodeKey).toBe("agent:child");
-    harness.input("\u001b[D");
-    expect((harness.widget as any).selectedNodeKey).toBe("agent:parent");
+    expect(harness.input("\u001b[D")).toEqual({ consume: true });
+    expect((harness.widget as any).selectedNodeKey).toBe("agent:child");
+    expect(harness.render().join("\n")).toContain("child");
     harness.widget.dispose();
   });
 
-  it("keeps newly added descendants hidden under a collapsed row", () => {
+  it("does not fold agent descendants with left and right", () => {
     const records = [
       makeRecord({ id: "parent", description: "parent", status: "running", completedAt: undefined }),
       makeRecord({ id: "first", description: "first child", status: "running", completedAt: undefined, parentAgentId: "parent" }),
@@ -559,7 +567,11 @@ describe("AgentWidget live records", () => {
     const harness = createNavigableWidgetHarness(records);
 
     harness.input("\u001b[B");
-    harness.input("\u001b[D");
+    expect((harness.widget as any).selectedNodeKey).toBe("agent:parent");
+    expect(harness.input("\u001b[D")).toEqual({ consume: true });
+    expect(harness.render().join("\n")).toContain("first child");
+    expect((harness.widget as any).collapsedKeys).toEqual(new Set());
+
     records.push(makeRecord({
       id: "new",
       description: "new child",
@@ -569,14 +581,15 @@ describe("AgentWidget live records", () => {
     }));
     harness.widget.update();
 
-    const collapsed = harness.render().join("\n");
-    expect(collapsed).not.toContain("first child");
-    expect(collapsed).not.toContain("new child");
-    expect((harness.widget as any).collapsedKeys).toEqual(new Set(["agent:parent"]));
+    expect(harness.render().join("\n")).toContain("first child");
+    expect(harness.render().join("\n")).toContain("new child");
+    expect(harness.input("\u001b[C")).toEqual({ consume: true });
+    expect(harness.render().join("\n")).toContain("new child");
+    expect((harness.widget as any).collapsedKeys).toEqual(new Set());
     harness.widget.dispose();
   });
 
-  it("scopes collapse state to the current session", () => {
+  it("keeps agent descendants visible across session transitions", () => {
     let sessionId = "s1";
     const records = [
       makeRecord({ id: "parent", description: "parent", status: "running", completedAt: undefined, sessionId }),
@@ -585,8 +598,9 @@ describe("AgentWidget live records", () => {
     const harness = createNavigableWidgetHarness(records, { getSessionId: () => sessionId });
 
     harness.input("\u001b[B");
-    harness.input("\u001b[D");
-    expect(harness.render().join("\n")).not.toContain("child");
+    expect(harness.input("\u001b[D")).toEqual({ consume: true });
+    expect(harness.render().join("\n")).toContain("child");
+    expect((harness.widget as any).collapsedKeys.size).toBe(0);
 
     sessionId = "s2";
     for (const record of records) record.sessionId = sessionId;
@@ -795,7 +809,7 @@ describe("re-registration recovery", () => {
     const harness = createNavigableWidgetHarness(records);
     harness.widget.update();
 
-    expect(harness.render().join("\n")).toContain("Agents  ↑↓ select · ←→ fold · enter view · esc back");
+    expect(harness.render().join("\n")).toContain("Agents  ↑↓ select · ←→ workflow fold · enter view · esc back");
     expect(harness.render().join("\n")).not.toMatch(/\/agents (?:re-focus|refocus|re-register)/);
 
     let registrations = 0;

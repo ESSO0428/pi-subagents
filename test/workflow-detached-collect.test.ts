@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { createWorkflowHost } from "../src/workflow/host.js";
 import type { WorkflowEntry } from "../src/workflow/progress.js";
 import type { WorkflowHost } from "../src/workflow/runtime.js";
@@ -97,7 +97,24 @@ describe("a detached launch is not a finished agent", () => {
 
 describe("the host resolves a detached child", () => {
   function fakeManager(record: unknown) {
-    return { getRecord: () => record } as never;
+    return {
+      getRecord: () => record,
+      spawn: vi.fn((_pi: unknown, _ctx: unknown, _type: string, _prompt: string, options: { onSpawned?: (id: string) => void }) => {
+        options.onSpawned?.("child-1");
+        return "child-1";
+      }),
+    } as never;
+  }
+
+  async function launch(host: WorkflowHost): Promise<void> {
+    await host.spawnAgent!({
+      agentId: "child-1",
+      index: 0,
+      prompt: "work",
+      label: "child",
+      agentType: "general-purpose",
+      runInBackground: true,
+    });
   }
 
   it("returns the child's final text once it settles", async () => {
@@ -112,6 +129,7 @@ describe("the host resolves a detached child", () => {
       manager: fakeManager(record),
     });
 
+    await launch(host);
     const out = await host.waitForAgent!("child-1");
     expect(settled).toBe(true);
     expect(out).toEqual({ ok: true, text: "the answer" });
@@ -124,6 +142,7 @@ describe("the host resolves a detached child", () => {
       manager: fakeManager({ promise: Promise.resolve(), error: "rate limited" }),
     });
 
+    await launch(host);
     const out = await host.waitForAgent!("child-1");
     expect(out.ok).toBe(false);
     expect((out as { error?: string }).error).toBe("rate limited");
@@ -139,5 +158,39 @@ describe("the host resolves a detached child", () => {
     const out = await host.waitForAgent!("ghost");
     expect(out.ok).toBe(false);
     expect((out as { error?: string }).error).toContain("ghost");
+  });
+
+  it("does not collect a completed manager record from a foreign handle", async () => {
+    const foreign = { promise: Promise.resolve(), result: "secret foreign result" };
+    const getRecord = vi.fn((id: string) => id === "foreign-record" ? foreign : undefined);
+    const manager = {
+      getRecord,
+      spawn: vi.fn((_pi: unknown, _ctx: unknown, _type: string, _prompt: string, options: { onSpawned?: (id: string) => void }) => {
+        options.onSpawned?.("local-record");
+        return "local-record";
+      }),
+    } as never;
+    const host = createWorkflowHost({
+      pi: {} as never,
+      ctx: { cwd: process.cwd() } as never,
+      manager,
+    });
+
+    await host.spawnAgent!({
+      agentId: "local-handle",
+      index: 0,
+      prompt: "work",
+      label: "local child",
+      agentType: "general-purpose",
+      runInBackground: true,
+    });
+
+    const out = await host.waitForAgent!("foreign-record");
+    expect(out).toEqual({
+      ok: false,
+      error: 'Cannot collect "foreign-record" — no such agent. It may have finished and been dropped already.',
+    });
+    expect(getRecord).not.toHaveBeenCalledWith("foreign-record");
+    expect(foreign.result).toBe("secret foreign result");
   });
 });

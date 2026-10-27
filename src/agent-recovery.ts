@@ -2,14 +2,20 @@
 
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { ensureSubagentsGitignore } from "./agent-history.js";
-import type { AgentInvocation } from "./types.js";
+import type {
+  AgentInvocation,
+  AgentOwnership,
+  AgentRecoveryRuntimeIdentity,
+  AgentRecoverySessionState,
+  WorktreeResumeState,
+} from "./types.js";
 import type { LifetimeUsage } from "./usage.js";
 
 const SUBAGENTS_DIR = ".pi-subagents";
 const CHECKPOINTS_DIR = "agent-checkpoints";
-const CHECKPOINT_VERSION = 1;
+const CHECKPOINT_VERSION = 2;
 const TERMINAL_STATUSES = new Set(["completed", "steered", "stopped", "aborted", "error"] as const);
 const THINKING_LEVELS = new Set(["minimal", "low", "medium", "high", "xhigh", "max", "off"]);
 
@@ -17,7 +23,7 @@ type ActiveStatus = "running" | "queued";
 type TerminalStatus = "completed" | "steered" | "stopped" | "aborted" | "error";
 export type AgentRecoveryStatus = ActiveStatus | TerminalStatus;
 
-export interface AgentRecoveryCheckpoint {
+export interface AgentRecoveryCheckpointV1 {
   version: 1;
   id: string;
   type: string;
@@ -36,14 +42,35 @@ export interface AgentRecoveryCheckpoint {
   parentAgentId?: string;
   /** Nesting depth of a nested child; absent on top-level agents. */
   depth?: number;
-  /**
-   * Session this record was spawned in. Absent on older checkpoints, and
-   * re-stamped with the *current* session when a branch or checkpoint restore
-   * brings the record forward, so "this session" means "present in this session"
-   * rather than "originally spawned here".
-   */
+  /** Session this record belongs to. */
   sessionId?: string;
 }
+
+export interface AgentRecoveryCheckpointV2 {
+  version: 2;
+  id: string;
+  type: string;
+  description: string;
+  status: AgentRecoveryStatus;
+  startedAt: number;
+  completedAt?: number;
+  result?: string;
+  error?: string;
+  resultConsumed?: boolean;
+  toolCallId?: string;
+  toolUses: number;
+  lifetimeUsage: LifetimeUsage;
+  compactionCount: number;
+  transcriptPath?: string;
+  invocation?: AgentInvocation;
+  runtime: AgentRecoveryRuntimeIdentity;
+  session: AgentRecoverySessionState;
+  ownership: AgentOwnership;
+  worktree?: WorktreeResumeState;
+}
+
+/** Valid checkpoints. V1 is intentionally display/history-only. */
+export type AgentRecoveryCheckpoint = AgentRecoveryCheckpointV1 | AgentRecoveryCheckpointV2;
 
 function isSafeString(value: unknown, maxLength: number): value is string {
   return typeof value === "string" && value.length > 0 && value.length <= maxLength && !/[\0\r\n]/.test(value);
@@ -94,37 +121,132 @@ function isSafeTranscriptPath(value: unknown): value is string {
     && !value.includes("\0");
 }
 
-/** Validate untrusted JSON before it can enter the manager or UI. */
-export function isAgentRecoveryCheckpoint(value: unknown): value is AgentRecoveryCheckpoint {
+function isSafeAbsolutePath(value: unknown): value is string {
+  return isSafeString(value, 4096) && isAbsolute(value);
+}
+
+function isSafePrivateLocator(value: unknown): value is string {
+  return typeof value === "string"
+    && /^\.pi-subagents\/agent-sessions\/[A-Za-z0-9_-]+\.jsonl$/.test(value)
+    && !value.includes("..")
+    && !value.includes("\\")
+    && !value.includes("\0");
+}
+
+function isRuntimeIdentity(value: unknown): value is AgentRecoveryRuntimeIdentity {
+  if (!value || typeof value !== "object") return false;
+  const runtime = value as Record<string, unknown>;
+  if (!Number.isInteger(runtime.depth) || (runtime.depth as number) < 0) return false;
+  if (!Number.isInteger(runtime.maxSubagentDepth) || (runtime.maxSubagentDepth as number) < 0) return false;
+  if ((runtime.maxSubagentDepth as number) < (runtime.depth as number)) return false;
+  return runtime.rootSessionId === undefined || isSafeString(runtime.rootSessionId, 256);
+}
+
+function isSessionState(value: unknown): value is AgentRecoverySessionState {
+  if (!value || typeof value !== "object") return false;
+  const session = value as Record<string, unknown>;
+  if (session.kind === "pending") return true;
+  if (session.kind !== "memory" && session.kind !== "explicit" && session.kind !== "private") return false;
+  if (!isSafeAbsolutePath(session.artifactRootCwd)
+    || !isSafeAbsolutePath(session.resourceCwd)
+    || !isSafeAbsolutePath(session.originalExecutionCwd)) return false;
+  if (session.kind !== "private") return true;
+  return isSafePrivateLocator(session.locator)
+    && isSafeString(session.sessionId, 256)
+    && isSafeString(session.provider, 256)
+    && isSafeString(session.modelId, 512)
+    && typeof session.thinking === "string"
+    && THINKING_LEVELS.has(session.thinking);
+}
+
+function isOwnership(value: unknown): value is AgentOwnership {
+  if (!value || typeof value !== "object") return false;
+  const ownership = value as Record<string, unknown>;
+  if (ownership.kind === "top-level") return true;
+  if (ownership.kind === "nested") {
+    return isSafeString(ownership.parentAgentId, 256)
+      && Number.isInteger(ownership.depth)
+      && (ownership.depth as number) >= 0;
+  }
+  if (ownership.kind === "workflow") {
+    return isSafeString(ownership.workflowId, 256)
+      && (ownership.depth === undefined || (Number.isInteger(ownership.depth) && (ownership.depth as number) >= 0));
+  }
+  return false;
+}
+
+function isSafeTargetSubdirectory(value: unknown): value is string {
+  if (typeof value !== "string" || value.includes("\\") || value.includes("\0") || value.includes("\r") || value.includes("\n") || isAbsolute(value)) return false;
+  if (!value) return true;
+  const segments = value.split("/");
+  return segments.every((segment) => segment.length > 0 && segment !== "." && segment !== "..");
+}
+
+function isCommitSha(value: unknown): value is string {
+  return typeof value === "string" && /^[0-9a-f]{40}$/i.test(value);
+}
+
+function isWorktreeResumeState(value: unknown): value is WorktreeResumeState {
+  if (!value || typeof value !== "object") return false;
+  const worktree = value as Record<string, unknown>;
+  return isSafeAbsolutePath(worktree.repoRoot)
+    && isCommitSha(worktree.baseCommitSha)
+    && (worktree.savedCommitSha === undefined || isCommitSha(worktree.savedCommitSha))
+    && isSafeTargetSubdirectory(worktree.originalTargetSubdirectory);
+}
+
+function isCommonCheckpoint(value: Record<string, unknown>): boolean {
+  if (!isSafeString(value.id, 256)
+    || !isSafeString(value.type, 256)
+    || !isSafeString(value.description, 4096)
+    || typeof value.status !== "string"
+    || !isFiniteTimestamp(value.startedAt)
+    || !Number.isInteger(value.toolUses)
+    || (value.toolUses as number) < 0
+    || !isUsage(value.lifetimeUsage)
+    || !Number.isInteger(value.compactionCount)
+    || (value.compactionCount as number) < 0) return false;
+
+  const status = value.status as AgentRecoveryStatus;
+  if (!isActiveStatus(status) && !isTerminalStatus(status)) return false;
+  if (value.completedAt !== undefined && !isFiniteTimestamp(value.completedAt)) return false;
+  if (isTerminalStatus(status)
+    && (value.completedAt === undefined || value.completedAt < (value.startedAt as number))) return false;
+  if (isActiveStatus(status) && value.completedAt !== undefined) return false;
+  if (value.result !== undefined && !isSafeString(value.result, 2_000_000)) return false;
+  if (value.error !== undefined && !isSafeString(value.error, 64_000)) return false;
+  if (value.transcriptPath !== undefined && !isSafeTranscriptPath(value.transcriptPath)) return false;
+  if (value.invocation !== undefined && !isInvocation(value.invocation)) return false;
+  return true;
+}
+
+/** Strict v1 reader used only for display/history recovery. */
+export function isAgentRecoveryCheckpointV1(value: unknown): value is AgentRecoveryCheckpointV1 {
   if (!value || typeof value !== "object") return false;
   const checkpoint = value as Record<string, unknown>;
-  if (checkpoint.version !== CHECKPOINT_VERSION
-    || !isSafeString(checkpoint.id, 256)
-    || !isSafeString(checkpoint.type, 256)
-    || !isSafeString(checkpoint.description, 4096)
-    || typeof checkpoint.status !== "string"
-    || !isFiniteTimestamp(checkpoint.startedAt)
-    || !Number.isInteger(checkpoint.toolUses)
-    || (checkpoint.toolUses as number) < 0
-    || !isUsage(checkpoint.lifetimeUsage)
-    || !Number.isInteger(checkpoint.compactionCount)
-    || (checkpoint.compactionCount as number) < 0) return false;
-
+  if (checkpoint.version !== 1 || !isCommonCheckpoint(checkpoint)) return false;
   if (checkpoint.parentAgentId !== undefined && !isSafeString(checkpoint.parentAgentId, 256)) return false;
   if (checkpoint.sessionId !== undefined && !isSafeString(checkpoint.sessionId, 256)) return false;
-  if (checkpoint.depth !== undefined && (!Number.isInteger(checkpoint.depth) || (checkpoint.depth as number) < 0)) return false;
+  return checkpoint.depth === undefined
+    || (Number.isInteger(checkpoint.depth) && (checkpoint.depth as number) >= 0);
+}
 
-  const status = checkpoint.status as AgentRecoveryStatus;
-  if (!isActiveStatus(status) && !isTerminalStatus(status)) return false;
-  if (checkpoint.completedAt !== undefined && !isFiniteTimestamp(checkpoint.completedAt)) return false;
-  if (isTerminalStatus(status)
-    && (checkpoint.completedAt === undefined || checkpoint.completedAt < checkpoint.startedAt)) return false;
-  if (isActiveStatus(status) && checkpoint.completedAt !== undefined) return false;
-  if (checkpoint.result !== undefined && !isSafeString(checkpoint.result, 2_000_000)) return false;
-  if (checkpoint.error !== undefined && !isSafeString(checkpoint.error, 64_000)) return false;
-  if (checkpoint.transcriptPath !== undefined && !isSafeTranscriptPath(checkpoint.transcriptPath)) return false;
-  if (checkpoint.invocation !== undefined && !isInvocation(checkpoint.invocation)) return false;
-  return true;
+/** Validate the executable-capable v2 envelope without opening any session. */
+export function isAgentRecoveryCheckpointV2(value: unknown): value is AgentRecoveryCheckpointV2 {
+  if (!value || typeof value !== "object") return false;
+  const checkpoint = value as Record<string, unknown>;
+  if (checkpoint.version !== CHECKPOINT_VERSION || !isCommonCheckpoint(checkpoint)) return false;
+  if (checkpoint.resultConsumed !== undefined && typeof checkpoint.resultConsumed !== "boolean") return false;
+  if (checkpoint.toolCallId !== undefined && !isSafeString(checkpoint.toolCallId, 512)) return false;
+  return isRuntimeIdentity(checkpoint.runtime)
+    && isSessionState(checkpoint.session)
+    && isOwnership(checkpoint.ownership)
+    && (checkpoint.worktree === undefined || isWorktreeResumeState(checkpoint.worktree));
+}
+
+/** Validate either supported checkpoint version. Future/corrupt values fail closed. */
+export function isAgentRecoveryCheckpoint(value: unknown): value is AgentRecoveryCheckpoint {
+  return isAgentRecoveryCheckpointV1(value) || isAgentRecoveryCheckpointV2(value);
 }
 
 function checkpointDirectory(cwd: string): string {
@@ -137,11 +259,7 @@ export function agentRecoveryCheckpointPath(cwd: string, agentId: string): strin
   return join(checkpointDirectory(cwd), `${safeId}.json`);
 }
 
-/**
- * Atomically write one checkpoint. Repeated writes for the same agent replace
- * the same file; identical payloads are skipped, so shutdown + abort callbacks
- * cannot create duplicate recovery records.
- */
+/** Remove one checkpoint, retaining the historical best-effort behavior. */
 export function removeAgentRecoveryCheckpoint(cwd: string, agentId: string): boolean {
   try {
     unlinkSync(agentRecoveryCheckpointPath(cwd, agentId));
@@ -151,6 +269,11 @@ export function removeAgentRecoveryCheckpoint(cwd: string, agentId: string): boo
   }
 }
 
+/**
+ * Atomically write one checkpoint. Repeated writes for the same agent replace
+ * the same file; identical payloads are skipped, so shutdown + abort callbacks
+ * cannot create duplicate recovery records.
+ */
 export function writeAgentRecoveryCheckpoint(cwd: string, checkpoint: AgentRecoveryCheckpoint): boolean {
   if (!isAgentRecoveryCheckpoint(checkpoint)) return false;
   try {
@@ -175,7 +298,7 @@ export function writeAgentRecoveryCheckpoint(cwd: string, checkpoint: AgentRecov
   }
 }
 
-/** Load valid checkpoints, ignoring orphan, malformed, and corrupt files. */
+/** Load valid checkpoints, ignoring orphan, malformed, and future files. */
 export function readAgentRecoveryCheckpoints(cwd: string): AgentRecoveryCheckpoint[] {
   const directory = checkpointDirectory(cwd);
   if (!existsSync(directory)) return [];
@@ -193,7 +316,7 @@ export function readAgentRecoveryCheckpoints(cwd: string): AgentRecoveryCheckpoi
       if (!isAgentRecoveryCheckpoint(value)) continue;
       latest.set(value.id, value);
     } catch {
-      // Ignore a partially written/corrupt checkpoint and continue indexing.
+      // Ignore a partially written/corrupt/future checkpoint and continue indexing.
     }
   }
   return [...latest.values()];

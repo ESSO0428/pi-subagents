@@ -15,6 +15,7 @@
  */
 
 import { randomUUID } from "node:crypto";
+import { canonicalArtifactRootCwd } from "../agent-session-storage.js";
 import type { WorkflowTreeRoot } from "../types.js";
 import type { WorkflowJournalEntry } from "./journal.js";
 import type { WorkflowMeta } from "./meta.js";
@@ -64,6 +65,10 @@ export interface WorkflowTask {
   /** When the current pause started, so `totalPausedMs` can be closed out. */
   pausedAt?: number;
 
+  /** Canonical stable project root used for display-only terminal history. */
+  artifactRootCwd: string;
+  /** Root Pi session that started this run; absent means history-only. */
+  rootSessionId?: string;
   /** Where this run records its own settled calls, for a later resume. */
   journalPath?: string;
   /** A previous run's journal, when this call asked to resume one. */
@@ -108,6 +113,8 @@ export function createWorkflowTask(init: {
   args?: unknown;
   meta?: WorkflowMeta;
   toolCallId?: string;
+  artifactRootCwd: string;
+  rootSessionId?: string;
   startTime?: number;
   journalPath?: string;
   replay?: readonly WorkflowJournalEntry[];
@@ -123,6 +130,8 @@ export function createWorkflowTask(init: {
     meta: init.meta,
     workflowName: init.meta?.name,
     toolCallId: init.toolCallId,
+    artifactRootCwd: canonicalArtifactRootCwd(init.artifactRootCwd),
+    rootSessionId: init.rootSessionId,
     journalPath: init.journalPath,
     replay: init.replay,
     resumedFrom: init.resumedFrom,
@@ -156,6 +165,8 @@ export function createWorkflowTask(init: {
  */
 export function toWorkflowTreeRoot(task: WorkflowTask): WorkflowTreeRoot {
   return {
+    artifactRootCwd: canonicalArtifactRootCwd(task.artifactRootCwd),
+    ...(task.rootSessionId !== undefined ? { rootSessionId: task.rootSessionId } : {}),
     id: task.id,
     name: task.workflowName ?? task.id,
     description: task.meta?.description ?? task.workflowName ?? task.id,

@@ -7,24 +7,63 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { existsSync, statSync } from "node:fs";
-import { isAbsolute } from "node:path";
+import { existsSync, realpathSync, rmSync, statSync } from "node:fs";
+import { isAbsolute, join, relative, sep } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
 import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { agentHistoryLocator, createAgentHistoryPath, readAgentHistory } from "./agent-history.js";
 import {
   type AgentRecoveryCheckpoint,
   type AgentRecoveryStatus,
+  agentRecoveryCheckpointPath,
   readAgentRecoveryCheckpoints,
   removeAgentRecoveryCheckpoint,
   writeAgentRecoveryCheckpoint,
 } from "./agent-recovery.js";
-import { resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
-import type { NestedSpawnOptions } from "./nested-tools.js";
+import {
+  type AgentResumeRuntimeFactory,
+  type AgentSessionMetadata,
+  type PreparedChildSession,
+  resumeAgent,
+  runAgent,
+  type ToolActivity,
+} from "./agent-runner.js";
+import {
+  canonicalArtifactRootCwd,
+  ResumeStorageError,
+  resolvePrivateSessionLocator,
+} from "./agent-session-storage.js";
+import { getMaxSubagentDepth, type NestedSpawnOptions } from "./nested-tools.js";
 import { streamToOutputFile, writeInitialEntry } from "./output-file.js";
-import type { AgentInvocation, AgentRecord, IsolationMode, SubagentType, ThinkingLevel } from "./types.js";
+import type {
+  AgentInvocation,
+  AgentOwnership,
+  AgentRecord,
+  AgentRecoveryRuntimeIdentity,
+  AgentRecoverySessionState,
+  IsolationMode,
+  SubagentType,
+  ThinkingLevel,
+  WorktreeResumeState,
+} from "./types.js";
 import { addUsage } from "./usage.js";
-import { cleanupWorktree, createWorktree, pruneWorktrees, } from "./worktree.js";
+import {
+  cleanupWorktree,
+  createDetachedWorktree,
+  createWorktree,
+  getCanonicalRepoRoot,
+  pruneWorktrees,
+  removeWorktree,
+  validateWorktreeTargetPath,
+  verifyCommitSha,
+  WorktreeError,
+  type WorktreeInfo,
+} from "./worktree.js";
+
+export interface ReconstructedWorktree {
+  worktree: WorktreeInfo;
+  executionCwd: string;
+}
 
 export type OnAgentComplete = (record: AgentRecord) => void;
 export type OnAgentStart = (record: AgentRecord) => void;
@@ -159,11 +198,39 @@ interface SpawnArgs {
   options: SpawnOptions;
 }
 
+export type ResumeAuthority =
+  | { kind: "top-level"; artifactRootCwd: string }
+  | { kind: "nested"; artifactRootCwd: string; parentAgentId: string }
+  | { kind: "workflow"; artifactRootCwd: string; workflowId: string; runtimeAgentId: string };
+
+export type AgentResumeErrorCode =
+  | "resume-checkpoint-missing"
+  | "resume-checkpoint-invalid"
+  | "resume-session-locator-invalid"
+  | "resume-session-missing"
+  | "resume-session-corrupt"
+  | "resume-session-incompatible"
+  | "resume-model-unavailable"
+  | "resume-invalid-options"
+  | "resume-busy"
+  | "resume-worktree-missing-cwd"
+  | "resume-worktree-invalid-ref"
+  | "resume-ownership-denied";
+
+export class AgentResumeError extends Error {
+  constructor(public readonly code: AgentResumeErrorCode, message: string) {
+    super(`${code}: ${message}`);
+    this.name = "AgentResumeError";
+  }
+}
+
 export interface ResumeOptions {
   /** Whether the resumed turn runs detached and produces a completion notification. */
   isBackground?: boolean;
   /** Abort only this resumed turn. */
   signal?: AbortSignal;
+  /** The originating Agent tool call, committed only after preflight succeeds. */
+  toolCallId?: string;
 }
 
 export interface SpawnOptions extends Partial<Omit<NestedSpawnOptions, "description" | "signal" | "onAssistantUsage" | "onSessionCreated">> {
@@ -193,6 +260,10 @@ export interface SpawnOptions extends Partial<Omit<NestedSpawnOptions, "descript
    * branch lands in that repo.
    */
   cwd?: string;
+  /** Stable project root for durable artifacts and private native sessions. */
+  artifactRootCwd?: string;
+  /** Persisted owner used by resume authority checks. */
+  ownership?: AgentOwnership;
   /** Resolved invocation snapshot captured for UI display. */
   invocation?: AgentInvocation;
   /** Parent abort signal — when aborted, the subagent is also stopped. */
@@ -227,6 +298,8 @@ export class AgentManager {
   private worktreeRepos = new Set<string>();
   /** Project cwd for each record's durable checkpoint. */
   private recoveryCwds = new Map<string, string>();
+  /** Legacy v1 checkpoints are display-only and must never be rewritten as v2. */
+  private displayOnlyCheckpointIds = new Set<string>();
 
   /** Queue of background agents waiting to start. */
   private queue: { id: string; args: SpawnArgs }[] = [];
@@ -234,6 +307,8 @@ export class AgentManager {
   private runningBackground = 0;
   /** Prevent late promise settlement from decrementing a replacement run. */
   private runningBackgroundIds = new Set<string>();
+  /** Fresh resume worktrees awaiting later runtime preparation or cleanup. */
+  private reconstructedWorktrees = new Map<string, { repoRoot: string; worktree: WorktreeInfo }>();
 
   constructor(
     onComplete?: OnAgentComplete,
@@ -261,6 +336,49 @@ export class AgentManager {
     return this.maxConcurrent;
   }
 
+  /** Reconstruct a fresh worktree; policy and ownership remain in the manager. */
+  reconstructResumeWorktree(state: WorktreeResumeState | undefined, agentId: string): ReconstructedWorktree {
+    if (!state) throw new WorktreeError("resume-worktree-missing-cwd", "worktree state is missing");
+    this.removeReconstructedWorktree(agentId);
+
+    const repoRoot = getCanonicalRepoRoot(state.repoRoot, "resume-worktree-missing-cwd", true);
+    const baseSha = verifyCommitSha(repoRoot, state.baseCommitSha);
+    const sourceSha = state.savedCommitSha === undefined
+      ? baseSha
+      : verifyCommitSha(repoRoot, state.savedCommitSha);
+    validateWorktreeTargetPath(repoRoot, state.originalTargetSubdirectory);
+    const worktree = createDetachedWorktree(repoRoot, sourceSha, state.originalTargetSubdirectory, agentId);
+    try {
+      const requestedExecutionCwd = join(worktree.path, state.originalTargetSubdirectory.split("/").join(sep));
+      const executionCwd = realpathSync(requestedExecutionCwd);
+      if (!statSync(executionCwd).isDirectory()) {
+        throw new WorktreeError("resume-worktree-missing-cwd", "fresh execution cwd is not a directory");
+      }
+      const executionRelative = relative(realpathSync(worktree.path), executionCwd);
+      if (executionRelative.startsWith(`..${sep}`) || executionRelative === ".." || isAbsolute(executionRelative)) {
+        throw new WorktreeError("resume-worktree-missing-cwd", "fresh execution cwd escaped the worktree");
+      }
+      const reconstructed = { worktree, executionCwd };
+      this.reconstructedWorktrees.set(agentId, { repoRoot, worktree });
+      return reconstructed;
+    } catch (error) {
+      removeWorktree(repoRoot, worktree);
+      if (error instanceof WorktreeError) throw error;
+      throw new WorktreeError("resume-worktree-missing-cwd", "fresh execution cwd is unavailable");
+    }
+  }
+
+  /** Idempotently remove a fresh resume worktree after preparation failure. */
+  removeReconstructedWorktree(agentId: string): void {
+    const tracked = this.reconstructedWorktrees.get(agentId);
+    if (!tracked) return;
+    try {
+      removeWorktree(tracked.repoRoot, tracked.worktree);
+    } finally {
+      this.reconstructedWorktrees.delete(agentId);
+    }
+  }
+
   private finishBackground(id: string): void {
     if (!this.runningBackgroundIds.delete(id)) return;
     this.runningBackground = Math.max(0, this.runningBackground - 1);
@@ -271,8 +389,20 @@ export class AgentManager {
   }
 
   private makeCheckpoint(record: AgentRecord): AgentRecoveryCheckpoint {
-    const checkpoint: AgentRecoveryCheckpoint = {
-      version: 1,
+    const depth = record.runtimeIdentity?.depth ?? record.depth ?? 1;
+    const runtime: AgentRecoveryRuntimeIdentity = {
+      depth,
+      maxSubagentDepth: record.runtimeIdentity?.maxSubagentDepth ?? record.maxSubagentDepth ?? depth,
+      ...(record.runtimeIdentity?.rootSessionId ?? record.rootSessionId
+        ? { rootSessionId: record.runtimeIdentity?.rootSessionId ?? record.rootSessionId }
+        : {}),
+    };
+    const ownership: AgentOwnership = record.ownership ?? (record.parentAgentId
+      ? { kind: "nested", parentAgentId: record.parentAgentId, depth }
+      : { kind: "top-level" });
+    const session: AgentRecoverySessionState = record.sessionState ?? { kind: "pending" };
+    return {
+      version: 2,
       id: record.id,
       type: record.type,
       description: record.description,
@@ -286,18 +416,19 @@ export class AgentManager {
       // Avoid duplicating potentially sensitive or very large result text.
       ...(!record.transcriptPath && record.result !== undefined && { result: record.result }),
       ...(record.error !== undefined && { error: record.error }),
+      ...(record.resultConsumed !== undefined && { resultConsumed: record.resultConsumed }),
+      ...(record.toolCallId !== undefined && { toolCallId: record.toolCallId }),
       ...(record.transcriptPath !== undefined && { transcriptPath: record.transcriptPath }),
       ...(record.invocation !== undefined && { invocation: cloneInvocation(record.invocation) }),
-      // Without these a reload rebuilds every agent as a root and the roster
-      // flattens, because nothing on disk records the nesting.
-      ...(record.parentAgentId !== undefined && { parentAgentId: record.parentAgentId }),
-      ...(record.depth !== undefined && { depth: record.depth }),
-      ...(record.sessionId !== undefined && { sessionId: record.sessionId }),
+      runtime,
+      session,
+      ownership,
+      ...(record.worktreeResume !== undefined && { worktree: record.worktreeResume }),
     };
-    return checkpoint;
   }
 
   private checkpoint(record: AgentRecord): void {
+    if (this.displayOnlyCheckpointIds.has(record.id)) return;
     const cwd = this.recoveryCwds.get(record.id);
     if (!cwd) return;
     writeAgentRecoveryCheckpoint(cwd, this.makeCheckpoint(record));
@@ -307,6 +438,13 @@ export class AgentManager {
     if (!record.outputCleanup) return;
     try { record.outputCleanup(); } catch { /* recovery must remain best effort */ }
     record.outputCleanup = undefined;
+  }
+
+  private applyWorktreeCleanup(record: AgentRecord, result: ReturnType<typeof cleanupWorktree>): void {
+    record.worktreeResult = result;
+    if (result.savedCommitSha && record.worktreeResume) {
+      record.worktreeResume.savedCommitSha = result.savedCommitSha;
+    }
   }
 
   /**
@@ -364,9 +502,16 @@ export class AgentManager {
    * SIGKILL cannot run a final flush/checkpoint, so this active snapshot is
    * necessarily the last recoverable state.
    */
-  restoreRecovered(cwd: string): void {
+  restoreRecovered(cwd: string, sessionId?: string): void {
     for (const checkpoint of readAgentRecoveryCheckpoints(cwd)) {
-      if (!checkpoint.transcriptPath || !readAgentHistory(cwd, checkpoint.transcriptPath)) continue;
+      if (checkpoint.version === 1) this.displayOnlyCheckpointIds.add(checkpoint.id);
+      else this.displayOnlyCheckpointIds.delete(checkpoint.id);
+      const hasTranscript = checkpoint.transcriptPath !== undefined
+        && readAgentHistory(cwd, checkpoint.transcriptPath) !== undefined;
+      // V1 is display/history-only. A valid v2 private checkpoint has an
+      // independent executable native session and must survive without a
+      // transcript file; every other transcript-less record remains hidden.
+      if (!hasTranscript && !(checkpoint.version === 2 && checkpoint.session.kind === "private")) continue;
       const status: RestorableAgentStatus = checkpoint.status === "running" || checkpoint.status === "queued"
         ? "stopped"
         : checkpoint.status;
@@ -379,18 +524,60 @@ export class AgentManager {
         if (!existing.transcriptPath && checkpoint.transcriptPath) {
           existing.transcriptPath = checkpoint.transcriptPath;
         }
+        if (checkpoint.version === 2 && !existing.session) {
+          existing.sessionState = checkpoint.session;
+          existing.ownership = checkpoint.ownership;
+          existing.runtimeIdentity = checkpoint.runtime;
+          existing.artifactRootCwd = checkpoint.session.kind === "pending" ? undefined : checkpoint.session.artifactRootCwd;
+          existing.resourceCwd = checkpoint.session.kind === "pending" ? undefined : checkpoint.session.resourceCwd;
+          existing.originalExecutionCwd = checkpoint.session.kind === "pending" ? undefined : checkpoint.session.originalExecutionCwd;
+          existing.worktreeResume = checkpoint.worktree;
+          existing.parentAgentId = checkpoint.ownership.kind === "nested"
+            ? checkpoint.ownership.parentAgentId
+            : checkpoint.ownership.kind === "workflow"
+              ? checkpoint.ownership.workflowId
+              : existing.parentAgentId;
+          existing.depth = checkpoint.runtime.depth;
+          existing.maxSubagentDepth = checkpoint.runtime.maxSubagentDepth;
+          existing.rootSessionId = checkpoint.runtime.rootSessionId;
+        }
         this.recoveryCwds.set(checkpoint.id, cwd);
         continue;
       }
-      // No session stamp here: these files are project-level and mix every
-      // session that ever ran in this directory. Re-stamping them would make
-      // "this session" mean "everything", which is the thing the scope exists to
-      // avoid. Records with no stamp stay reachable under the all-sessions entry.
-      this.agents.set(checkpoint.id, this.createRestoredRecord({
-        ...checkpoint,
-        status,
-        completedAt,
-      }));
+      const restored = checkpoint.version === 2
+        ? {
+            ...checkpoint,
+            status,
+            completedAt,
+            parentAgentId: checkpoint.ownership.kind === "nested"
+              ? checkpoint.ownership.parentAgentId
+              : checkpoint.ownership.kind === "workflow"
+                ? checkpoint.ownership.workflowId
+                : undefined,
+            depth: checkpoint.runtime.depth,
+            maxSubagentDepth: checkpoint.runtime.maxSubagentDepth,
+            rootSessionId: checkpoint.runtime.rootSessionId,
+            sessionState: checkpoint.session,
+            ownership: checkpoint.ownership,
+            runtimeIdentity: checkpoint.runtime,
+            artifactRootCwd: checkpoint.session.kind === "pending" ? undefined : checkpoint.session.artifactRootCwd,
+            resourceCwd: checkpoint.session.kind === "pending" ? undefined : checkpoint.session.resourceCwd,
+            originalExecutionCwd: checkpoint.session.kind === "pending" ? undefined : checkpoint.session.originalExecutionCwd,
+            worktreeResume: checkpoint.worktree,
+            ...(sessionId !== undefined && checkpoint.runtime.rootSessionId === sessionId
+              ? { sessionId }
+              : {}),
+          }
+        : {
+            ...checkpoint,
+            status,
+            completedAt,
+          };
+      // Checkpoint files are project-level and mix every session that ever ran
+      // in this directory. Only a v2 root session or the original v1 session
+      // identity that exactly matches the active runtime session enters the
+      // current-session projection; older or unknown records remain history-only.
+      this.agents.set(checkpoint.id, this.createRestoredRecord(restored));
       this.recoveryCwds.set(checkpoint.id, cwd);
     }
   }
@@ -413,6 +600,19 @@ export class AgentManager {
 
     const id = randomUUID().slice(0, 17);
     const abortController = new AbortController();
+    const artifactRootCwd = canonicalArtifactRootCwd(options.artifactRootCwd ?? ctx.cwd);
+    const depth = options.depth ?? 1;
+    const maxDepth = options.maxSubagentDepth ?? getMaxSubagentDepth();
+    const runtimeIdentity: AgentRecoveryRuntimeIdentity = {
+      depth,
+      maxSubagentDepth: maxDepth,
+      ...(options.rootSessionId ?? ctx.sessionManager?.getSessionId?.()
+        ? { rootSessionId: options.rootSessionId ?? ctx.sessionManager?.getSessionId?.() }
+        : {}),
+    };
+    const ownership: AgentOwnership = options.ownership ?? (options.parentAgentId
+      ? { kind: "nested", parentAgentId: options.parentAgentId, depth }
+      : { kind: "top-level" });
     const record: AgentRecord = {
       id,
       type,
@@ -430,12 +630,18 @@ export class AgentManager {
       // have no inline surface — stay visible instead of vanishing.
       isBackground: options.isBackground,
       invocation: options.invocation,
-      depth: options.depth ?? 1,
+      depth,
       parentAgentId: options.parentAgentId,
+      ownership,
+      runtimeIdentity,
+      artifactRootCwd,
+      resourceCwd: options.configCwd ?? ctx.cwd,
+      originalExecutionCwd: options.cwd ?? ctx.cwd,
       parentDescription: options.parentAgentId ? this.agents.get(options.parentAgentId)?.description : undefined,
-      maxSubagentDepth: options.maxSubagentDepth,
+      maxSubagentDepth: maxDepth,
       rootSessionId: options.rootSessionId ?? ctx.sessionManager?.getSessionId?.(),
       sessionId: options.sessionId ?? ctx.sessionManager?.getSessionId?.(),
+      sessionState: { kind: "pending" },
       liveActivity: {
         activeTools: new Map(),
         responseText: "",
@@ -445,16 +651,16 @@ export class AgentManager {
       },
     };
     this.agents.set(id, record);
-    this.recoveryCwds.set(id, ctx.cwd);
+    this.recoveryCwds.set(id, artifactRootCwd);
     // Durable history is a manager invariant: it exists before queue/start and
     // before the external callback can expose the id to another subsystem.
     try {
-      this.attachDurableHistory(record, prompt, ctx.cwd);
+      this.attachDurableHistory(record, prompt, artifactRootCwd);
       options.onSpawned?.(id);
     } catch (err) {
       this.agents.delete(id);
       this.recoveryCwds.delete(id);
-      removeAgentRecoveryCheckpoint(ctx.cwd, id);
+      removeAgentRecoveryCheckpoint(artifactRootCwd, id);
       throw err;
     }
 
@@ -462,7 +668,7 @@ export class AgentManager {
 
     // Nested children never consume or wait for a top-level concurrency slot;
     // queueing behind the parent would deadlock an inline nested spawn.
-    if (options.isBackground && !options.parentAgentId && !options.bypassQueue && this.runningBackground >= this.maxConcurrent) {
+    if (options.isBackground && ownership.kind === "top-level" && !options.bypassQueue && this.runningBackground >= this.maxConcurrent) {
       // Queue it — will be started when a running agent completes
       this.queue.push({ id, args });
       return id;
@@ -475,7 +681,7 @@ export class AgentManager {
     } catch (err) {
       this.agents.delete(id);
       this.recoveryCwds.delete(id);
-      removeAgentRecoveryCheckpoint(ctx.cwd, id);
+      removeAgentRecoveryCheckpoint(artifactRootCwd, id);
       throw err;
     }
     return id;
@@ -505,6 +711,13 @@ export class AgentManager {
         );
       }
       record.worktree = wt;
+      if (typeof wt.repoRoot === "string" && typeof wt.originalTargetSubdirectory === "string") {
+        record.worktreeResume = {
+          repoRoot: wt.repoRoot,
+          baseCommitSha: wt.baseSha,
+          originalTargetSubdirectory: customCwd !== undefined ? wt.originalTargetSubdirectory : "",
+        };
+      }
       // workPath preserves subdirectory scoping for caller-supplied cwds: a
       // cwd deep in a monorepo maps to the same subdir inside the copy, not
       // the copied repo's root. Plain worktree spawns keep the historical
@@ -512,13 +725,13 @@ export class AgentManager {
       // also move .pi config discovery when the parent session sits in a repo
       // subdirectory, silently dropping extensions/skills.
       worktreeCwd = customCwd !== undefined ? wt.workPath : wt.path;
-      this.worktreeRepos.add(baseCwd);
+      this.worktreeRepos.add(wt.repoRoot ?? baseCwd);
     }
 
     record.status = "running";
     record.startedAt = Date.now();
     this.checkpoint(record);
-    if (options.isBackground && !options.parentAgentId) {
+    if (options.isBackground && this.persistedOwnership(record).kind === "top-level") {
       this.runningBackground++;
       this.runningBackgroundIds.add(id);
     }
@@ -533,7 +746,9 @@ export class AgentManager {
     }
     const detach = () => { detachParentSignal?.(); detachParentSignal = undefined; };
 
-    const promise = runAgent(ctx, type, prompt, {
+    let agentPromise: ReturnType<typeof runAgent>;
+    try {
+      agentPromise = runAgent(ctx, type, prompt, {
       pi,
       agentId: id,
       model: options.model,
@@ -547,7 +762,36 @@ export class AgentManager {
       // stay undefined otherwise so plain worktree runs keep resolving config
       // (incl. relative extension paths and memory) inside the worktree copy.
       cwd: worktreeCwd ?? customCwd,
-      configCwd: customCwd !== undefined ? ctx.cwd : undefined,
+      configCwd: customCwd !== undefined ? (record.resourceCwd ?? ctx.cwd) : undefined,
+      artifactRootCwd: record.artifactRootCwd ?? ctx.cwd,
+      originalExecutionCwd: record.originalExecutionCwd ?? customCwd ?? ctx.cwd,
+      runtimeIdentity: record.runtimeIdentity ?? {
+        depth: record.depth ?? 1,
+        maxSubagentDepth: record.maxSubagentDepth ?? record.depth ?? 1,
+        ...(record.rootSessionId ? { rootSessionId: record.rootSessionId } : {}),
+      },
+      ownership: record.ownership ?? (record.parentAgentId
+        ? { kind: "nested", parentAgentId: record.parentAgentId, depth: record.depth ?? 1 }
+        : { kind: "top-level" }),
+      rootSessionId: record.rootSessionId,
+      onSessionMetadata: (metadata: AgentSessionMetadata) => {
+        const persistedMetadata = record.worktree
+          ? {
+              ...metadata,
+              resourceCwd: ctx.cwd,
+              sessionState: metadata.sessionState.kind === "pending"
+                ? metadata.sessionState
+                : { ...metadata.sessionState, resourceCwd: ctx.cwd },
+            }
+          : metadata;
+        record.sessionState = persistedMetadata.sessionState;
+        record.runtimeIdentity = persistedMetadata.runtimeIdentity;
+        record.ownership = persistedMetadata.ownership;
+        record.artifactRootCwd = persistedMetadata.artifactRootCwd;
+        record.resourceCwd = persistedMetadata.resourceCwd;
+        record.originalExecutionCwd = persistedMetadata.originalExecutionCwd;
+        this.checkpoint(record);
+      },
       signal: record.abortController!.signal,
       onToolActivity: (activity) => {
         const live = record.liveActivity;
@@ -588,9 +832,10 @@ export class AgentManager {
         manager: this,
         parentAgentId: id,
         depth: record.depth ?? 1,
-        maxSubagentDepth: options.maxSubagentDepth,
+        maxSubagentDepth: record.runtimeIdentity?.maxSubagentDepth ?? options.maxSubagentDepth,
+        rootSessionId: record.runtimeIdentity?.rootSessionId ?? record.rootSessionId,
       },
-      nestedSession: options.parentAgentId !== undefined,
+      nestedSession: record.ownership?.kind === "nested" || options.parentAgentId !== undefined,
       onSessionCreated: (session) => {
         record.session = session;
         if (record.liveActivity) record.liveActivity.session = session;
@@ -609,11 +854,25 @@ export class AgentManager {
         }
         // Subscribe before the external callback so history does not depend on
         // any particular adapter's callback ordering or output setting.
-        this.attachTranscriptStream(record, session, ctx.cwd);
+        this.attachTranscriptStream(record, session, record.artifactRootCwd ?? ctx.cwd);
         options.onSessionCreated?.(session);
         this.checkpoint(record);
       },
-    })
+      });
+    } catch (err) {
+      detach();
+      if (record.worktree) {
+        try {
+          const cleanupCwd = record.worktreeResume?.repoRoot ?? record.worktree.repoRoot ?? baseCwd;
+          const wtResult = cleanupWorktree(cleanupCwd, record.worktree, options.description);
+          this.applyWorktreeCleanup(record, wtResult);
+        } catch { /* ignore cleanup errors */ }
+      }
+      if (options.isBackground && this.persistedOwnership(record).kind === "top-level") this.finishBackground(id);
+      throw err;
+    }
+
+    const promise = agentPromise
       .then(({ responseText, session, aborted, steered, failure }) => {
         // A disposed manager no longer owns this run. Avoid late callbacks
         // mutating a dead session or emitting completion side effects.
@@ -643,8 +902,9 @@ export class AgentManager {
 
         // Clean up worktree if used
         if (record.worktree) {
-          const wtResult = cleanupWorktree(baseCwd, record.worktree, options.description);
-          record.worktreeResult = wtResult;
+          const cleanupCwd = record.worktreeResume?.repoRoot ?? record.worktree.repoRoot ?? baseCwd;
+          const wtResult = cleanupWorktree(cleanupCwd, record.worktree, options.description);
+          this.applyWorktreeCleanup(record, wtResult);
           if (wtResult.hasChanges && wtResult.branch) {
             // With a caller-supplied cwd the branch lives in THAT repo, not the
             // parent session's — say so, or the orchestrator merges in the wrong repo.
@@ -686,8 +946,9 @@ export class AgentManager {
         // Best-effort worktree cleanup on error
         if (record.worktree) {
           try {
-            const wtResult = cleanupWorktree(baseCwd, record.worktree, options.description);
-            record.worktreeResult = wtResult;
+            const cleanupCwd = record.worktreeResume?.repoRoot ?? record.worktree.repoRoot ?? baseCwd;
+            const wtResult = cleanupWorktree(cleanupCwd, record.worktree, options.description);
+            this.applyWorktreeCleanup(record, wtResult);
           } catch { /* ignore cleanup errors */ }
         }
         this.checkpoint(record);
@@ -729,32 +990,308 @@ export class AgentManager {
     }
   }
 
+  private persistedOwnership(record: AgentRecord): AgentOwnership {
+    return record.ownership ?? (record.parentAgentId
+      ? { kind: "nested", parentAgentId: record.parentAgentId, depth: record.depth ?? 1 }
+      : { kind: "top-level" });
+  }
+
+  private persistedArtifactRoot(record: AgentRecord): string | undefined {
+    const state = record.sessionState;
+    return record.artifactRootCwd
+      ?? (state && state.kind !== "pending" ? state.artifactRootCwd : undefined);
+  }
+
+  /** Final owner gate. No checkpoint, locator, model, or worktree access precedes this. */
+  private assertResumeAuthority(record: AgentRecord, authority: ResumeAuthority): string {
+    let callerRoot: string;
+    try {
+      callerRoot = canonicalArtifactRootCwd(authority.artifactRootCwd);
+    } catch {
+      throw new AgentResumeError("resume-ownership-denied", "caller artifact root is invalid");
+    }
+    const persistedRoot = this.persistedArtifactRoot(record);
+    if (!persistedRoot) {
+      throw new AgentResumeError("resume-ownership-denied", "record has no persisted artifact root");
+    }
+    let recordRoot: string;
+    try {
+      recordRoot = canonicalArtifactRootCwd(persistedRoot);
+    } catch {
+      throw new AgentResumeError("resume-ownership-denied", "record artifact root is invalid");
+    }
+    if (callerRoot !== recordRoot) {
+      throw new AgentResumeError("resume-ownership-denied", "caller artifact root does not own this record");
+    }
+
+    const owner = this.persistedOwnership(record);
+    const owns = authority.kind === "top-level"
+      ? owner.kind === "top-level"
+      : authority.kind === "nested"
+        ? owner.kind === "nested" && owner.parentAgentId === authority.parentAgentId
+        : owner.kind === "workflow" && owner.workflowId === authority.workflowId
+          && authority.runtimeAgentId.length > 0;
+    if (!owns) {
+      throw new AgentResumeError("resume-ownership-denied", "record owner does not match resume authority");
+    }
+    return callerRoot;
+  }
+
+  private assertCheckpointAuthority(
+    checkpoint: Extract<AgentRecoveryCheckpoint, { version: 2 }>,
+    authority: ResumeAuthority,
+    callerRoot: string,
+  ): void {
+    if (checkpoint.session.kind === "pending" || checkpoint.session.artifactRootCwd === undefined) {
+      throw new AgentResumeError("resume-checkpoint-invalid", "private checkpoint session state is missing");
+    }
+    let persistedRoot: string;
+    try {
+      persistedRoot = canonicalArtifactRootCwd(checkpoint.session.artifactRootCwd);
+    } catch {
+      throw new AgentResumeError("resume-checkpoint-invalid", "private checkpoint artifact root is invalid");
+    }
+    if (persistedRoot !== callerRoot) {
+      throw new AgentResumeError("resume-ownership-denied", "checkpoint artifact root does not match caller");
+    }
+    const owner = checkpoint.ownership;
+    const owns = authority.kind === "top-level"
+      ? owner.kind === "top-level"
+      : authority.kind === "nested"
+        ? owner.kind === "nested" && owner.parentAgentId === authority.parentAgentId
+        : owner.kind === "workflow" && owner.workflowId === authority.workflowId
+          && authority.runtimeAgentId.length > 0;
+    if (!owns) {
+      throw new AgentResumeError("resume-ownership-denied", "checkpoint owner does not match resume authority");
+    }
+  }
+
+  private requirePrivateCheckpoint(
+    record: AgentRecord,
+    authority: ResumeAuthority,
+    callerRoot: string,
+  ): Extract<AgentRecoveryCheckpoint, { version: 2 }> {
+    const cwd = this.recoveryCwds.get(record.id) ?? callerRoot;
+    const checkpoint = readAgentRecoveryCheckpoints(cwd).find(value => value.id === record.id);
+    if (!checkpoint) {
+      const path = agentRecoveryCheckpointPath(cwd, record.id);
+      throw new AgentResumeError(
+        existsSync(path) ? "resume-checkpoint-invalid" : "resume-checkpoint-missing",
+        `no valid v2 checkpoint exists for agent ${record.id}`,
+      );
+    }
+    if (checkpoint.version !== 2) {
+      throw new AgentResumeError("resume-checkpoint-invalid", "v1 checkpoints are display-only");
+    }
+    if (checkpoint.session.kind !== "private") {
+      throw new AgentResumeError("resume-checkpoint-invalid", "only private v2 sessions are executable after loss");
+    }
+    this.assertCheckpointAuthority(checkpoint, authority, callerRoot);
+    return checkpoint;
+  }
+
+  private ensureResumeHistory(record: AgentRecord, prompt: string, cwd: string): void {
+    if (record.historyFile) return;
+    const historyFile = createAgentHistoryPath(cwd, record.id);
+    record.historyFile = historyFile;
+    record.transcriptPath = agentHistoryLocator(cwd, historyFile);
+    writeInitialEntry(historyFile, record.id, prompt, cwd);
+  }
+
+  private cleanupResumeWorktree(record: AgentRecord, worktree: WorktreeInfo | undefined, description: string): void {
+    if (!worktree) return;
+    const cleanupCwd = record.worktreeResume?.repoRoot ?? worktree.repoRoot;
+    try {
+      this.applyWorktreeCleanup(record, cleanupWorktree(cleanupCwd, worktree, description));
+    } finally {
+      this.reconstructedWorktrees.delete(record.id);
+    }
+  }
+
+  private startResumeTurn(
+    record: AgentRecord,
+    prompt: string,
+    isBackground: boolean,
+    signal: AbortSignal | undefined,
+    historyStartIndex: number,
+    worktree: WorktreeInfo | undefined,
+  ): Promise<string> {
+    const controller = record.abortController!;
+    const occupiesBackgroundPool = isBackground && this.persistedOwnership(record).kind === "top-level";
+    let settled = false;
+    let detachExternalSignal = () => {};
+    if (signal) {
+      const onAbort = () => this.abort(record.id);
+      if (signal.aborted) onAbort();
+      else {
+        signal.addEventListener("abort", onAbort, { once: true });
+        detachExternalSignal = () => signal.removeEventListener("abort", onAbort);
+      }
+    }
+
+    const finish = (text: string, failure?: string, thrown?: unknown): string => {
+      if (settled) return text;
+      settled = true;
+      detachExternalSignal();
+      if (record.status !== "stopped") {
+        record.status = failure || thrown !== undefined ? "error" : "completed";
+      }
+      if (failure) record.error = failure;
+      if (thrown !== undefined) record.error = thrown instanceof Error ? thrown.message : String(thrown);
+      record.result = text;
+      record.completedAt = Date.now();
+      this.flushOutput(record);
+      this.cleanupResumeWorktree(record, worktree, record.description);
+      if (!isBackground) record.resultConsumed = true;
+      this.checkpoint(record);
+      if (occupiesBackgroundPool) this.finishBackground(record.id);
+      try { this.onComplete?.(record); } catch { /* completion callbacks are best effort */ }
+      if (occupiesBackgroundPool) this.drainQueue();
+      return text;
+    };
+
+    const promise = Promise.resolve()
+      .then(() => resumeAgent(record.session!, prompt, {
+        historyStartIndex,
+        onToolActivity: activity => {
+          if (activity.type === "end") record.toolUses++;
+        },
+        onAssistantUsage: usage => addUsage(record.lifetimeUsage, usage),
+        onCompaction: info => {
+          record.compactionCount++;
+          this.onCompact?.(record, info);
+        },
+        signal: controller.signal,
+      }))
+      .then(({ text, failure }) => finish(text, failure))
+      .catch(error => finish("", undefined, error));
+    record.promise = promise;
+    return promise;
+  }
+
   /**
-   * Resume an existing agent session with a new prompt.
-   *
-   * The third argument remains compatible with the historical AbortSignal
-   * form. Callers may instead pass ResumeOptions directly, or pass the
-   * options as the fourth argument alongside a signal.
+   * Resume a record with explicit owner authority. Live sessions use the
+   * same-process path; only a validated private v2 checkpoint may rehydrate.
    */
   async resume(
     id: string,
     prompt: string,
+    runtimeFactory: AgentResumeRuntimeFactory,
+    authority: ResumeAuthority,
     signalOrOptions?: AbortSignal | ResumeOptions,
     options?: ResumeOptions,
   ): Promise<AgentRecord | undefined> {
     const record = this.agents.get(id);
-    const session = record?.session;
-    if (!record || !session) return undefined;
-
+    if (!record) return undefined;
     const resumeOptions = options ?? (
       signalOrOptions && "aborted" in signalOrOptions
         ? { signal: signalOrOptions }
         : signalOrOptions
     ) ?? {};
-    const signal = resumeOptions.signal;
-    const isBackground = resumeOptions.isBackground ?? true;
-    const occupiesBackgroundPool = isBackground && record.parentAgentId === undefined;
+    const callerRoot = this.assertResumeAuthority(record, authority);
+    if (record.status === "running" || record.status === "queued") {
+      throw new AgentResumeError("resume-busy", `agent ${id} is already ${record.status}`);
+    }
 
+    const isBackground = resumeOptions.isBackground ?? false;
+    const signal = resumeOptions.signal;
+    const oldSession = record.session;
+    let prepared: PreparedChildSession | undefined;
+    let freshWorktree: WorktreeInfo | undefined;
+    let resumeCheckpoint: Extract<AgentRecoveryCheckpoint, { version: 2 }> | undefined;
+    if (!oldSession) {
+      resumeCheckpoint = this.requirePrivateCheckpoint(record, authority, callerRoot);
+      try {
+        const checkpointSession = resumeCheckpoint.session;
+        if (checkpointSession.kind !== "private") {
+          throw new AgentResumeError("resume-checkpoint-invalid", "only private v2 sessions are executable after loss");
+        }
+        // Validate the locator before creating a worktree. The runtime repeats
+        // the native JSONL/header checks immediately before open.
+        resolvePrivateSessionLocator(callerRoot, checkpointSession.locator);
+        const execution = resumeCheckpoint.worktree
+          ? this.reconstructResumeWorktree(resumeCheckpoint.worktree, record.id)
+          : (() => {
+              if (!existsSync(checkpointSession.originalExecutionCwd)
+                || !statSync(checkpointSession.originalExecutionCwd).isDirectory()) {
+                throw new AgentResumeError("resume-worktree-missing-cwd", "original execution cwd is unavailable");
+              }
+              return { executionCwd: checkpointSession.originalExecutionCwd, worktree: undefined };
+            })();
+        freshWorktree = execution.worktree;
+        const runtime = runtimeFactory.create({
+          nestedManager: this,
+          childIdentity: {
+            parentAgentId: record.id,
+            depth: resumeCheckpoint.runtime.depth,
+            maxSubagentDepth: resumeCheckpoint.runtime.maxSubagentDepth,
+            rootSessionId: resumeCheckpoint.runtime.rootSessionId,
+          },
+        });
+        prepared = await runtime.rehydrate(
+          {
+            ...record,
+            sessionState: checkpointSession,
+            ownership: resumeCheckpoint.ownership,
+            runtimeIdentity: resumeCheckpoint.runtime,
+            artifactRootCwd: checkpointSession.artifactRootCwd,
+            resourceCwd: checkpointSession.resourceCwd,
+            originalExecutionCwd: checkpointSession.originalExecutionCwd,
+            worktreeResume: resumeCheckpoint.worktree,
+          },
+          execution.executionCwd,
+          signal,
+        );
+      } catch (error) {
+        if (prepared?.session) {
+          try { prepared.session.dispose(); } catch { /* adapter cleanup is best effort */ }
+        }
+        if (freshWorktree) this.removeReconstructedWorktree(record.id);
+        if (error instanceof AgentResumeError) throw error;
+        if (error instanceof ResumeStorageError) throw new AgentResumeError(error.code, error.message);
+        if (error instanceof WorktreeError) throw new AgentResumeError(error.code, error.message);
+        throw new AgentResumeError(
+          error instanceof Error && "code" in error && typeof (error as { code?: unknown }).code === "string"
+            ? (error as { code: AgentResumeErrorCode }).code
+            : "resume-session-incompatible",
+          error instanceof Error ? error.message : String(error),
+        );
+      }
+    }
+
+    const session = prepared?.session ?? oldSession;
+    if (!session) throw new AgentResumeError("resume-session-incompatible", "resume session is unavailable");
+    const previous = {
+      status: record.status,
+      startedAt: record.startedAt,
+      completedAt: record.completedAt,
+      result: record.result,
+      error: record.error,
+      resultConsumed: record.resultConsumed,
+      toolCallId: record.toolCallId,
+      session: record.session,
+      abortController: record.abortController,
+      promise: record.promise,
+      isBackground: record.isBackground,
+      worktree: record.worktree,
+      worktreeResume: record.worktreeResume,
+      sessionState: record.sessionState,
+      ownership: record.ownership,
+      runtimeIdentity: record.runtimeIdentity,
+      artifactRootCwd: record.artifactRootCwd,
+      resourceCwd: record.resourceCwd,
+      originalExecutionCwd: record.originalExecutionCwd,
+      invocation: record.invocation,
+      outputFile: record.outputFile,
+      historyFile: record.historyFile,
+      transcriptPath: record.transcriptPath,
+      outputCleanup: record.outputCleanup,
+      worktreeResult: record.worktreeResult,
+    };
+    const previousLiveActivitySession = record.liveActivity?.session;
+    const controller = new AbortController();
+    record.session = session;
+    record.abortController = controller;
     record.status = "running";
     record.startedAt = Date.now();
     record.completedAt = undefined;
@@ -762,11 +1299,20 @@ export class AgentManager {
     record.error = undefined;
     record.resultConsumed = false;
     record.isBackground = isBackground;
-    if (occupiesBackgroundPool) {
-      this.runningBackground++;
-      this.runningBackgroundIds.add(id);
+    if (resumeOptions.toolCallId !== undefined) record.toolCallId = resumeOptions.toolCallId;
+    if (prepared?.metadata) {
+      record.sessionState = prepared.metadata.sessionState;
+      record.runtimeIdentity = prepared.metadata.runtimeIdentity;
+      record.ownership = prepared.metadata.ownership;
+      record.artifactRootCwd = prepared.metadata.artifactRootCwd;
+      record.resourceCwd = prepared.metadata.resourceCwd;
+      record.originalExecutionCwd = prepared.metadata.originalExecutionCwd;
     }
-    this.onStart?.(record);
+    if (freshWorktree) {
+      record.worktree = freshWorktree;
+      record.worktreeResume = record.worktreeResume ?? resumeCheckpoint?.worktree;
+    }
+    if (record.liveActivity) record.liveActivity.session = session;
     const resumedModel = session.model;
     record.invocation = {
       ...(record.invocation ?? {}),
@@ -774,54 +1320,40 @@ export class AgentManager {
       effectiveThinking: session.thinkingLevel,
       runInBackground: isBackground,
     };
-    const cwd = this.recoveryCwds.get(id);
-    if (cwd) this.attachTranscriptStream(record, session, cwd, session.messages.length);
-    this.checkpoint(record);
+    const occupiesBackgroundPool = isBackground && this.persistedOwnership(record).kind === "top-level";
+    let backgroundReserved = false;
+    try {
+      const cwd = this.recoveryCwds.get(id) ?? callerRoot;
+      this.ensureResumeHistory(record, prompt, cwd);
+      const historyStartIndex = prepared?.historyStartIndex ?? session.messages.length;
+      this.attachTranscriptStream(record, session, cwd, historyStartIndex);
+      this.checkpoint(record);
+      this.onStart?.(record);
+      if (occupiesBackgroundPool) {
+        this.runningBackground++;
+        this.runningBackgroundIds.add(id);
+        backgroundReserved = true;
+      }
+      this.startResumeTurn(record, prompt, isBackground, signal, historyStartIndex, freshWorktree);
+    } catch (error) {
+      if (backgroundReserved) this.finishBackground(id);
+      if (record.outputCleanup !== previous.outputCleanup && record.outputCleanup) {
+        try { record.outputCleanup(); } catch { /* rollback must remain best effort */ }
+      }
+      if (previous.historyFile === undefined && record.historyFile !== undefined) {
+        try { rmSync(record.historyFile, { force: true }); } catch { /* rollback must remain best effort */ }
+      }
+      if (prepared && prepared.session !== oldSession) {
+        try { prepared.session.dispose(); } catch { /* adapter cleanup is best effort */ }
+      }
+      if (freshWorktree) this.removeReconstructedWorktree(id);
+      Object.assign(record, previous);
+      if (record.liveActivity) record.liveActivity.session = previousLiveActivitySession;
+      try { this.checkpoint(record); } catch { /* preserve the original setup failure */ }
+      throw error;
+    }
 
-    const promise = Promise.resolve()
-      .then(() => resumeAgent(session, prompt, {
-        onToolActivity: (activity) => {
-          if (activity.type === "end") record.toolUses++;
-        },
-        onAssistantUsage: (usage) => {
-          addUsage(record.lifetimeUsage, usage);
-        },
-        onCompaction: (info) => {
-          record.compactionCount++;
-          this.onCompact?.(record, info);
-        },
-        signal,
-      }))
-      .then(({ text, failure }) => {
-        // Same contract as the spawn path (#144): a failed final turn is an
-        // error, not a completion — but the resumed text stays available.
-        record.status = failure ? "error" : "completed";
-        if (failure) record.error = failure;
-        record.result = text;
-        record.completedAt = Date.now();
-        this.flushOutput(record);
-        this.checkpoint(record);
-        if (!isBackground) record.resultConsumed = true;
-        if (occupiesBackgroundPool) this.finishBackground(id);
-        try { this.onComplete?.(record); } catch { /* ignore completion side-effect errors */ }
-        if (occupiesBackgroundPool) this.drainQueue();
-        return text;
-      })
-      .catch((err) => {
-        record.status = "error";
-        record.error = err instanceof Error ? err.message : String(err);
-        record.completedAt = Date.now();
-        this.flushOutput(record);
-        this.checkpoint(record);
-        if (!isBackground) record.resultConsumed = true;
-        if (occupiesBackgroundPool) this.finishBackground(id);
-        try { this.onComplete?.(record); } catch { /* ignore completion side-effect errors */ }
-        if (occupiesBackgroundPool) this.drainQueue();
-        return "";
-      });
-    record.promise = promise;
-    await promise;
-
+    if (!isBackground) await record.promise;
     return record;
   }
 
@@ -886,6 +1418,8 @@ export class AgentManager {
     completedAt: number;
     result?: string;
     error?: string;
+    resultConsumed?: boolean;
+    toolCallId?: string;
     toolUses?: number;
     lifetimeUsage?: { input: number; output: number; cacheWrite: number };
     transcriptPath?: string;
@@ -894,6 +1428,15 @@ export class AgentManager {
     parentAgentId?: string;
     depth?: number;
     sessionId?: string;
+    maxSubagentDepth?: number;
+    rootSessionId?: string;
+    sessionState?: AgentRecoverySessionState;
+    ownership?: AgentOwnership;
+    runtimeIdentity?: AgentRecoveryRuntimeIdentity;
+    artifactRootCwd?: string;
+    resourceCwd?: string;
+    originalExecutionCwd?: string;
+    worktreeResume?: AgentRecord["worktreeResume"];
   }): AgentRecord {
     return {
       id: record.id,
@@ -902,6 +1445,8 @@ export class AgentManager {
       status: record.status,
       result: record.result,
       error: record.error,
+      resultConsumed: record.resultConsumed,
+      toolCallId: record.toolCallId,
       toolUses: record.toolUses ?? 0,
       startedAt: record.startedAt,
       completedAt: record.completedAt,
@@ -914,6 +1459,15 @@ export class AgentManager {
       parentAgentId: record.parentAgentId,
       depth: record.depth,
       sessionId: record.sessionId,
+      maxSubagentDepth: record.maxSubagentDepth,
+      rootSessionId: record.rootSessionId,
+      sessionState: record.sessionState,
+      ownership: record.ownership,
+      runtimeIdentity: record.runtimeIdentity,
+      artifactRootCwd: record.artifactRootCwd,
+      resourceCwd: record.resourceCwd,
+      originalExecutionCwd: record.originalExecutionCwd,
+      worktreeResume: record.worktreeResume,
     };
   }
 
@@ -967,12 +1521,30 @@ export class AgentManager {
     return true;
   }
 
-  /** Dispose a record's session and remove it from the map. */
+  /** Dispose a record's volatile runtime handles and remove it from the map. */
   private removeRecord(id: string, record: AgentRecord): void {
     this.flushOutput(record);
-    record.session?.dispose?.();
+    try { record.session?.dispose?.(); } catch { /* cleanup is best effort */ }
     record.session = undefined;
+    record.abortController = undefined;
+    record.promise = undefined;
+    if (record.liveActivity) record.liveActivity.session = undefined;
+    this.reconstructedWorktrees.delete(id);
     this.agents.delete(id);
+  }
+
+  private retainTerminalStub(record: AgentRecord): void {
+    this.flushOutput(record);
+    try { record.session?.dispose?.(); } catch { /* cleanup is best effort */ }
+    record.session = undefined;
+    record.abortController = undefined;
+    record.promise = undefined;
+    record.outputFile = undefined;
+    record.historyFile = undefined;
+    record.worktree = undefined;
+    if (record.liveActivity) record.liveActivity.session = undefined;
+    record.result = undefined;
+    this.checkpoint(record);
   }
 
   private cleanup() {
@@ -980,23 +1552,11 @@ export class AgentManager {
     for (const [id, record] of this.agents) {
       if (record.status === "running" || record.status === "queued") continue;
       if ((record.completedAt ?? 0) >= cutoff) continue;
-      // A durable transcript is the source of truth for history. Release the
-      // live session after the TTL, but retain a lightweight record so opening
-      // history again in this session does not silently lose its identity or
-      // locator. Records without durable storage remain eligible for eviction.
-      if (record.transcriptPath) {
-        this.flushOutput(record);
-        try { record.session?.dispose?.(); } catch { /* ignore cleanup failures */ }
-        record.session = undefined;
-        record.outputFile = undefined;
-        record.historyFile = undefined;
-        // The durable transcript is the source of truth after the TTL. Keep
-        // only the small identity/status record in memory; get_subagent_result
-        // reloads the final answer from transcriptPath on demand.
-        record.result = undefined;
-        continue;
-      }
-      this.removeRecord(id, record);
+      // Private v2 records remain executable even when their display transcript
+      // is absent. Explicit and memory sessions retain only their display stub.
+      const retain = record.sessionState?.kind === "private" || record.transcriptPath !== undefined;
+      if (retain) this.retainTerminalStub(record);
+      else this.removeRecord(id, record);
     }
   }
 
@@ -1069,18 +1629,30 @@ export class AgentManager {
 
   dispose() {
     clearInterval(this.cleanupInterval);
+    for (const id of this.reconstructedWorktrees.keys()) this.removeReconstructedWorktree(id);
     // Clear queue
     this.queue = [];
     for (const record of this.agents.values()) {
-      // Keep the latest openable partial transcript even when dispose() is
-      // called without the host's normal session_shutdown abortAll hook.
+      // Keep the latest openable checkpoint even when dispose() is called
+      // without the host's normal session_shutdown abortAll hook.
       this.flushOutput(record);
       this.checkpoint(record);
-      record.session?.dispose();
+      try { record.session?.dispose?.(); } catch { /* cleanup is best effort */ }
+      record.session = undefined;
+      record.abortController = undefined;
+      record.promise = undefined;
+      record.outputFile = undefined;
+      record.historyFile = undefined;
+      record.worktree = undefined;
+      if (record.liveActivity) record.liveActivity.session = undefined;
+      record.result = undefined;
+      this.checkpoint(record);
     }
     this.agents.clear();
     this.recoveryCwds.clear();
+    this.displayOnlyCheckpointIds.clear();
     this.runningBackgroundIds.clear();
+    this.reconstructedWorktrees.clear();
     this.runningBackground = 0;
     // Prune any orphaned git worktrees (crash recovery)
     try { pruneWorktrees(process.cwd()); } catch { /* ignore */ }
