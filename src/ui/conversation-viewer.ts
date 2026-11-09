@@ -12,7 +12,7 @@ import type { AgentRecord } from "../types.js";
 import { getLifetimeTotal, getSessionContextPercent } from "../usage.js";
 import type { Theme } from "./agent-widget.js";
 import { type AgentActivity, buildInvocationTags, describeActivity, fgPreservingNestedStyles, formatDuration, formatSessionTokens, getDisplayName, getPromptModeLabel } from "./agent-widget.js";
-import { createViewerCcstyleResult } from "./ccstyle/tool-result.js";
+import { createViewerCcstyleResult, textFromResult } from "./ccstyle/tool-result.js";
 import { type ConversationBlock, formatConversationMessages } from "./conversation-blocks.js";
 import { editLiveAssistantBlockInNvim, viewConversationBlockInNvim } from "./conversation-nvim.js";
 import { renderConversationRoleHeader } from "./conversation-role.js";
@@ -104,7 +104,9 @@ class FullToolPreview implements Component {
   private pageSize = 1;
   private totalLines = 1;
   private pendingTop = false;
+  private hoveredCopy = false;
   private hoveredClose = false;
+  private pressedHeaderAction: "copy" | "close" | undefined;
   private scrollbarActive = false;
 
   constructor(
@@ -113,11 +115,16 @@ class FullToolPreview implements Component {
     private readonly title: string,
     private readonly body: Component,
     private readonly done: (result: undefined) => void,
+    private readonly copy: () => void,
   ) {}
 
   handleInput(data: string): void {
     if (matchesKey(data, Key.escape) || matchesKey(data, "q")) {
       this.done(undefined);
+      return;
+    }
+    if (data === "M") {
+      this.copy();
       return;
     }
     if (data === "g") {
@@ -134,15 +141,40 @@ class FullToolPreview implements Component {
   }
 
   handleMouse(event: TuiMouseEvent): { handled?: boolean; capture?: boolean; render?: boolean } | undefined {
-    const closeHit = event.y === 1 && event.x >= Math.max(0, event.width - 7) && event.x < Math.max(0, event.width - 1);
+    const copyWidth = visibleWidth("[copy]");
+    const closeWidth = visibleWidth("[esc]");
+    const actionsWidth = copyWidth + 1 + closeWidth;
+    const actionStart = Math.max(0, event.width - 1 - actionsWidth);
+    const copyHit = event.y === 1 && event.x >= Math.max(0, actionStart - 1) && event.x < actionStart + copyWidth;
+    const closeHit = event.y === 1 && event.x >= actionStart + copyWidth && event.x < Math.max(0, event.width - 1);
     if (event.type === "move") {
-      if (closeHit === this.hoveredClose) return undefined;
+      const copyChanged = copyHit !== this.hoveredCopy;
+      const closeChanged = closeHit !== this.hoveredClose;
+      this.hoveredCopy = copyHit;
       this.hoveredClose = closeHit;
+      if (!copyChanged && !closeChanged) return undefined;
       return { handled: true, render: true };
     }
-    if (closeHit && event.button === "left") {
-      if (event.type === "press") return { handled: true, capture: true, render: false };
-      if (event.type === "click") {
+    if (event.button === "left") {
+      if (event.type === "press" && copyHit) {
+        this.pressedHeaderAction = "copy";
+        return { handled: true, capture: true, render: false };
+      }
+      if (event.type === "press" && closeHit) {
+        this.pressedHeaderAction = "close";
+        return { handled: true, capture: true, render: false };
+      }
+      if (event.type === "release" && this.pressedHeaderAction) {
+        this.pressedHeaderAction = undefined;
+        return { handled: true, render: false };
+      }
+      if (event.type === "click" && copyHit) {
+        this.pressedHeaderAction = undefined;
+        this.copy();
+        return { handled: true, render: false };
+      }
+      if (event.type === "click" && closeHit) {
+        this.pressedHeaderAction = undefined;
         this.done(undefined);
         return { handled: true, render: false };
       }
@@ -174,12 +206,14 @@ class FullToolPreview implements Component {
     };
     const hiddenAbove = this.scrollOffset;
     const hiddenBelow = Math.max(0, this.totalLines - this.scrollOffset - this.pageSize);
+    const copy = this.theme.fg(this.hoveredCopy ? "text" : "dim", "[copy]");
     const close = this.theme.fg(this.hoveredClose ? "text" : "dim", "[esc]");
+    const actionsWidth = visibleWidth(copy) + 1 + visibleWidth(close);
     const header = this.theme.bold(this.theme.fg("accent", this.title));
     const status = `${this.scrollOffset + 1}-${Math.min(this.totalLines, this.scrollOffset + this.pageSize)} / ${this.totalLines} lines · j/k gg/G ↑↓ PgUp/PgDn · [esc] close`;
     return [
       border(`╭${"─".repeat(inner)}╮`),
-      `${border("│")}${pad(` ${header}`, inner - visibleWidth(close))}${close}${border("│")}`,
+      `${border("│")}${pad(` ${header}`, Math.max(0, inner - actionsWidth))}${copy} ${close}${border("│")}`,
       renderScrollMoreRule(this.theme, inner, "top", hiddenAbove),
       ...Array.from({ length: viewport }, (_, index) => {
         const content = pad(` ${visible[index] ?? ""}`, bodyWidth);
@@ -509,14 +543,14 @@ export class ConversationViewer implements Component {
   private isPreviewButtonHit(x: number, y: number, innerW: number): boolean {
     if (y !== 1) return false;
     const previewWidth = visibleWidth("[preview]");
-    const closeWidth = visibleWidth("[Esc]");
+    const closeWidth = visibleWidth("[esc]");
     const labelStart = 2 + Math.max(0, innerW - previewWidth - 1 - closeWidth);
     return x >= labelStart && x < labelStart + previewWidth;
   }
 
   private isCloseButtonHit(x: number, y: number, innerW: number): boolean {
     if (y !== 1) return false;
-    const labelWidth = visibleWidth("[Esc]");
+    const labelWidth = visibleWidth("[esc]");
     const labelStart = 2 + Math.max(0, innerW - labelWidth);
     return x >= labelStart && x < 2 + innerW;
   }
@@ -560,7 +594,7 @@ export class ConversationViewer implements Component {
       : "";
     const headerText = `${statusIcon} ${th.bold(name)}${modeTag}  ${th.fg("muted", this.record.description)}${th.fg("dim", owner)} ${th.fg("dim", "·")} ${fgPreservingNestedStyles(th, "dim", headerParts.join(" · "))}`;
     const previewLabel = this.hoveredPreview ? th.fg("text", th.bold("[preview]")) : th.fg("dim", "[preview]");
-    const closeLabel = this.hoveredClose ? th.fg("text", th.bold("[Esc]")) : th.fg("dim", "[Esc]");
+    const closeLabel = this.hoveredClose ? th.fg("text", th.bold("[esc]")) : th.fg("dim", "[esc]");
     const actionsWidth = visibleWidth(previewLabel) + 1 + visibleWidth(closeLabel);
     const headerLeft = truncateToWidth(headerText, Math.max(0, innerW - actionsWidth - 1), "", true);
     const headerGap = Math.max(1, innerW - visibleWidth(headerLeft) - actionsWidth);
@@ -930,6 +964,8 @@ export class ConversationViewer implements Component {
     this.toolPreview = new FullToolPreview(this.tui, this.theme, title, body, () => {
       this.toolPreview = undefined;
       this.tui.requestRender();
+    }, () => {
+      void this.copyCurrentToolPreview(block);
     });
     this.tui.requestRender();
   }
@@ -1009,15 +1045,24 @@ export class ConversationViewer implements Component {
 
   private async copyCurrentMessage(): Promise<void> {
     const block = this.currentBlock();
-    if (!block || !this.operations) {
-      if (!this.operations) return;
-      return;
-    }
+    if (!block || !this.operations) return;
     const source = `${stripAnsi(block.header)}\n${block.copyText}`.trimEnd();
+    await this.copyWithNotification(source, "current message");
+  }
+
+  private async copyCurrentToolPreview(block: ConversationBlock): Promise<void> {
+    if (!this.operations) return;
+    const result = block.toolResult ?? block.result ?? { content: [] };
+    const source = textFromResult(result, true, FULL_TOOL_PREVIEW_MAX_CHARS) || "Done";
+    await this.copyWithNotification(source, "tool output");
+  }
+
+  private async copyWithNotification(source: string, label: string): Promise<void> {
+    if (!this.operations) return;
     const clipped = source.length > MAX_COPY_CHARS ? `${source.slice(0, MAX_COPY_CHARS)}\n… [truncated by subagent copy]` : source;
     try {
       await copyToClipboard(clipped);
-      this.operations.ctx.ui.notify(`Copied current message (${clipped.length} chars)`, "info");
+      this.operations.ctx.ui.notify(`Copied ${label} (${clipped.length} chars)`, "info");
     } catch (error) {
       this.operations.ctx.ui.notify(`Copy failed: ${error instanceof Error ? error.message : String(error)}`, "error");
     }

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.2] - 2026-10-28
+
+### Added
+- **Full Tool Preview copy action**: Full Tool Preview exposes a clickable `[copy]` action immediately before `[esc]`, and pressing uppercase `M` performs the same action to copy the complete tool output. This gives users both a visible control and a keyboard shortcut for copying the full preview without changing the existing read-only preview or close behavior.
+
+### Changed
++- **Agent-view tool cards**: Write now uses the same 24-line collapsed code display as Edit; focus the card and press `Enter` to expand its full content. The full Write `[preview]` remains unchanged, and the viewer close label is consistently rendered as `[esc]`.
+
 ## [0.19.0] - 2026-10-27
 
 ### Added

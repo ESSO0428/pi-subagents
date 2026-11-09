@@ -212,6 +212,45 @@ describe("ConversationViewer", () => {
     expect(viewer.render(120).join("\n")).toContain("six");
   });
 
+  it("shows bounded Write code and expands the full content on Enter", () => {
+    const content = Array.from(
+      { length: 32 },
+      (_, index) => `const value${index + 1} = ${index + 1};`,
+    ).join("\n");
+    const viewer = new ConversationViewer(
+      tui(),
+      createStaticConversationSource([
+        {
+          role: "assistant",
+          content: [{
+            type: "toolCall",
+            id: "write-1",
+            name: "write",
+            arguments: { file_path: "src/generated.ts", content },
+          }],
+        },
+        {
+          role: "toolResult",
+          toolCallId: "write-1",
+          toolName: "write",
+          content: [{ type: "text", text: "Successfully wrote src/generated.ts" }],
+        },
+      ] as any),
+      record(),
+      undefined,
+      theme,
+      vi.fn(),
+    );
+
+    const collapsed = viewer.render(120).join("\n");
+    expect(collapsed).toContain("value1");
+    expect(collapsed).not.toContain("value32");
+
+    viewer.handleInput("\t");
+    viewer.handleInput("\r");
+    expect(viewer.render(120).join("\n")).toContain("value32");
+  });
+
   it("toggles mouse expansion only on the normalized click event", () => {
     const viewer = new ConversationViewer(
       tui(),
@@ -389,7 +428,7 @@ describe("ConversationViewer", () => {
     expect((viewer as any).toolPreview).toBeUndefined();
 
     viewer.handleMouse(mouse("move", 1, { button: "none", x: 114, screenX: 114, screenY: 1 }));
-    expect(viewer.render(120).join("\n")).toContain("<text><bold>[Esc]</bold></text>");
+    expect(viewer.render(120).join("\n")).toContain("<text><bold>[esc]</bold></text>");
     expect(viewer.handleMouse(mouse("press", 1, { x: 114, screenX: 114 }))?.handled).toBe(true);
     expect(viewer.handleMouse(mouse("click", 1, { x: 114, screenX: 114, clickCount: 1 }))?.handled).toBe(true);
     expect(done).toHaveBeenCalledTimes(1);
