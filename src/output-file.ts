@@ -57,7 +57,7 @@ export function writeInitialEntry(path: string, agentId: string, prompt: string,
 
 /**
  * Subscribe to session events and flush new messages to the supplied transcript
- * files on each turn_end. The first message is the initial prompt already
+ * files when each message completes. The first message is the initial prompt already
  * written by the manager; `startAt` is used when resuming a session whose prior
  * messages are already persisted. Returns a cleanup function that does a final
  * flush and unsubscribes.
@@ -96,7 +96,7 @@ export function streamToOutputFile(
   };
 
   const unsubscribe = session.subscribe((event: AgentSessionEvent) => {
-    if (event.type === "turn_end") flush();
+    if (event.type === "message_end" || event.type === "turn_end") flush();
     // Compaction replaces session.messages with a shorter, summarized array,
     // leaving writtenCount past the new end — without re-anchoring, the flush
     // loop would never match again and streaming would halt for good (#145).

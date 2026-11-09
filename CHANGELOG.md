@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.3] - 2026-11-09
+
+### Fixed
+- **Write metadata survives mid-turn reloads**: durable agent transcripts now flush every completed session message rather than waiting only for `turn_end`, so a completed Write tool call and its bounded diff metadata remain available to Agent View after `/reload`.
+
 ## [0.19.2] - 2026-10-28
 
 ### Added
